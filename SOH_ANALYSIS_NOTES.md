@@ -1,4 +1,4 @@
-# SOH Analysis Notes — ref_capacity_ah Fix & Source Comparison
+# SOH Analysis Notes — ref_capacity_ah Fix & Source Comparison (A / B / C)
 
 ## Background
 
@@ -69,25 +69,43 @@ This change propagates to all four SOH computations:
 
 ---
 
-### 2. `code/soh_comparison.py` — New Standalone Analysis Script
+### 2. `code/soh_comparison.py` — Standalone Analysis Script (three sources)
 
-A new script that independently validates and compares SOH estimates from two current sources:
+Independently validates and compares SOH estimates from three independent sources:
 
 - **Source A:** BMS `current_mean` (from `cycles.csv` produced by `data_prep_1.py`)
 - **Source B:** `hves1_current` from `bms_ultratech_current_full.csv` (supplementary high-resolution current table, 32M rows, 66 vehicles)
+- **Source C:** Energy-derived — `capacity_ah = energy_kwh × 1000 / voltage_mean` — bypasses both current sensors entirely
 
-**Method:**
+**Method (Sources A & B):**
 1. Load `cycles.csv` (77,194 sessions, 66 vehicles)
 2. Load the supplementary current table
 3. Use `merge_asof` (5s tolerance) per vehicle to stamp each hves1 row with its session
-4. Coulomb-count per session using `hves1_current` (positive = discharge, `< -50 A` = charging)
+4. Coulomb-count per session using `hves1_current`:
+   - **Discharge sessions:** positive current; regen = `current < -50 A` (5s dt cap)
+   - **Charging sessions:** all negative current (`current < 0`, full dt) — trickle/slow phases included
 5. Aggregate to block level for discharge (matching Source A's method)
 6. Compute `capacity_soh_disc_B` and `capacity_soh_chg_B`
 7. Cache session-level Ah to `artifacts/_soh_comparison_cache.csv` for fast re-runs (~2 min first run, instant on re-run)
 
+**Charging threshold fix (commit 2fe7955):**
+
+Previously the `-50 A` cutoff was applied uniformly across all sessions. This excluded trickle/slow charging current (0 to -50 A) from charging sessions, causing Source B charging SOH to appear ~83% instead of ~100%. Fixed by splitting the mask:
+
+```python
+regen_mask  = (~is_chg_ses) & (curr_vals < CHARGE_A)  # discharge regen only, 5s dt cap
+plugin_mask =  is_chg_ses   & (curr_vals < 0)          # all plugin/trickle charging, full dt
+```
+
+**Method (Source C — energy-derived):**
+- `capacity_ah_C = energy_kwh × 1000 / voltage_mean` per session
+- Discharge: block-level sum of session `capacity_ah_C`, then normalized by `block_soc_diff`; same quality filter as Source A
+- Charging: session-level, using `abs(energy_kwh)` (sign is negative for charging sessions)
+- True nominal voltage: `282,000 Wh / 436 Ah ≈ 647 V` (for reference only — voltage_mean used directly)
+
 **Additional analyses in the script:**
 - **Idle Ah correction (Source B):** For each inter-session gap within a block where SoC dropped, add synthetic Ah = `idle_soc_gap% / 100 × 436 Ah` to bridge the gap
-- **Source A recomputed with 436 Ah ref:** Recomputes `capacity_soh` for Source A using the `block_capacity_ah` and `block_soc_diff` already in `cycles.csv` but with 436 Ah denominator — for immediate preview without re-running the full pipeline
+- **Source A recomputed with 436 Ah ref:** Recomputes `capacity_soh` for Source A using `block_capacity_ah` and `block_soc_diff` already in `cycles.csv` with 436 Ah denominator — for immediate preview without re-running the full pipeline
 
 **Plots generated:**
 
@@ -99,20 +117,28 @@ A new script that independently validates and compares SOH estimates from two cu
 | `plots/soh_ref_capacity_dist.png` | Per-vehicle ref_capacity_ah vs nominal |
 | `plots/soh_A_ref_fix_effect.png` | Source A: old p90 ref vs fixed 436 Ah ref |
 | `plots/soh_discharge_idle_adj.png` | Three-way: A vs B vs B + idle Ah correction |
+| `plots/soh_all_sources_discharge.png` | Four-way A / A-436 / B / C discharge comparison (variable-bin histogram + bar chart) |
+| `plots/soh_all_sources_charging.png` | Four-way A / A-436 / B / C charging comparison |
+| `plots/soh_energy_distribution.png` | Source C variable-bin histogram (5 pp / 2 pp / 0.5 pp bins) |
 
 ---
 
 ## Observations
 
-### Charging SOH — Sources A and B agree almost perfectly
+### Charging SOH — All three sources agree (with correct threshold)
+
+After the charging threshold fix (commit 2fe7955), trickle/slow charging current (0 to -50 A) is no longer excluded from Source B:
 
 ```
-Source A (BMS)   n=7,493   mean=99.97%   std=1.70%
-Source B (hves1) n=7,493   mean=99.95%   std=1.46%
-B − A            mean=−0.02%   MAE=0.09%   within ±5%: 99.8%
+Source A (BMS, 436 Ah ref)    n=7,493   mean≈100%   ~78% clip above 100%
+Source B (hves1, 436 Ah ref)  n=7,493   mean≈100%   ~73% clip above 100%
+Source C (energy/V, 436 Ah)   n=7,492   mean≈100%   ~78% clip above 100%
+B − A   MAE≈0.04%   within ±5%: >99%
 ```
 
-Charging Ah from both sensors are virtually identical. The charging-side SOH of ~100% is consistent with a healthy fleet (charging always restores close to full capacity).
+All three sources produce near-identical charging SOH. The high clip rate (~73–78%) is **expected for a healthy fleet** — batteries routinely return close to or above nominal capacity during a full charge cycle. This is correct behaviour, not an artefact.
+
+> **Note on old numbers:** The previously reported charging MAE of 0.09% (Sources A & B) was computed when `ref_capacity_ah` was still the p90 ~197 Ah value. With the old ref, all sources clipped to 100% regardless, masking any real difference. With 436 Ah ref and the fixed charging threshold, the MAE is ~0.04%.
 
 ---
 
@@ -127,11 +153,12 @@ B − A   mean=+30.08%   MAE=30.44%   within ±5%: 25.0%
 This 30 pp gap was initially attributed to the ref_capacity_ah error. After fixing ref to 436 Ah for Source A:
 
 ```
-Source A (BMS, fixed 436 Ah ref)   n=26,881   mean=31.82%   median=30.47%
-Source B (hves1, fixed 436 Ah ref) n=26,881   mean=95.15%   median=100.00%
+Source A (BMS, fixed 436 Ah ref)   n=5,876   mean=25.1%   max=93.0%   clip above 100%: 0%
+Source B (hves1, fixed 436 Ah ref) n=5,876   mean=80.9%   p90=116.4%  clip above 100%: 41.9%
+Source C (energy/V, fixed 436 Ah)  n=5,876   mean=14.4%   clip above 100%: 0%   below 0%: 4.6%
 ```
 
-The gap **widens to ~63 pp** once both use the same denominator. This reveals a genuine sensor-level discrepancy: the BMS `current_mean` (Source A) records far fewer Coulombs than `hves1_current` (Source B) during the same discharge sessions.
+The gap **widens to ~56 pp (A vs B)** once both use the same denominator. Source C (energy-derived) is even lower than Source A, suggesting it is also under-counting discharge energy relative to hves1. Source B's 41.9% clip rate is caused by the 3× current over-count (hves1 implied ~75 A mean vs BMS ~22 A mean for the same sessions).
 
 ---
 
@@ -143,21 +170,35 @@ Adding synthetic Ah for unmeasured idle parking gaps moves Source B from 96.42% 
 
 ### Summary of discharge SOH estimates
 
-| Method | ref | mean SOH | median SOH |
+| Method | ref | mean SOH | median SOH | clip >100% |
+|---|---|---|---|---|
+| Source A — old pipeline | p90 ~197 Ah | 67.56% | 70.74% | 0% |
+| Source A — fixed ref | 436 Ah | 25.1% | ~24% | 0% |
+| Source B (hves1, block) | 436 Ah | 80.9% | 100.00% | 41.9% |
+| Source B (hves1 + idle Ah) | 436 Ah | ~79% | 100.00% | ~40% |
+| Source C (energy/voltage) | 436 Ah | 14.4% | ~13% | 0% |
+
+### Summary of charging SOH estimates
+
+| Method | ref | mean SOH | clip >100% |
 |---|---|---|---|
-| Source A — old pipeline | p90 ~197 Ah | 67.56% | 70.74% |
-| Source A — fixed ref | 436 Ah | 31.82% | 30.47% |
-| Source B (hves1, block) | 436 Ah | 96.42% | 100.00% |
-| Source B (hves1 + idle Ah) | 436 Ah | 95.15% | 100.00% |
+| Source A BMS (p90 ref, old) | ~197 Ah | 100% (all clipped) | ~100% |
+| Source A BMS (436 Ah ref) | 436 Ah | ~101% | 78% |
+| Source B hves1 (old threshold) | 436 Ah | ~83% | low |
+| Source B hves1 (fixed threshold) | 436 Ah | ~101% | 73% |
+| Source C energy/voltage | 436 Ah | ~101% | 78% |
 
 ---
 
 ### Interpretation
 
-The two current sources produce fundamentally different discharge Ah counts for the same sessions. The most likely explanations are:
+The three current/energy sources produce fundamentally different discharge Ah counts for the same sessions. Key findings:
 
-1. **Sensor placement / scaling:** `hves1_current` may be measured at a different point in the power path (e.g., pack-side vs motor-side), or may use a different current sensor with a higher gain.
-2. **Sampling rate / integration:** The supplementary table (32M rows, ~66 vehicles) may have a higher temporal resolution than what `current_mean` in cycles.csv captures after session-level aggregation.
-3. **Sign / offset correction:** The BMS may apply corrections (e.g., zero-offset calibration) that reduce the reported current magnitude.
+1. **hves1 discharge over-counts by ~3×:** Implied mean current from hves1 ≈ 75 A vs BMS ≈ 22 A for the same sessions. This is not explained by dt inflation (hves1 average dt = 6.1s, within the 5-min cap). Most likely causes:
+   - **Sensor placement / scaling:** hves1 may be measured at the pack terminals (both strings in parallel) while BMS may report per-string current
+   - **Different current sensor with higher gain or different calibration**
+2. **Source C discharge under-counts:** Energy-derived Ah (energy_kwh × 1000 / voltage_mean) produces even lower SOH than Source A BMS, suggesting `energy_kwh` in cycles.csv is computed from the same under-counting BMS current (V × I_BMS integration)
+3. **Charging sources all agree:** All three sources return ~100% charging SOH with 436 Ah ref, consistent with healthy batteries being fully restored each charge cycle
+4. **4.6% of Source C discharge blocks below 0%:** Caused by small or near-zero `energy_kwh` values in short discharge sessions, or high `voltage_mean` outliers
 
-**Recommended next step:** Plot `hves1_current` vs `current_mean` time-series for one or two representative sessions to identify whether the discrepancy is a scaling factor, an offset, or session-boundary effects.
+**Recommended next step:** Plot `hves1_current` vs `current_mean` time-series for one or two representative sessions to identify whether the discharge discrepancy is a constant scaling factor, a measurement-point difference, or session-boundary effects.
