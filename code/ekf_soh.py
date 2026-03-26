@@ -1,0 +1,296 @@
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) if "__file__" in dir() else os.getcwd())
+
+"""
+ekf_soh.py — Extended Kalman Filter for per-vehicle SoH tracking.
+
+State vector  x = [SoH (%), IR_drift (Ω), spread_drift (V)]
+
+Process model (per charging-session step):
+    SoH(k+1)    = SoH(k)    − α·Δefc − β·Δdays·(CAL_AGING_RATE/365)   + w₁
+    IR(k+1)     = IR(k)     + γ·Δefc                                    + w₂
+    spread(k+1) = spread(k) + δ·Δefc                                    + w₃
+
+Observation model (charging sessions only, non-NaN observations):
+    z = [capacity_soh, bms_soh, ir_ohm_mean, cell_spread_mean]
+    H = [[1, 0, 0],   # capacity_soh ≈ SoH
+         [1, 0, 0],   # bms_soh      ≈ SoH (noisier)
+         [0, 1, 0],   # ir_ohm_mean  ≈ baseline_ir + IR_drift
+         [0, 0, 1]]   # cell_spread  ≈ baseline_spread + spread_drift
+
+Outputs
+-------
+ekf_soh.csv  — one row per charging session with:
+    ekf_soh, ekf_soh_std, ekf_ir, ekf_spread,
+    ekf_rul_days, ekf_rul_days_lo, ekf_rul_days_hi
+"""
+
+import numpy as np
+import pandas as pd
+from config import (
+    CYCLES_CSV, EKF_CSV, BASE,
+    EKF_Q_DIAG, EKF_R_DIAG,
+    EOL_SOH, EFC_MAX, CAL_AGING_RATE,
+    EKF_ALPHA,
+)
+
+# ── EKF physical parameters ────────────────────────────────────────────────────
+# Process model coefficients (fleet-wide priors; refined per vehicle via EKF)
+ALPHA = EKF_ALPHA  # %SoH lost per EFC (cycle aging) — set in config.py
+BETA  = 1.0      # scale factor on calendar aging term
+GAMMA = 0.001    # Ω per EFC            (IR growth)
+DELTA = 0.0001   # V per EFC            (spread growth)
+
+# Initial state and covariance
+X0    = np.array([100.0, 0.0, 0.0])          # fresh pack
+P0    = np.diag([4.0, 1e-3, 1e-4])           # ±2% SoH, small IR/spread uncertainty
+
+# Noise matrices
+Q     = np.diag(EKF_Q_DIAG)                  # process noise
+R_ALL = np.diag(EKF_R_DIAG)                  # observation noise (all 4 obs)
+
+# Observation matrix H  (4 × 3)
+H_ALL = np.array([
+    [1.0, 0.0, 0.0],   # capacity_soh → SoH
+    [1.0, 0.0, 0.0],   # bms_soh      → SoH
+    [0.0, 1.0, 0.0],   # ir_ohm_mean  → IR_drift
+    [0.0, 0.0, 1.0],   # cell_spread  → spread_drift
+])
+
+# Observation column names (must match cycles.csv)
+OBS_COLS = ["capacity_soh", "soh", "ir_ohm_mean", "cell_spread_mean"]
+
+
+# ── EKF core ───────────────────────────────────────────────────────────────────
+
+def _build_F(delta_efc: float, delta_days: float) -> np.ndarray:
+    """State transition Jacobian F (3×3) for one step."""
+    return np.array([
+        [1.0,  0.0,  0.0],
+        [0.0,  1.0,  0.0],
+        [0.0,  0.0,  1.0],
+    ])
+
+
+def _process(x: np.ndarray, delta_efc: float, delta_days: float) -> np.ndarray:
+    """Nonlinear state transition (same as F since model is linear in state)."""
+    x_new = x.copy()
+    x_new[0] -= ALPHA * delta_efc + BETA * delta_days * (CAL_AGING_RATE / 365.0)
+    x_new[1] += GAMMA * delta_efc
+    x_new[2] += DELTA * delta_efc
+    return x_new
+
+
+def ekf_step(x: np.ndarray, P: np.ndarray,
+             z_obs: np.ndarray,
+             delta_efc: float, delta_days: float) -> tuple:
+    """
+    One EKF predict + update step.
+
+    Parameters
+    ----------
+    x         : current state (3,)
+    P         : current covariance (3,3)
+    z_obs     : observation vector (4,) — NaN entries are skipped
+    delta_efc : EFC change since last session
+    delta_days: calendar days since last session
+
+    Returns
+    -------
+    x_new, P_new
+    """
+    # ── Predict ──
+    F     = _build_F(delta_efc, delta_days)
+    x_p   = _process(x, delta_efc, delta_days)
+    P_p   = F @ P @ F.T + Q
+
+    # ── Update (skip NaN observations) ──
+    valid = ~np.isnan(z_obs)
+    if not valid.any():
+        return x_p, P_p
+
+    H_v = H_ALL[valid]
+    R_v = R_ALL[np.ix_(valid, valid)]
+    z_v = z_obs[valid]
+
+    S   = H_v @ P_p @ H_v.T + R_v
+    K   = P_p @ H_v.T @ np.linalg.inv(S)
+    inn = z_v - H_v @ x_p                  # innovation
+
+    x_new = x_p + K @ inn
+    x_new[0] = np.clip(x_new[0], 0.0, 105.0)   # SoH must be in plausible range
+    P_new = (np.eye(3) - K @ H_v) @ P_p
+
+    return x_new, P_new
+
+
+# ── RUL from EKF state ─────────────────────────────────────────────────────────
+
+def _rul_from_ekf(soh: float, soh_std: float, avg_efc_per_day: float,
+                  eol: float = EOL_SOH) -> dict:
+    """Compute point + uncertainty RUL from EKF state and its std."""
+    if soh <= eol or not np.isfinite(avg_efc_per_day) or avg_efc_per_day <= 0:
+        return {"ekf_rul_days": 0.0, "ekf_rul_days_lo": 0.0, "ekf_rul_days_hi": 0.0}
+
+    # Rate: combined calendar + cycle, approximated from EKF process parameters
+    daily_soh_rate = (ALPHA * avg_efc_per_day +
+                      BETA * CAL_AGING_RATE / 365.0)
+    if daily_soh_rate <= 0:
+        return {"ekf_rul_days": np.inf, "ekf_rul_days_lo": np.inf, "ekf_rul_days_hi": np.inf}
+
+    remaining = soh - eol
+    rul_point = remaining / daily_soh_rate
+
+    # Uncertainty bands: propagate SoH std through remaining / rate
+    remaining_lo = max(0.0, remaining - 1.96 * soh_std)
+    remaining_hi = remaining + 1.96 * soh_std
+    rul_lo = remaining_lo / daily_soh_rate
+    rul_hi = remaining_hi / daily_soh_rate
+
+    def _cap(v):
+        return round(min(v, 36500.0), 0) if np.isfinite(v) else None
+
+    return {
+        "ekf_rul_days":    _cap(rul_point),
+        "ekf_rul_days_lo": _cap(rul_lo),
+        "ekf_rul_days_hi": _cap(rul_hi),
+    }
+
+
+# ── Per-vehicle batch loop ─────────────────────────────────────────────────────
+
+def run_ekf_fleet(cycles: pd.DataFrame) -> pd.DataFrame:
+    """
+    Run EKF on charging sessions for every vehicle. Skips sessions where
+    soh_low_confidence=True or capacity_soh is NaN (prediction-only step).
+
+    Returns a DataFrame with one row per charging session plus EKF columns.
+    """
+    # Use charging sessions only — the reliable side for capacity_soh
+    chg = cycles[cycles["session_type"] == "charging"].copy()
+    chg = chg.sort_values(["registration_number", "start_time"]).reset_index(drop=True)
+
+    # Compute cum_efc and days_since_first if not already present
+    if "cum_efc" not in chg.columns:
+        chg["_efc_s"] = chg["soc_range"].abs() / 100.0
+        chg["cum_efc"] = chg.groupby("registration_number")["_efc_s"].transform("cumsum")
+        chg.drop(columns=["_efc_s"], inplace=True)
+
+    if "days_since_first" not in chg.columns:
+        chg["days_since_first"] = (
+            chg.groupby("registration_number")["start_time"]
+            .transform(lambda x: (x - x.min()) / 86_400_000.0)
+        )
+
+    results = []
+
+    for reg, veh in chg.groupby("registration_number"):
+        veh = veh.sort_values("start_time").reset_index(drop=True)
+
+        # Per-vehicle avg EFC/day for RUL projection
+        days_span = float(veh["days_since_first"].iloc[-1])
+        efc_total = float(veh["cum_efc"].iloc[-1])
+        avg_efc_per_day = (efc_total / days_span) if days_span > 1.0 else np.nan
+
+        x = X0.copy()
+        P = P0.copy()
+
+        for _, row in veh.iterrows():
+            # Step increments
+            delta_efc  = float(row.get("soc_range", 0.0) or 0.0) / 100.0
+            delta_days = float(row.get("days_since_first", 0.0) or 0.0)
+            if len(results) > 0 and results[-1]["registration_number"] == reg:
+                prev_days = float(results[-1].get("days_since_first_session", delta_days))
+                delta_days = max(0.0, delta_days - prev_days)
+            else:
+                delta_days = 0.0
+
+            # Build observation vector
+            low_conf = bool(row.get("soh_low_confidence", False))
+            z = np.array([
+                float(row["capacity_soh"]) if (not low_conf and "capacity_soh" in row and
+                                               pd.notna(row["capacity_soh"])) else np.nan,
+                float(row["soh"]) if pd.notna(row.get("soh")) else np.nan,
+                float(row["ir_ohm_mean"]) if pd.notna(row.get("ir_ohm_mean")) else np.nan,
+                float(row["cell_spread_mean"]) if pd.notna(row.get("cell_spread_mean")) else np.nan,
+            ])
+
+            x, P = ekf_step(x, P, z, delta_efc, delta_days)
+
+            ekf_soh     = float(x[0])
+            ekf_soh_std = float(np.sqrt(max(0.0, P[0, 0])))
+            rul_dict    = _rul_from_ekf(ekf_soh, ekf_soh_std, avg_efc_per_day)
+
+            results.append({
+                "registration_number":    reg,
+                "session_id":             row.get("session_id"),
+                "start_time":             row.get("start_time"),
+                "days_since_first_session": float(row.get("days_since_first", 0.0)),
+                "cum_efc":                float(row.get("cum_efc", 0.0)),
+                "capacity_soh_obs":       z[0],
+                "bms_soh_obs":            z[1],
+                "ekf_soh":                round(ekf_soh, 3),
+                "ekf_soh_std":            round(ekf_soh_std, 4),
+                "ekf_ir":                 round(float(x[1]), 6),
+                "ekf_spread":             round(float(x[2]), 6),
+                **rul_dict,
+            })
+
+    return pd.DataFrame(results)
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    print(f"Loading cycles from {CYCLES_CSV} ...")
+    cycles = pd.read_csv(CYCLES_CSV)
+    print(f"  {len(cycles):,} sessions, {cycles['registration_number'].nunique()} vehicles")
+
+    print("Running EKF fleet-wide ...")
+    ekf_df = run_ekf_fleet(cycles)
+    print(f"  EKF output: {len(ekf_df):,} charging sessions")
+
+    ekf_df.to_csv(EKF_CSV, index=False)
+    print(f"Saved: {EKF_CSV}")
+
+    # ── Verification summary ───────────────────────────────────────────────────
+    print("\n" + "=" * 70)
+    print("EKF SOH TRACKING SUMMARY  (per vehicle)")
+    print("=" * 70)
+    summary = (
+        ekf_df.groupby("registration_number")
+        .agg(
+            n_sessions      = ("ekf_soh",     "count"),
+            ekf_soh_final   = ("ekf_soh",     "last"),
+            ekf_soh_std_mean= ("ekf_soh_std", "mean"),
+            ekf_rul_days    = ("ekf_rul_days", "last"),
+            cum_efc_final   = ("cum_efc",      "last"),
+        )
+        .round(3)
+        .sort_values("ekf_soh_final")
+    )
+    print(summary.to_string())
+
+    print(f"\nFleet EKF SoH: "
+          f"mean={ekf_df.groupby('registration_number')['ekf_soh'].last().mean():.2f}%  "
+          f"std={ekf_df.groupby('registration_number')['ekf_soh'].last().std():.2f}%")
+    print(f"Fleet EKF RUL: "
+          f"median={ekf_df.groupby('registration_number')['ekf_rul_days'].last().median():.0f} days")
+
+    # Verification checks
+    print("\n── Verification checks ──")
+    ekf_last = ekf_df.groupby("registration_number").last().reset_index()
+
+    # Check: ekf_soh vs capacity_soh_obs should be within ±2%
+    valid_obs = ekf_last.dropna(subset=["capacity_soh_obs"])
+    if len(valid_obs):
+        diff = (valid_obs["ekf_soh"] - valid_obs["capacity_soh_obs"]).abs()
+        pct_within_2 = (diff <= 2.0).mean() * 100
+        print(f"  ekf_soh within ±2% of capacity_soh: {pct_within_2:.0f}% of vehicles ✓" if pct_within_2 >= 80
+              else f"  ⚠ ekf_soh vs capacity_soh: only {pct_within_2:.0f}% within ±2%")
+
+    # Check: ekf_soh_std shrinks with more data
+    if len(ekf_df) > 100:
+        early  = ekf_df[ekf_df["cum_efc"] < ekf_df["cum_efc"].quantile(0.25)]["ekf_soh_std"].mean()
+        late   = ekf_df[ekf_df["cum_efc"] > ekf_df["cum_efc"].quantile(0.75)]["ekf_soh_std"].mean()
+        print(f"  ekf_soh_std early vs late sessions: {early:.4f} → {late:.4f} "
+              f"({'shrinking ✓' if late < early else '⚠ not shrinking'})")

@@ -1,0 +1,109 @@
+"""
+Shared configuration for fleet battery SoH / RUL analysis.
+All paths and constants live here so every other script imports them.
+"""
+import os
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+# Project root = parent of the code/ directory (portable across machines)
+BASE         = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR     = os.path.join(BASE, "data")        # raw input data
+ARTIFACTS_DIR = os.path.join(BASE, "artifacts")  # generated CSVs, models, numpy files
+PLOTS_DIR    = os.path.join(BASE, "plots")        # all plot images
+
+# Create output directories if they don't exist
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(ARTIFACTS_DIR, exist_ok=True)
+os.makedirs(PLOTS_DIR, exist_ok=True)
+
+BMS_FILE   = os.path.join(DATA_DIR, "bms_full_ultratech_intangles_more_cols_full.csv")
+GPS_FILE   = os.path.join(DATA_DIR, "gps_full_ultratech_intangles.csv")
+VCU_FILE   = os.path.join(DATA_DIR, "vcu_full_ultratech_intangles.csv")
+CYCLES_CSV = os.path.join(ARTIFACTS_DIR, "cycles.csv")        # one row per session
+SEQ_NPY    = os.path.join(ARTIFACTS_DIR, "sequences.npy")      # discharge sequences (N, BINS, FEATS)
+SEQ_META   = os.path.join(ARTIFACTS_DIR, "sequence_meta.csv")  # maps seq index → vehicle / cycle
+
+# ── Data-quality filters ───────────────────────────────────────────────────────
+# Based on physical limits for this fleet (650 V NMC pack, fleet EV)
+VOLTAGE_RANGE   = (400.0, 760.0)    # total pack voltage (V)
+CURRENT_RANGE   = (-2000.0, 2000.0) # A — wide; only drops clear sensor faults
+                                    # NOTE: upper bound must be >> HIGH_CURRENT_A (150A)
+                                    # so high-discharge rows (voltage sag, IR events) are not filtered out
+CELL_V_RANGE    = (2.5,   4.3)      # per-cell voltage (V)
+TEMP_RANGE      = (-10.0, 80.0)     # °C
+SOH_MIN         = 50.0              # drop 0.0 (corrupt) readings
+
+GPS_GAP_MAX_SEC  = 120   # seconds — GPS speed/position is nulled when nearest GPS
+                          # record is older than this. Prevents stale-speed regen misclassification.
+ODO_GAP_MAX_SEC  = 300   # seconds — VCU odometer is nulled when nearest VCU record
+                          # is older than this. Prevents spurious energy/km values.
+EPK_MAX_KWH_KM   = 5.0   # physical upper bound for energy/km (kWh/km).
+                          # 282 kWh pack × 5 kWh/km = ~56 km range: conservative minimum.
+                          # Trips exceeding this are GPS/odometer artifacts → set to NaN.
+REGEN_SPEED_KPH  = 5.0   # kph — minimum speed to consider a negative-current event as
+                          # regenerative braking rather than plug-in charging
+
+# ── Session detection (from current sign — no GPS needed) ─────────────────────
+# Convention in this BMS: positive current = discharging, negative = charging
+DISCHARGE_A      =  20.0   # current ABOVE this  → discharging
+CHARGE_A         = -50.0   # current BELOW this  → charging (sustained charge events)
+MIN_SESSION_MIN  =  10.0   # drop sessions shorter than 10 minutes
+TRIP_GAP_MIN     =  15.0   # minutes — inter-session idle gap that ends a trip
+MIN_BMS_ROWS     =   5     # minimum rows to keep a session
+MAX_DT_MIN       =   5.0   # cap Δt in coulomb counting (avoids inflating Ah
+                            # when BMS goes silent during parking/off periods)
+
+# ── Sequence extraction ────────────────────────────────────────────────────────
+NUM_BINS     = 20
+SEQ_FEATURES = ["voltage", "current", "soc", "cell_spread", "temp_highest"]
+# cell_spread = max_cell_voltage - min_cell_voltage  (cell imbalance; grows with aging)
+
+# Session-level scalar health features fed into the neural model's SoH head
+# and used as additional Isolation Forest features
+SCALAR_FEATURES = [
+    "n_vsag",
+    "n_high_ir", "n_low_soc", "temp_rise_rate", "energy_per_km",
+    "cell_spread_mean",   
+    "bms_coverage",       # data quality — helps model weight sequences
+    "time_delta_hr",      
+]
+
+#  Health flag thresholds 
+IR_THRESHOLD_MOHM    =  30.0    #IR threshold (|ΔV/ΔI|)
+LOW_SOC_PCT          =  20.0    
+BATTERY_CAPACITY_KWH  = 282.0   
+NOMINAL_VOLTAGE_V     = 630.0   
+NOMINAL_CAPACITY_AH   = 436.0
+
+#  RUL 
+EOL_SOH = 80.0  
+
+# ── Battery life & aging parameters ──────────────────────────────────────────
+EFC_MAX        = 3000     
+CAL_AGING_LO   = 0.03    
+CAL_AGING_HI   = 0.06    
+CAL_AGING_RATE = 0.045   
+
+#  EKF physical parameters 
+EKF_ALPHA = 0.005   # %SoH / EFC  (was 0.007)
+
+#  EKF state-space noise matrices 
+# Process noise Q — diagonal entries: [SoH (%), IR drift (Ω), spread drift (V)]
+EKF_Q_DIAG = [1e-4, 2.5e-7, 2.5e-9]      # [0.01², 0.0005², 0.00005²]
+# Observation noise R — diagonal: [capacity_soh, bms_soh, ir_ohm_mean, cell_spread_mean]
+# bms_soh noise raised from 4.0 → 9.0 (3.0²): BMS reports integer steps only;
+# higher R makes the EKF rely less on the noisy integer observation and more
+# on the physics-based process model, producing more stable SoH estimates.
+EKF_R_DIAG = [2.25, 9.0, 4e-6, 2.5e-5]   # [1.5², 3.0², 0.002², 0.005²]
+
+# EKF output file
+EKF_CSV = os.path.join(ARTIFACTS_DIR, "ekf_soh.csv")
+
+#  Session quality filters for trend fitting & supervised models 
+# Do NOT apply to: CUSUM, Isolation Forest, EKF (benefit from all sessions).
+MIN_SOC_RANGE_FOR_TREND = 10.0   # discharge session
+MIN_UNIQUE_SOH_FOR_OLS  = 3      # need at least 3 distinct BMS SoH values before OLS is meaningful (avoids fitting # integer-quantisation noise on young vehicles)
+OLS_R2_THRESHOLD        = 0.4    # R² below this -> flag as "low_r2" reliability
+
+#  Reproducibility 
+SEED = 42

@@ -1,0 +1,6 @@
+{
+    "python.terminal.executeInFileDir": true,
+    "python.defaultInterpreterPath": "C:/Program Files/Python312/python.exe",
+    "jupyter.notebookFileRoot": "${fileDirname}",
+    "python.REPL.sendToNativeREPL": false
+}

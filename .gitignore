@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.npy
+*.keras
+*.xlsx
+*.pptx
+*.csv
+data/
+plots/
+artifacts/
+ppt/
+readme/
+code/build_presentation.py
