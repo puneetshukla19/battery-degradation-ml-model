@@ -165,6 +165,140 @@ Generates diagnostic and summary plots from all pipeline outputs.
 
 ---
 
+## Data Extraction (AWS Athena)
+
+All input data is pulled from Athena. Run each query in the Athena console (or via `boto3`) and export as CSV to the `data/` directory before running the pipeline.
+
+---
+
+### 1. BMS Telemetry — `data/bms_full_ultratech_intangles_more_cols_full.csv`
+
+Core BMS signals: voltage, current, SoC, SoH, cell voltages, temperatures, relay states, power limits, and insulation resistance.
+
+```sql
+SELECT
+    registration_number,
+    gps_time,
+    event_datetime,
+    vendor,
+    spv,
+    voltage,
+    current,
+    soc,
+    soh,
+    battery_operating_state,
+    status_heating_control,
+    status_cooling_control,
+    status_charge_relay_off,
+    status_charge_relay_on,
+    status_precharge_relay,
+    status_positive_relay,
+    status_negative_relay,
+    max_discharge_power_limit,
+    max_charge_power_limit,
+    max_discharge_current_limit,
+    max_charge_current_limit,
+    min_cell_voltage,
+    max_cell_voltage,
+    min_cell_voltage_number,
+    max_cell_voltage_number,
+    min_cell_voltage_subsystem_number,
+    max_cell_voltage_subsystem_number,
+    temperature_lowest,
+    temperature_highest,
+    temperature_lowest_probe_number,
+    temperature_highest_probe_number,
+    temperature_lowest_subsystem_number,
+    temperature_highest_subsystem_number,
+    insulation_resistance,
+    subsystem_voltage,
+    subsystem_number,
+    subsystem_total_number,
+    subsystem_current
+FROM "unified"."bms_raw_parsed"
+WHERE spv = 'ULTRATECH'
+  AND vendor = 'intangles';
+```
+
+---
+
+### 2. GPS / Location — `data/gps_full_ultratech_intangles.csv`
+
+GPS telemetry: coordinates, altitude, heading, speed.
+
+```sql
+SELECT
+    registration_number,
+    gps_time,
+    event_datetime,
+    latitude,
+    longitude,
+    altitude,
+    head,
+    speed,
+    vendor,
+    spv
+FROM "unified"."location"
+WHERE spv = 'ULTRATECH'
+  AND vendor = 'intangles';
+```
+
+---
+
+### 3. MCU Data — `data/mcu_full_ultratech_intangles.csv`
+
+Motor controller unit raw signals.
+
+```sql
+SELECT *
+FROM "unified"."mcu_raw_parsed"
+WHERE spv = 'ULTRATECH'
+  AND vendor = 'intangles';
+```
+
+---
+
+### 4. VCU Data — `data/vcu_full_ultratech_intangles.csv`
+
+Vehicle controller unit signals (includes odometer).
+
+```sql
+SELECT *
+FROM "unified"."vcu_raw_parsed"
+WHERE spv = 'ULTRATECH'
+  AND vendor = 'intangles';
+```
+
+---
+
+### 5. High-Resolution Current Table — `data/bms_ultratech_current_full.csv`
+
+Supplementary table with high-resolution `hves1_current` and `hves1_voltage_level` used for Source B SOH comparison. Approximately 32 million rows across 66 vehicles.
+
+```sql
+SELECT
+    registration_number,
+    timestamp,
+    hves1_voltage_level,
+    hves1_current
+FROM "processed"."intangles_bms"
+WHERE event_datetime > date '2025-10-01'
+  AND spv = 'ULTRATECH';
+```
+
+> **Note:** Remove the `event_datetime` filter to pull the full history. The filter above limits to data from October 2025 onwards. Adjust the date range as needed for the analysis window.
+
+---
+
+### Export instructions
+
+1. Run each query in the [Athena console](https://console.aws.amazon.com/athena/)
+2. Download the result CSV from the S3 output location (shown under **Query results** after execution)
+3. Rename the file to match the name shown above and place it in the `data/` directory
+4. The `data/` directory is excluded from git (see `.gitignore`) — data files are never committed to the repo
+
+---
+
 ## Pipeline Execution Order
 
 ```bash
