@@ -142,21 +142,33 @@ for reg in tqdm(vehicles, desc="Vehicles") if not os.path.exists(CACHE_FILE) els
     merged = merged.sort_values(["session_id", "timestamp"])
     dt_hr       = merged.groupby("session_id")["timestamp"].diff().fillna(0) / 3_600_000
     dt_hr       = dt_hr.clip(0, MAX_DT_MIN / 60)
+    # Regen dt cap only applies inside discharge sessions (short regen spikes)
     dt_hr_regen = dt_hr.clip(0, REGEN_DT_MAX_SEC / 3_600)
 
-    curr_vals = merged["hves1_current"].values
-    disc_mask = curr_vals > 0
-    chg_mask  = curr_vals < CHARGE_A
+    curr_vals  = merged["hves1_current"].values
+    is_chg_ses = (merged["session_type"] == "charging").values
 
-    merged["_dq_disc"]  = np.where(disc_mask,  curr_vals * dt_hr.values,              0.0)
-    merged["_dq_chg"]   = np.where(chg_mask,   np.abs(curr_vals * dt_hr_regen.values), 0.0)
+    disc_mask  = curr_vals > 0
 
-    sess_stats = merged.groupby("session_id").agg(
-        capacity_ah_disc_B  = ("_dq_disc",           "sum"),
-        capacity_ah_chg_B   = ("_dq_chg",            "sum"),
-        voltage_mean_B      = ("hves1_voltage_level", "mean"),
-        n_rows_B            = ("timestamp",           "count"),
-    ).reset_index()
+    # Discharge sessions:  regen = current < CHARGE_A (-50 A), capped dt to 5 s
+    #   — keeps regen braking separate from noise/trickle in a moving session
+    # Charging sessions:   count ALL negative current (< 0), full dt
+    #   — trickle / slow phases (0 to -50 A) must be included for accuracy
+    regen_mask   = (~is_chg_ses) & (curr_vals < CHARGE_A)
+    plugin_mask  = is_chg_ses    & (curr_vals < 0)
+
+    merged["_dq_disc"]  = np.where(disc_mask,   curr_vals * dt_hr.values,               0.0)
+    merged["_dq_chg"]   = np.where(regen_mask,  np.abs(curr_vals * dt_hr_regen.values), 0.0)
+    merged["_dq_plugin"] = np.where(plugin_mask, np.abs(curr_vals * dt_hr.values),       0.0)
+
+    sess_grp = merged.groupby("session_id")
+    sess_stats = pd.DataFrame({
+        "capacity_ah_disc_B" : sess_grp["_dq_disc"].sum(),
+        # regen Ah (discharge sessions) + plugin/trickle Ah (charging sessions)
+        "capacity_ah_chg_B"  : sess_grp["_dq_chg"].sum() + sess_grp["_dq_plugin"].sum(),
+        "voltage_mean_B"     : sess_grp["hves1_voltage_level"].mean(),
+        "n_rows_B"           : sess_grp["timestamp"].count(),
+    }).reset_index()
     sess_stats["registration_number"] = reg
 
     all_sess_stats.append(sess_stats)
@@ -222,6 +234,124 @@ if "block_id" in cycles.columns and "block_capacity_ah" in cycles.columns:
     a436 = cycles["capacity_soh_disc_A436"].dropna()
     print(f"  capacity_soh_disc_A436: n={len(a436):,}  mean={a436.mean():.2f}%  "
           f"median={a436.median():.2f}%  std={a436.std():.2f}%")
+
+print("\nDeriving Source C — energy-derived capacity SOH ...")
+# ══════════════════════════════════════════════════════════════════════════════
+# Source C: capacity derived from energy_kwh / voltage_mean
+#
+#   capacity_ah_C = energy_kwh × 1000 / voltage_mean
+#
+# This bypasses both current sensors entirely. It uses the pack energy
+# (already computed in data_prep_1.py from V × I integration) and the
+# mean pack voltage to back-calculate Ah. Since energy is computed from
+# the BMS voltage × current product, it is less sensitive to the raw
+# current value — the voltage measurement is generally much more accurate
+# than current sensors on EV packs.
+#
+# Discharge (block-level, same structure as Source A):
+#   block_energy_kwh = sum of session energy_kwh across the block
+#   block_cap_C      = block_energy_kwh × 1000 / voltage_mean_block
+#   norm_cap_C       = block_cap_C / (block_soc_diff / 100)
+#   capacity_soh_disc_C = (norm_cap_C / 436) × 100, clipped [0, 100]
+#
+# Charging (session-level):
+#   cap_C_chg = energy_kwh × 1000 / voltage_mean × CHARGE_EFF
+#   norm_cap_C_chg = cap_C_chg / (soc_range / 100)
+#   capacity_soh_chg_C = (norm_cap_C_chg / 436) × 100, clipped [0, 100]
+# ══════════════════════════════════════════════════════════════════════════════
+
+TRUE_NOMINAL_V = 282_000.0 / NOMINAL_CAPACITY_AH   # ~647 V — pack energy / nominal cap
+
+cycles["capacity_soh_disc_C"] = np.nan
+cycles["capacity_soh_chg_C"]  = np.nan
+
+has_energy  = "energy_kwh"    in cycles.columns
+has_voltage = "voltage_mean"  in cycles.columns
+
+if has_energy and has_voltage and "block_id" in cycles.columns:
+    # ── Discharge block-level ─────────────────────────────────────────────────
+    disc_C = cycles[
+        (cycles["session_type"] == "discharge") &
+        (cycles["current_mean"] > 0) &
+        cycles["block_id"].notna() &
+        (cycles["block_soc_diff"] < 0) &
+        (cycles["energy_kwh"]   > 0) &
+        (cycles["voltage_mean"] > 0)
+    ].copy()
+
+    # Ah per session from energy: energy_kwh × 1000 / V_mean
+    disc_C["_cap_ah_C"] = disc_C["energy_kwh"] * 1000.0 / disc_C["voltage_mean"]
+
+    blk_C = disc_C.groupby(["registration_number", "block_id"]).agg(
+        block_cap_C    = ("_cap_ah_C",      "sum"),
+        block_v_mean   = ("voltage_mean",   "mean"),
+        block_soc_diff = ("block_soc_diff", "first"),
+    ).reset_index()
+
+    blk_C["dod_C"]      = blk_C["block_soc_diff"].abs()
+    blk_C["norm_cap_C"] = (
+        blk_C["block_cap_C"] / (blk_C["dod_C"] / 100.0)
+    ).replace([np.inf, -np.inf], np.nan)
+
+    quality_C = (
+        (blk_C["dod_C"]      >= MIN_SOC_RANGE_DISC) &
+        (blk_C["block_cap_C"] > 0) &
+        blk_C["norm_cap_C"].notna()
+    )
+    blk_C["soh_disc_C"] = np.nan
+    blk_C.loc[quality_C, "soh_disc_C"] = (
+        (blk_C.loc[quality_C, "norm_cap_C"] / NOMINAL_CAPACITY_AH * 100).clip(0, 100)
+    )
+
+    blk_C_idx = blk_C.set_index(["registration_number", "block_id"])["soh_disc_C"]
+    disc_rows_C = cycles[
+        (cycles["session_type"] == "discharge") &
+        (cycles["current_mean"] > 0) &
+        cycles["block_id"].notna() &
+        (cycles["block_soc_diff"] < 0)
+    ]
+    cycles.loc[disc_rows_C.index, "capacity_soh_disc_C"] = [
+        blk_C_idx.get(k, np.nan)
+        for k in zip(disc_rows_C["registration_number"], disc_rows_C["block_id"])
+    ]
+
+    c_disc_vals = cycles["capacity_soh_disc_C"].dropna()
+    norm_c = blk_C.loc[quality_C, "norm_cap_C"]
+    print(f"  Source C discharge: n={len(c_disc_vals):,}  "
+          f"mean={c_disc_vals.mean():.2f}%  median={c_disc_vals.median():.2f}%  "
+          f"std={c_disc_vals.std():.2f}%")
+    print(f"  norm_cap_C  p50={norm_c.median():.1f}  p90={norm_c.quantile(0.9):.1f}  "
+          f"mean={norm_c.mean():.1f}  > 436 Ah: {(norm_c > NOMINAL_CAPACITY_AH).mean()*100:.1f}%")
+
+    # ── Charging session-level ────────────────────────────────────────────────
+    chg_C = cycles[
+        (cycles["session_type"] == "charging") &
+        (cycles["soc_diff"] > 0) &
+        (cycles["energy_kwh"]   != 0) &   # negative for charging — use abs below
+        (cycles["voltage_mean"] > 0)
+    ].copy()
+
+    chg_C["soc_rng"]     = chg_C["soc_range"].abs()
+    chg_C                = chg_C[chg_C["soc_rng"] >= MIN_SOC_RANGE_CHG]
+    chg_C["_cap_ah_C"]   = chg_C["energy_kwh"].abs() * 1000.0 / chg_C["voltage_mean"]
+    chg_C["norm_cap_C"]  = (
+        chg_C["_cap_ah_C"] * CHARGE_EFF / (chg_C["soc_rng"] / 100.0)
+    ).replace([np.inf, -np.inf], np.nan)
+
+    quality_C_chg = chg_C["norm_cap_C"].notna() & (chg_C["_cap_ah_C"] > 0)
+    cycles.loc[chg_C.index[quality_C_chg], "capacity_soh_chg_C"] = (
+        (chg_C.loc[quality_C_chg, "norm_cap_C"] / NOMINAL_CAPACITY_AH * 100).clip(0, 100)
+    )
+
+    c_chg_vals    = cycles["capacity_soh_chg_C"].dropna()
+    norm_c_chg    = chg_C.loc[quality_C_chg, "norm_cap_C"]
+    print(f"  Source C charging:  n={len(c_chg_vals):,}  "
+          f"mean={c_chg_vals.mean():.2f}%  median={c_chg_vals.median():.2f}%  "
+          f"std={c_chg_vals.std():.2f}%")
+    print(f"  norm_cap_C_chg p50={norm_c_chg.median():.1f}  p90={norm_c_chg.quantile(0.9):.1f}  "
+          f"mean={norm_c_chg.mean():.1f}  > 436 Ah: {(norm_c_chg > NOMINAL_CAPACITY_AH).mean()*100:.1f}%")
+else:
+    print("  WARNING: energy_kwh or voltage_mean missing from cycles.csv — skipping Source C.")
 
 print("\nDeriving capacity_soh_B ...")
 
@@ -470,6 +600,15 @@ if cycles["capacity_soh_disc_B_adj"].notna().any():
     if len(delta_adj):
         print(f"    B_adj - A:  n={len(delta_adj):,}  mean={delta_adj.mean():+.2f}%  "
               f"MAE={delta_adj.abs().mean():.2f}%  within +/-5%: {(delta_adj.abs()<=5).mean():.1%}")
+
+# Source C summary
+if cycles["capacity_soh_disc_C"].notna().any() or cycles["capacity_soh_chg_C"].notna().any():
+    print(f"\n  Source C (energy / voltage — independent of current sensors):")
+    for label, col in [("Discharge", "capacity_soh_disc_C"), ("Charging ", "capacity_soh_chg_C")]:
+        v = cycles[col].dropna()
+        if len(v):
+            print(f"    {label}: n={len(v):,}  mean={v.mean():.2f}%  "
+                  f"median={v.median():.2f}%  std={v.std():.2f}%")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -728,5 +867,233 @@ if cycles["capacity_soh_disc_B_adj"].notna().any():
         fig.savefig(out, dpi=DPI, bbox_inches="tight")
         plt.close(fig)
         print(f"  Saved: {out}")
+
+# ── Plot 7: Four-way comparison: A_orig / A_436 / B_adj / C (energy) ─────────
+if cycles["capacity_soh_disc_C"].notna().any():
+    disc_src = cycles["capacity_soh_source"] == "discharge"
+    chg_src  = cycles["capacity_soh_source"] == "charge"
+
+    rows = [
+        ("A orig (BMS, p90 ref ~197 Ah)",  cycles.loc[disc_src, "capacity_soh"].dropna(),            "#aec7e8", "--"),
+        ("A fixed (BMS, 436 Ah ref)",       cycles["capacity_soh_disc_A436"].dropna(),                "#1f77b4", "-"),
+        ("B hves1 + idle adj (436 Ah)",     cycles.loc[disc_src, "capacity_soh_disc_B_adj"].dropna(), "#ff7f0e", "-"),
+        ("C energy/voltage (436 Ah)",       cycles["capacity_soh_disc_C"].dropna(),                   "#2ca02c", "-"),
+    ]
+
+    VAR_BINS_CMP = np.concatenate([
+        np.arange(0,  50,  5.0),
+        np.arange(50, 80,  2.0),
+        np.arange(80, 100, 0.5),
+        [100.0],
+    ])
+    widths_cmp = np.diff(VAR_BINS_CMP)
+
+    with plt.style.context(STYLE):
+        fig, axes = plt.subplots(1, 2, figsize=(17, 6))
+        fig.suptitle(
+            "Discharge SOH — All Sources Compared  (ref = 436 Ah)\n"
+            "Variable bin width: 5 pp below 50%  |  2 pp 50-80%  |  0.5 pp 80-100%",
+            fontsize=12, fontweight="bold",
+        )
+        ax = axes[0]
+        for label, vals, color, ls in rows:
+            if len(vals) == 0:
+                continue
+            counts, _ = np.histogram(vals.clip(0, 100), bins=VAR_BINS_CMP)
+            density    = counts / (counts.sum() * widths_cmp)
+            ax.step(VAR_BINS_CMP[:-1], density, where="post",
+                    color=color, lw=2.0, ls=ls,
+                    label=f"{label}  n={len(vals):,}  mean={vals.mean():.1f}%")
+            ax.axvline(vals.mean(), color=color, lw=1.0, ls=":", alpha=0.7)
+        ax.axvspan(80, 100, alpha=0.06, color="#999999", zorder=0)
+        ax.axvline(80, color="#999999", lw=0.8, ls="--", alpha=0.5)
+        ax.set_title("SOH Distribution by Source", fontsize=11, fontweight="bold")
+        ax.set_xlabel("capacity_soh (%)")
+        ax.set_ylabel("Probability density")
+        ax.set_xlim(0, 101)
+        ax.legend(fontsize=8, loc="upper left")
+
+        ax2 = axes[1]
+        labels_bar = [r[0].split("(")[0].strip() for r in rows if len(r[1]) > 0]
+        means_bar  = [r[1].mean()                for r in rows if len(r[1]) > 0]
+        pct80_bar  = [(r[1] >= 80).mean()*100    for r in rows if len(r[1]) > 0]
+        colors_bar = [r[2]                       for r in rows if len(r[1]) > 0]
+        x  = np.arange(len(labels_bar))
+        w  = 0.38
+        b1 = ax2.bar(x - w/2, means_bar, width=w, color=colors_bar, alpha=0.85,
+                     label="Mean SOH (%)", edgecolor="white")
+        b2 = ax2.bar(x + w/2, pct80_bar, width=w, color=colors_bar, alpha=0.45,
+                     label="% sessions >= 80%", edgecolor="white", hatch="//")
+        for bar, val in zip(b1, means_bar):
+            ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.8,
+                     f"{val:.1f}%", ha="center", va="bottom", fontsize=8, fontweight="bold")
+        for bar, val in zip(b2, pct80_bar):
+            ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.8,
+                     f"{val:.1f}%", ha="center", va="bottom", fontsize=8)
+        ax2.set_xticks(x)
+        ax2.set_xticklabels(labels_bar, fontsize=8, rotation=10)
+        ax2.set_ylabel("Value (%)")
+        ax2.set_title("Mean SOH vs % sessions >= 80%", fontsize=11, fontweight="bold")
+        ax2.legend(fontsize=9)
+        ax2.set_ylim(0, 115)
+        fig.tight_layout()
+        out = os.path.join(PLOTS_DIR, "soh_all_sources_discharge.png")
+        fig.savefig(out, dpi=DPI, bbox_inches="tight")
+        plt.close(fig)
+        print(f"\n  Saved: {out}")
+
+    # Charging 4-way
+    chg_quality_mask = (
+        (cycles["session_type"] == "charging") &
+        (cycles["soc_diff"] > 0) &
+        (cycles["soc_range"].abs() >= MIN_SOC_RANGE_CHG) &
+        (cycles["capacity_ah_charge_total"] > 0) &
+        (cycles["voltage_mean"] > 0)
+    )
+    norm_chg_A436 = (
+        (cycles.loc[chg_quality_mask, "capacity_ah_charge_total"] * CHARGE_EFF) /
+        (cycles.loc[chg_quality_mask, "soc_range"].abs() / 100.0) /
+        NOMINAL_CAPACITY_AH * 100
+    ).clip(0, 100).dropna()
+
+    chg_rows = [
+        ("A BMS (p90 ref)",       cycles.loc[chg_src, "capacity_soh"].dropna(),        "#aec7e8", "--"),
+        ("A BMS (436 Ah ref)",    norm_chg_A436,                                        "#1f77b4", "-"),
+        ("B hves1 (436 Ah ref)",  cycles.loc[chg_src, "capacity_soh_chg_B"].dropna(),  "#ff7f0e", "-"),
+        ("C energy/V (436 Ah)",   cycles["capacity_soh_chg_C"].dropna(),                "#2ca02c", "-"),
+    ]
+
+    with plt.style.context(STYLE):
+        fig, axes = plt.subplots(1, 2, figsize=(17, 6))
+        fig.suptitle(
+            "Charging SOH — All Sources Compared  (ref = 436 Ah)\n"
+            "Variable bin width: 5 pp below 50%  |  2 pp 50-80%  |  0.5 pp 80-100%",
+            fontsize=12, fontweight="bold",
+        )
+        ax = axes[0]
+        for label, vals, color, ls in chg_rows:
+            if len(vals) == 0:
+                continue
+            counts, _ = np.histogram(vals.clip(0, 100), bins=VAR_BINS_CMP)
+            density    = counts / (counts.sum() * widths_cmp)
+            ax.step(VAR_BINS_CMP[:-1], density, where="post",
+                    color=color, lw=2.0, ls=ls,
+                    label=f"{label}  n={len(vals):,}  mean={vals.mean():.1f}%")
+            ax.axvline(vals.mean(), color=color, lw=1.0, ls=":", alpha=0.7)
+        ax.axvspan(80, 100, alpha=0.06, color="#999999", zorder=0)
+        ax.axvline(80, color="#999999", lw=0.8, ls="--", alpha=0.5)
+        ax.set_title("Charging SOH Distribution by Source", fontsize=11, fontweight="bold")
+        ax.set_xlabel("capacity_soh (%)")
+        ax.set_ylabel("Probability density")
+        ax.set_xlim(0, 101)
+        ax.legend(fontsize=8, loc="upper left")
+
+        ax2 = axes[1]
+        labels_bar = [r[0].split("(")[0].strip() for r in chg_rows if len(r[1]) > 0]
+        means_bar  = [r[1].mean()                for r in chg_rows if len(r[1]) > 0]
+        pct80_bar  = [(r[1] >= 80).mean()*100    for r in chg_rows if len(r[1]) > 0]
+        colors_bar = [r[2]                       for r in chg_rows if len(r[1]) > 0]
+        x  = np.arange(len(labels_bar))
+        b1 = ax2.bar(x - w/2, means_bar, width=w, color=colors_bar, alpha=0.85,
+                     label="Mean SOH (%)", edgecolor="white")
+        b2 = ax2.bar(x + w/2, pct80_bar, width=w, color=colors_bar, alpha=0.45,
+                     label="% sessions >= 80%", edgecolor="white", hatch="//")
+        for bar, val in zip(b1, means_bar):
+            ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.8,
+                     f"{val:.1f}%", ha="center", va="bottom", fontsize=8, fontweight="bold")
+        for bar, val in zip(b2, pct80_bar):
+            ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.8,
+                     f"{val:.1f}%", ha="center", va="bottom", fontsize=8)
+        ax2.set_xticks(x)
+        ax2.set_xticklabels(labels_bar, fontsize=8, rotation=10)
+        ax2.set_ylabel("Value (%)")
+        ax2.set_title("Mean SOH vs % sessions >= 80%", fontsize=11, fontweight="bold")
+        ax2.legend(fontsize=9)
+        ax2.set_ylim(0, 115)
+        fig.tight_layout()
+        out = os.path.join(PLOTS_DIR, "soh_all_sources_charging.png")
+        fig.savefig(out, dpi=DPI, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  Saved: {out}")
+
+# ── Plot 8: Variable-bin SOH distribution — Source C (energy/voltage) ────────
+# Coarse bins below 80 % so the dense 80-100 % region can be shown finely.
+#   0 – 50 %   →  5 % wide bins   (broad, few sessions here)
+#   50 – 80 %  →  2 % wide bins   (medium detail)
+#   80 – 100 % →  0.5 % wide bins (fine — where most sessions cluster)
+VAR_BINS = np.concatenate([
+    np.arange(0,  50,  5.0),
+    np.arange(50, 80,  2.0),
+    np.arange(80, 100, 0.5),
+    [100.0],
+])
+
+disc_src = cycles["capacity_soh_source"] == "discharge"
+chg_src  = cycles["capacity_soh_source"] == "charge"
+
+disc_vals = cycles["capacity_soh_disc_C"].dropna().values
+chg_vals  = cycles["capacity_soh_chg_C"].dropna().values
+
+with plt.style.context(STYLE):
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    fig.suptitle(
+        "SOH Distribution — Source C: energy_kwh / voltage_mean  (ref = 436 Ah)\n"
+        "Variable bin width: 5 pp below 50%  |  2 pp from 50-80%  |  0.5 pp from 80-100%",
+        fontsize=12, fontweight="bold",
+    )
+
+    for ax, vals, title, color, n_label in [
+        (axes[0], disc_vals, "Discharge SOH  (block-level, energy / voltage)", "#2ca02c", "discharge"),
+        (axes[1], chg_vals,  "Charging SOH   (session-level, energy / voltage)", "#9467bd", "charging"),
+    ]:
+        # Counts per bin (variable width) — use density so bar height is
+        # probability density, making area ∝ fraction of sessions.
+        counts, edges = np.histogram(vals, bins=VAR_BINS)
+        widths = np.diff(edges)
+        density = counts / (counts.sum() * widths)   # prob density
+
+        # Colour-code bars: grey below 80 %, colour in 80-100 %
+        bar_colors = ["#bbbbbb" if e < 80 else color for e in edges[:-1]]
+
+        bars = ax.bar(edges[:-1], density, width=widths, align="edge",
+                      color=bar_colors, edgecolor="white", linewidth=0.4)
+
+        # Vertical lines for mean and median
+        ax.axvline(np.mean(vals),   color="#333333", lw=1.8, ls="--",
+                   label=f"Mean   {np.mean(vals):.1f} %")
+        ax.axvline(np.median(vals), color="#555555", lw=1.8, ls=":",
+                   label=f"Median {np.median(vals):.1f} %")
+
+        # Shade the 80-100 % region
+        ax.axvspan(80, 100, alpha=0.07, color=color, zorder=0)
+        ax.axvline(80, color=color, lw=1.0, ls="--", alpha=0.5)
+
+        # Annotations
+        pct_above_80 = (vals >= 80).mean() * 100
+        pct_above_90 = (vals >= 90).mean() * 100
+        ax.text(0.97, 0.95, f"≥ 80 %: {pct_above_80:.1f} % of sessions\n"
+                             f"≥ 90 %: {pct_above_90:.1f} % of sessions",
+                transform=ax.transAxes, ha="right", va="top", fontsize=9,
+                bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8))
+
+        ax.set_title(title, fontsize=11, fontweight="bold")
+        ax.set_xlabel("capacity_soh  (%)", fontsize=10)
+        ax.set_ylabel("Probability density", fontsize=10)
+        ax.set_xlim(0, 101)
+        ax.legend(fontsize=9)
+        ax.tick_params(axis="x", labelsize=8)
+
+        # Secondary x-axis annotation marking the 80 % boundary
+        ax.annotate("← coarse bins  |  fine bins →",
+                    xy=(80, 0), xycoords=("data", "axes fraction"),
+                    xytext=(0, -28), textcoords="offset points",
+                    ha="center", fontsize=7.5, color="#666666",
+                    arrowprops=None)
+
+    fig.tight_layout()
+    out = os.path.join(PLOTS_DIR, "soh_energy_distribution.png")
+    fig.savefig(out, dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+    print(f"\n  Saved: {out}")
 
 print("\nDone.")
