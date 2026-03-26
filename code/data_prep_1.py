@@ -8,13 +8,17 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from config import (
-    BMS_FILE, GPS_FILE, VCU_FILE, CYCLES_CSV, SEQ_NPY, SEQ_META,
+    BMS_FILE, GPS_FILE, VCU_FILE, CYCLES_CSV, SEQ_NPY, SEQ_META, DATA_DIR,
     VOLTAGE_RANGE, CURRENT_RANGE, CELL_V_RANGE, TEMP_RANGE, SOH_MIN,
     DISCHARGE_A, CHARGE_A, MIN_SESSION_MIN, MIN_BMS_ROWS, MAX_DT_MIN, TRIP_GAP_MIN,
     NUM_BINS, SEQ_FEATURES, SCALAR_FEATURES,
     IR_THRESHOLD_MOHM, LOW_SOC_PCT, BATTERY_CAPACITY_KWH, NOMINAL_CAPACITY_AH, NOMINAL_VOLTAGE_V,
     REGEN_SPEED_KPH, GPS_GAP_MAX_SEC, ODO_GAP_MAX_SEC, EPK_MAX_KWH_KM,
 )
+
+# ── Supplementary current/voltage table ───────────────────────────────────────
+import os as _os
+CURRENT_FILE = _os.path.join(DATA_DIR, "bms_ultratech_current_full.csv")
 
 # ── New / overriding constants ──────────────────────────────────────────────────
 SMOOTH_WINDOW    = 1           # no smoothing; session continuity handled by _merge_discharge_gaps()
@@ -220,6 +224,39 @@ def load_bms(path: str) -> tuple:
 
     print(f"  BMS rows loaded: {len(df):,}")
     return bms_by_veh, bms_val_cols, fleet_thr
+
+
+def load_current_table(path: str) -> dict:
+    """
+    Load supplementary current/voltage table (bms_ultratech_current_full.csv).
+
+    Columns used:
+      registration_number, timestamp (ms epoch), hves1_voltage_level, hves1_current
+
+    Current sign convention (already correct in raw data):
+      positive = discharge, negative = charging / regen
+
+    Returns {reg: DataFrame sorted by timestamp}.
+    """
+    import os
+    if not os.path.exists(path):
+        print(f"  [current_table] File not found: {path} — skipping.")
+        return {}
+    print(f"Loading supplementary current table from {path} ...")
+    df = pd.read_csv(
+        path,
+        usecols=["registration_number", "timestamp", "hves1_voltage_level", "hves1_current"],
+        dtype={"hves1_voltage_level": "float32", "hves1_current": "float32",
+               "registration_number": "str"},
+    )
+    df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
+    df = df.dropna(subset=["timestamp", "registration_number",
+                            "hves1_voltage_level", "hves1_current"])
+    df["timestamp"] = df["timestamp"].astype("int64")
+    by_veh = {reg: grp.sort_values("timestamp").reset_index(drop=True)
+              for reg, grp in df.groupby("registration_number", sort=False)}
+    print(f"  Rows: {len(df):,}  |  Vehicles: {len(by_veh)}")
+    return by_veh
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1001,6 +1038,19 @@ def extract_cycles(df: pd.DataFrame) -> pd.DataFrame:
     df["_moving_disc_flag"] = (moving_mask & disc_curr_mask).astype(int)
     df["_moving_chg_flag"]  = moving_chg_mask.astype(int)
 
+    # ── New current source (hves1_current) — same Ah split logic ─────────────
+    # Charging and regen are negative; discharge is positive.
+    if "hves1_current" in df.columns:
+        new_disc_mask  = df["hves1_current"] > 0
+        new_regen_mask = moving_mask & (df["hves1_current"] < CHARGE_A)
+        new_plugin_mask= plugin_chg_mask & (df["hves1_current"] < 0)
+        df["_dq_discharge_new"] = np.where(
+            new_disc_mask,  df["hves1_current"] * df["_dt_hr"],                      0.0)
+        df["_dq_regen_new"]     = np.where(
+            new_regen_mask, (df["hves1_current"] * df["_dt_hr_regen"]).abs(),        0.0)
+        df["_dq_plugin_new"]    = np.where(
+            new_plugin_mask,(df["hves1_current"] * df["_dt_hr"]).abs(),              0.0)
+
     # ── Aggregation spec ──────────────────────────────────────────────────────
     agg_spec = dict(
         n_rows           = ("gps_time",    "count"),
@@ -1026,6 +1076,14 @@ def extract_cycles(df: pd.DataFrame) -> pd.DataFrame:
         capacity_ah_charge    = ("_dq_regen",     "sum"),
         capacity_ah_plugin    = ("_dq_plugin",    "sum"),
     )
+
+    # New-source Ah buckets (only if hves1_current was joined)
+    if "_dq_discharge_new" in df.columns:
+        agg_spec["capacity_ah_discharge_new"] = ("_dq_discharge_new", "sum")
+        agg_spec["capacity_ah_charge_new"]    = ("_dq_regen_new",     "sum")
+        agg_spec["capacity_ah_plugin_new"]    = ("_dq_plugin_new",    "sum")
+    if "hves1_voltage_level" in df.columns:
+        agg_spec["voltage_mean_new"] = ("hves1_voltage_level", "mean")
 
     # Optional columns — add only if present
     def _maybe(key, col, func):
@@ -1097,6 +1155,12 @@ def extract_cycles(df: pd.DataFrame) -> pd.DataFrame:
 
     # capacity_ah_charge_total: regen + plugin (useful for charging-side SOH)
     agg["capacity_ah_charge_total"] = agg["capacity_ah_charge"] + agg["capacity_ah_plugin"]
+
+    # New-source totals
+    if "capacity_ah_charge_new" in agg.columns:
+        agg["capacity_ah_charge_total_new"] = (
+            agg["capacity_ah_charge_new"] + agg["capacity_ah_plugin_new"]
+        )
 
     disc_mask = agg["session_type"] == "discharge"
     chg_mask  = agg["session_type"] == "charging"
@@ -1595,17 +1659,10 @@ def add_capacity_soh(cycles: pd.DataFrame) -> pd.DataFrame:
         print(f"    Nominal: {NOMINAL_CAPACITY_AH} Ah  "
               f"({BATTERY_CAPACITY_KWH} kWh / {NOMINAL_VOLTAGE_V} V)")
 
-        # Per-vehicle reference: p90 of block norm_cap, capped at nominal
-        ref_disc = quality_blocks.groupby("registration_number")["norm_cap"].agg(
-            lambda s: min(s.quantile(0.90), NOMINAL_CAPACITY_AH)
-                      if len(s) >= MIN_REF_SESSIONS else np.nan
-        )
-
-        # Block-level capacity_soh
-        block_disc = block_disc.join(ref_disc.rename("ref_cap"), on="registration_number")
-        block_disc["ref_cap"] = block_disc["ref_cap"].fillna(NOMINAL_CAPACITY_AH)
+        # Reference capacity: fixed at nominal (436 Ah) for all vehicles
+        # (data-driven p90 under-estimates due to unmeasured idle SoC drops)
         block_disc["capacity_soh_block"] = (
-            (block_disc["norm_cap"] / block_disc["ref_cap"] * 100).clip(0, 100)
+            (block_disc["norm_cap"] / NOMINAL_CAPACITY_AH * 100).clip(0, 100)
         )
 
         # Index for fast lookup: (registration_number, block_id) → capacity_soh
@@ -1624,10 +1681,6 @@ def add_capacity_soh(cycles: pd.DataFrame) -> pd.DataFrame:
             (disc["current_mean"] >  0) &
             disc["norm_cap"].notna()
         ]
-        ref_disc = quality_disc.groupby("registration_number")["norm_cap"].agg(
-            lambda s: min(s.quantile(0.90), NOMINAL_CAPACITY_AH)
-                      if len(s) >= MIN_REF_SESSIONS else np.nan
-        )
         print(f"  capacity_soh discharge (session-level fallback): "
               f"{len(quality_disc):,} sessions across "
               f"{quality_disc['registration_number'].nunique()}/{n_total} vehicles")
@@ -1655,22 +1708,12 @@ def add_capacity_soh(cycles: pd.DataFrame) -> pd.DataFrame:
     print(f"  capacity_soh charging : {len(quality_chg):,} sessions "
           f"across {n_q_chg}/{n_total} vehicles")
 
-    # ── Per-vehicle reference: discharge preferred, charge fills gaps ─────────
-    ref_chg = pd.Series(dtype=float)
-    if not quality_chg.empty and "norm_cap_charge" in quality_chg.columns:
-        ref_chg = quality_chg.groupby("registration_number")["norm_cap_charge"].agg(
-            lambda s: min(s.quantile(0.90), NOMINAL_CAPACITY_AH)
-                      if len(s) >= MIN_REF_SESSIONS else np.nan
-        )
-
-    ref_vehicle = ref_disc.combine_first(ref_chg)
-    n_fallback = ref_vehicle.isna().sum()
-    if n_fallback:
-        print(f"    {n_fallback} vehicle(s) use nominal fallback ({NOMINAL_CAPACITY_AH} Ah)")
-    ref_vehicle = ref_vehicle.fillna(NOMINAL_CAPACITY_AH)
-
-    cycles = cycles.join(ref_vehicle.rename("ref_capacity_ah"), on="registration_number")
-    cycles["ref_capacity_ah"] = cycles["ref_capacity_ah"].fillna(NOMINAL_CAPACITY_AH)
+    # ── Reference capacity: fixed nominal for all vehicles ────────────────────
+    # Data-driven p90 is suppressed by unmeasured idle/parking SoC drops which
+    # inflate block_soc_diff without inflating block_capacity_ah, pulling the
+    # p90 down to ~197 Ah. Hard-fixing at the true nominal (436 Ah) avoids this.
+    cycles["ref_capacity_ah"] = NOMINAL_CAPACITY_AH
+    print(f"    ref_capacity_ah fixed at {NOMINAL_CAPACITY_AH} Ah for all vehicles")
 
     # ── Assign capacity_soh ───────────────────────────────────────────────────
     cycles["capacity_soh"]        = np.nan
@@ -1721,6 +1764,54 @@ def add_capacity_soh(cycles: pd.DataFrame) -> pd.DataFrame:
             (norm_chg_all[true_chg] / cycles.loc[true_chg, "ref_capacity_ah"] * 100).clip(0, 100)
         )
         cycles.loc[true_chg, "capacity_soh_source"] = "charge"
+
+    # ── New-source capacity_soh (hves1_current / hves1_voltage_level) ─────────
+    if "capacity_ah_discharge_new" in cycles.columns:
+        # Discharge side
+        disc_rows_new = (cycles["session_type"] == "discharge") & (cycles["current_mean"] > 0)
+        dod_new = cycles["soc_diff"].abs()
+        norm_disc_new = (
+            cycles["capacity_ah_discharge_new"] / (dod_new / 100.0)
+        ).replace([np.inf, -np.inf], np.nan)
+        cycles["capacity_soh_disc_new"] = np.nan
+        true_disc_new = disc_rows_new & (cycles["soc_diff"] < 0) & (dod_new >= MIN_SOC_RANGE_DISC_PCT)
+        cycles.loc[true_disc_new, "capacity_soh_disc_new"] = (
+            (norm_disc_new[true_disc_new] / cycles.loc[true_disc_new, "ref_capacity_ah"] * 100)
+            .clip(0, 100)
+        )
+
+        # Charging side
+        cycles["capacity_soh_chg_new"] = np.nan
+        if "capacity_ah_charge_total_new" in cycles.columns:
+            chg_mask_new = cycles["session_type"] == "charging"
+            chg_soc_new  = cycles["soc_range"].abs()
+            norm_chg_new = (
+                (cycles["capacity_ah_charge_total_new"] * CHARGE_COULOMBIC_EFF) /
+                (chg_soc_new / 100.0)
+            ).replace([np.inf, -np.inf], np.nan)
+            true_chg_new = (
+                chg_mask_new &
+                (cycles["soc_diff"] > 0) &
+                (chg_soc_new >= MIN_SOC_RANGE_PCT)
+            )
+            cycles.loc[true_chg_new, "capacity_soh_chg_new"] = (
+                (norm_chg_new[true_chg_new] / cycles.loc[true_chg_new, "ref_capacity_ah"] * 100)
+                .clip(0, 100)
+            )
+
+        # ── Comparison summary ─────────────────────────────────────────────────
+        print("\n  ── capacity_soh comparison: original vs hves1_current ──────────────")
+        for label, old_col, new_col in [
+            ("Discharge", "capacity_soh",     "capacity_soh_disc_new"),
+            ("Charging ", "capacity_soh",     "capacity_soh_chg_new"),
+        ]:
+            src = "discharge" if label.strip() == "Discharge" else "charge"
+            mask = cycles["capacity_soh_source"] == src
+            old_vals = cycles.loc[mask, old_col].dropna()
+            new_vals = cycles.loc[mask, new_col].dropna() if new_col in cycles.columns else pd.Series(dtype=float)
+            print(f"  {label}  |  old mean: {old_vals.mean():.2f}%  n={len(old_vals):,}"
+                  f"  |  new mean: {new_vals.mean():.2f}%  n={len(new_vals):,}"
+                  f"  |  delta: {(new_vals.mean() - old_vals.mean()):+.2f}%")
 
     return cycles
 
@@ -1797,6 +1888,7 @@ if __name__ == "__main__":
     print("\nDetecting depot locations ...")
     depots = detect_depot(gps_by_veh)
     vcu_by_veh = load_vcu(VCU_FILE)
+    curr_by_veh = load_current_table(CURRENT_FILE)
 
     vehicles = sorted(set(gps_by_veh.keys()) & set(bms_by_veh.keys()))
 
@@ -1888,6 +1980,19 @@ if __name__ == "__main__":
         df_v = df_v[df_v["voltage"].notna()].reset_index(drop=True)
         if len(df_v) < 10:
             continue
+
+        # Step 3b: Join supplementary current/voltage table (5 s window)
+        if curr_by_veh and reg in curr_by_veh:
+            curr_v = (curr_by_veh[reg]
+                      .rename(columns={"timestamp": "gps_time"})
+                      [["gps_time", "hves1_voltage_level", "hves1_current"]])
+            df_v = pd.merge_asof(
+                df_v.sort_values("gps_time"),
+                curr_v,
+                on="gps_time",
+                tolerance=5_000,       # 5 seconds in ms
+                direction="nearest",
+            )
 
         # Steps 4-6: derived cols, sessions, sag, IR
         df_v = add_derived_columns(df_v)
