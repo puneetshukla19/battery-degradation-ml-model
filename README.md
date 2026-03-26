@@ -109,6 +109,63 @@ Per-vehicle statistical modelling of SoH degradation trajectories and fleet-wide
 
 ---
 
+### `cell_diagnostics.py` — Cell & Pack Replacement Ranking
+
+Identifies which physical battery subsystem (pack module) and cell is most degraded and needs replacing, using probe and subsystem number fields from the BMS raw data.
+
+**Signals used:**
+
+| Field | What it tells us |
+|---|---|
+| `min_cell_voltage_subsystem_number` | Which subsystem hosts the weakest cell each timestamp |
+| `min_cell_voltage_number` | Index of the weakest cell within that subsystem |
+| `temperature_highest_subsystem_number` | Which subsystem runs hottest |
+| `temperature_highest_probe_number` | Which temperature probe is the hotspot |
+| `insulation_resistance` | Isolation fault trend — declining = cell/harness degradation |
+| `subsystem_voltage` | Per-subsystem pack voltage — std across subsystems = imbalance |
+
+**Method:**
+1. Stamps each BMS row with its session using `merge_asof` per vehicle
+2. Per session: takes the modal (most frequent) subsystem/cell index for voltage and temperature signals
+3. Per vehicle: counts how often each subsystem appears as weakest / hottest across all discharge sessions
+4. Computes a **composite replacement score** per subsystem per vehicle:
+   - 60% — % of sessions where subsystem is the weakest (voltage)
+   - 20% — % of sessions where subsystem is the hottest (thermal)
+   - 20% — how low the mean min cell voltage is (inverted, normalised)
+5. Ranks subsystems within each vehicle — rank 1 = highest replacement priority
+
+**ML integration (via `data_prep_1.py`):**
+
+Six new features are added to `cycles.csv` at session level:
+
+| Feature | Description |
+|---|---|
+| `weak_subsystem_id` | Modal subsystem with min cell voltage in session |
+| `weak_cell_id` | Modal cell index with min cell voltage in session |
+| `weak_subsystem_consistency` | Fraction of session rows where modal subsystem is weakest (0–1) |
+| `hot_subsystem_id` | Modal subsystem with highest temperature in session |
+| `hot_probe_id` | Modal temperature probe with highest reading |
+| `subsystem_voltage_std` | Std of subsystem voltages in session (pack imbalance) |
+
+These are consumed by `anomaly.py`'s LightGBM and Isolation Forest models:
+- A **recurring `weak_subsystem_id`** across sessions flags a degraded pack module
+- **Low `weak_subsystem_consistency`** (< 0.5) means degradation is spreading — multiple cells competing for weakest
+- **Rising `subsystem_voltage_std`** indicates growing pack imbalance between modules
+- A **persistent `hot_subsystem_id`**  with rising temperature trend points to a cooling or cell issue in a specific module
+
+**Outputs:**
+
+| File | Description |
+|---|---|
+| `artifacts/cell_health_ranking.csv` | Per-vehicle subsystem replacement ranking with scores |
+| `plots/cell_weak_subsystem_heatmap.png` | Fleet heatmap — % sessions each subsystem is weakest |
+| `plots/cell_hot_subsystem_heatmap.png` | Fleet heatmap — % sessions each subsystem is hottest |
+| `plots/cell_min_voltage_trend.png` | Weakest-cell voltage trend over time (top 10 vehicles) |
+| `plots/cell_insulation_trend.png` | Insulation resistance trend per vehicle |
+| `plots/cell_pack_imbalance.png` | Per-vehicle subsystem voltage std (pack imbalance bar chart) |
+
+---
+
 ### `anomaly.py` — Multi-Model Anomaly Detection
 
 Three complementary anomaly detection approaches applied per discharge cycle.
@@ -302,11 +359,15 @@ WHERE event_datetime > date '2025-10-01'
 ## Pipeline Execution Order
 
 ```bash
-python data_prep_1.py   # 1. process raw data → cycles.csv
-python ekf_soh.py       # 2. EKF SoH tracking → ekf_soh.csv
-python soh_rul.py       # 3. degradation trends → rul_estimates.csv, soh_trends.csv
-python anomaly.py       # 4. anomaly detection → anomaly_scores.csv
-python plot_rul.py      # 5. generate all plots
+python code/data_prep_1.py      # 1. process raw data → cycles.csv (with cell/subsystem features)
+python code/cell_diagnostics.py # 2. pack & cell replacement ranking → cell_health_ranking.csv
+python code/ekf_soh.py          # 3. EKF SoH tracking → ekf_soh.csv
+python code/soh_rul.py          # 4. degradation trends → rul_estimates.csv, soh_trends.csv
+python code/anomaly.py          # 5. anomaly detection → anomaly_scores.csv
+python code/plot_rul.py         # 6. generate all plots
+
+# Optional — standalone source comparison & analysis
+python code/soh_comparison.py   # compare BMS vs hves1_current SOH estimates
 ```
 
 ---
@@ -359,4 +420,5 @@ All tunable constants (file paths, thresholds, noise matrices, aging rates, EOL 
 | `anomaly_scores.csv` | `anomaly.py` | Per-cycle anomaly flags |
 | `lgbm_soh_predictions.csv` | `anomaly.py` | LightGBM SoH predictions |
 | `regime_clusters.csv` | `anomaly.py` | UMAP+HDBSCAN cluster labels |
-| `plots/` | `plot_rul.py` | All diagnostic figures |
+| `cell_health_ranking.csv` | `cell_diagnostics.py` | Per-vehicle subsystem replacement ranking |
+| `plots/` | `plot_rul.py` + `cell_diagnostics.py` + `soh_comparison.py` | All diagnostic figures |

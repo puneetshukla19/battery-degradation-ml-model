@@ -1110,6 +1110,22 @@ def extract_cycles(df: pd.DataFrame) -> pd.DataFrame:
     _maybe("n_cell_undervoltage", "cell_undervoltage", "sum")
     _maybe("n_cell_overvoltage",  "cell_overvoltage",  "sum")
     _maybe("n_cell_spread_warn",  "cell_spread_warn",  "sum")
+    # Cell / subsystem location features — which physical pack and cell is weakest
+    _mode = lambda x: int(x.mode().iloc[0]) if len(x) > 0 and x.notna().any() else -1
+    _maybe("weak_subsystem_id",  "min_cell_voltage_subsystem_number", _mode)
+    _maybe("weak_cell_id",       "min_cell_voltage_number",           _mode)
+    _maybe("hot_subsystem_id",   "temperature_highest_subsystem_number", _mode)
+    _maybe("hot_probe_id",       "temperature_highest_probe_number",      _mode)
+    # Fraction of rows in session where the modal subsystem is the weakest
+    if "min_cell_voltage_subsystem_number" in df.columns:
+        modal_sub = df["min_cell_voltage_subsystem_number"].mode()
+        if len(modal_sub) > 0:
+            agg_spec["weak_subsystem_consistency"] = (
+                "min_cell_voltage_subsystem_number",
+                lambda x, m=int(modal_sub.iloc[0]): (x == m).mean() if x.notna().any() else np.nan,
+            )
+    # Pack voltage imbalance: std of subsystem_voltage within session
+    _maybe("subsystem_voltage_std", "subsystem_voltage", "std")
     # Speed
     _maybe("speed_mean", "speed", "mean")
     _maybe("speed_max",  "speed", "max")
@@ -2195,6 +2211,9 @@ if __name__ == "__main__":
         # Cell health
         "cell_spread_mean", "cell_spread_max",
         "n_cell_undervoltage", "n_cell_overvoltage", "n_cell_spread_warn", "cell_health_poor",
+        # Cell / subsystem location (which physical pack & cell is weakest)
+        "weak_subsystem_id", "weak_cell_id", "weak_subsystem_consistency",
+        "hot_subsystem_id", "hot_probe_id", "subsystem_voltage_std",
         # Temperature
         "temp_start", "temp_max", "temp_mean", "temp_lowest_mean",
         "temp_rise_rate", "rapid_heating",
