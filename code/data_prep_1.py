@@ -1929,6 +1929,80 @@ def add_capacity_soh(cycles: pd.DataFrame) -> pd.DataFrame:
     return cycles
 
 
+def add_cycle_soh(cycles: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute cycle_soh by pairing adjacent discharge + charging blocks per vehicle.
+
+    Step 1 — Anchor: For each quality disc+chg block pair (SoC swing gates met),
+      cycle_soh = mean(norm_disc, norm_chg) / NOMINAL_CAPACITY_AH * 100  (clipped 0–100)
+      where norm_X = block_capacity_ah / (|block_soc_diff| / 100).
+      Broadcast the anchor value to all sessions in both paired blocks.
+
+    Step 2 — Fill: Per vehicle, interpolate linearly by elapsed time between anchors,
+      then ffill / bfill to cover edge sessions.  Every session receives a value;
+      vehicles with no quality pairs remain NaN.
+    """
+    cycles = cycles.sort_values(["registration_number", "start_time"]).reset_index(drop=True)
+    cycles["cycle_soh"] = np.nan
+
+    for reg, idx in cycles.groupby("registration_number", sort=False).groups.items():
+        grp = cycles.loc[idx]
+
+        # ── Step 1: anchor points from quality block pairs ─────────────────────
+        blocks = (
+            grp.dropna(subset=["block_id"])
+               .sort_values("start_time")
+               .drop_duplicates("block_id", keep="first")
+               [["block_id", "block_type", "block_capacity_ah", "block_soc_diff"]]
+               .reset_index(drop=True)
+        )
+
+        for i in range(len(blocks) - 1):
+            a, b = blocks.iloc[i], blocks.iloc[i + 1]
+            if set([a["block_type"], b["block_type"]]) != {"discharge", "charging"}:
+                continue
+
+            disc = a if a["block_type"] == "discharge" else b
+            chg  = b if b["block_type"] == "charging"  else a
+
+            dod  = abs(disc["block_soc_diff"])
+            csoc = abs(chg["block_soc_diff"])
+            if dod < MIN_SOC_RANGE_DISC_PCT or csoc < MIN_SOC_RANGE_PCT:
+                continue
+            if disc["block_capacity_ah"] <= 0 or chg["block_capacity_ah"] <= 0:
+                continue
+
+            norm_disc = disc["block_capacity_ah"] / (dod  / 100.0)
+            norm_chg  = chg["block_capacity_ah"]  / (csoc / 100.0)
+            soh_val   = float(np.clip(
+                np.mean([norm_disc, norm_chg]) / NOMINAL_CAPACITY_AH * 100,
+                0, 100
+            ))
+
+            pair_mask = grp["block_id"].isin([disc["block_id"], chg["block_id"]])
+            cycles.loc[idx[pair_mask.values], "cycle_soh"] = soh_val
+
+        # ── Step 2: interpolate + extrapolate ──────────────────────────────────
+        s = cycles.loc[idx, "cycle_soh"].copy()
+        if s.notna().sum() >= 2:
+            t = cycles.loc[idx, "start_time"].values.astype("int64")
+            s_indexed = pd.Series(s.values, index=t)
+            s_indexed = s_indexed.interpolate(method="index")
+            s_indexed = s_indexed.ffill().bfill()
+            cycles.loc[idx, "cycle_soh"] = s_indexed.values
+        elif s.notna().sum() == 1:
+            cycles.loc[idx, "cycle_soh"] = float(s.dropna().iloc[0])
+        # else: no quality pairs → stays NaN
+
+    n_filled = cycles["cycle_soh"].notna().sum()
+    n_veh_no = cycles.groupby("registration_number")["cycle_soh"].apply(
+        lambda x: x.isna().all()
+    ).sum()
+    print(f"  cycle_soh: {n_filled:,} sessions filled  |  "
+          f"{int(n_veh_no)} vehicles with no quality pairs (remain NaN)")
+    return cycles
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 12 — DISCHARGE SEQUENCE EXTRACTION (unchanged from data_prep.py)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2184,6 +2258,9 @@ if __name__ == "__main__":
     # ── Engineered features for ML degradation models ─────────────────────────
     cycles = add_engineered_features(cycles)
 
+    # ── Cycle SOH (paired disc+chg block, interpolated to all sessions) ───────
+    cycles = add_cycle_soh(cycles)
+
     # ── Alerts join ───────────────────────────────────────────────────────────
     alerts_agg = load_alerts(ALERTS_FILE)
     cycles = join_alerts_onto_cycles(cycles, alerts_agg)
@@ -2271,6 +2348,7 @@ if __name__ == "__main__":
         "soh",
         # Capacity SOH
         "capacity_soh", "capacity_soh_source", "ref_capacity_ah", "soh_low_confidence",
+        "cycle_soh",
         # hves1-source capacity SOH (Source B)
         "capacity_soh_disc_new", "capacity_soh_chg_new",
         # Electrical — BMS current/voltage
