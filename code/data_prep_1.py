@@ -2271,12 +2271,19 @@ if __name__ == "__main__":
         "soh",
         # Capacity SOH
         "capacity_soh", "capacity_soh_source", "ref_capacity_ah", "soh_low_confidence",
-        # Electrical
+        # hves1-source capacity SOH (Source B)
+        "capacity_soh_disc_new", "capacity_soh_chg_new",
+        # Electrical — BMS current/voltage
         "voltage_mean", "voltage_min",
         "current_mean", "current_max", "current_mean_discharge", "current_mean_charge",
-        # Capacity / energy
+        # Electrical — hves1 current/voltage (Source B)
+        "voltage_mean_new",
+        # Capacity / energy — BMS source
         "capacity_ah_discharge", "capacity_ah_charge", "capacity_ah_plugin",
         "capacity_ah", "capacity_ah_charge_total",
+        # Capacity / energy — hves1 source (Source B)
+        "capacity_ah_discharge_new", "capacity_ah_charge_new",
+        "capacity_ah_plugin_new", "capacity_ah_charge_total_new",
         "energy_kwh", "energy_per_km", "charging_rate_kw",
         # Voltage sag
         "n_vsag", "d_vsag_per_cycle",
