@@ -1,4 +1,4 @@
-import sys, os, warnings
+import sys, os, warnings, gc
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) if "__file__" in dir() else os.getcwd())
 # Force UTF-8 output on Windows so special chars don't crash the console
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
@@ -19,6 +19,7 @@ from config import (
 # ── Supplementary current/voltage table ───────────────────────────────────────
 import os as _os
 CURRENT_FILE = _os.path.join(DATA_DIR, "bms_ultratech_current_full.csv")
+ALERTS_FILE  = _os.path.join(DATA_DIR, "alerts_full_ultratech_intangles.csv")
 
 # ── New / overriding constants ──────────────────────────────────────────────────
 SMOOTH_WINDOW    = 1           # no smoothing; session continuity handled by _merge_discharge_gaps()
@@ -118,6 +119,85 @@ def _angle_diff(a, b):
     return np.where(np.isnan(diff), np.nan, np.where(diff > 180, 360 - diff, diff))
 
 
+# ── Fixed route geofences ────────────────────────────────────────────────────
+# Manawar Loading Area  — rectangular polygon [lat, lon] vertices
+_LOADING_POLYGON = np.array([
+    [22.271683, 75.138225],
+    [22.268312, 75.128871],
+    [22.262503, 75.128803],
+    [22.262364, 75.139468],
+], dtype=float)
+
+# Dhule Unloading Area — circular geofence
+_UNLOADING_CENTER   = (21.15111842, 74.84979354)
+_UNLOADING_RADIUS_M = 100.0
+
+
+def _point_in_polygon_vec(lats, lons, polygon):
+    """
+    Vectorised ray-casting point-in-polygon test.
+    polygon: (N, 2) float array of [lat, lon] vertices (any winding order).
+    Returns bool array, same length as lats/lons.
+    """
+    lats = np.asarray(lats, dtype=float)
+    lons = np.asarray(lons, dtype=float)
+    n_vert  = len(polygon)
+    inside  = np.zeros(len(lats), dtype=bool)
+    j = n_vert - 1
+    for i in range(n_vert):
+        xi, yi = polygon[i]   # lat, lon of vertex i
+        xj, yj = polygon[j]   # lat, lon of vertex j
+        # horizontal ray cast along longitude axis
+        cond = ((yi > lons) != (yj > lons)) & \
+               (lats < (xj - xi) * (lons - yi) / ((yj - yi) if yj != yi else 1e-15) + xi)
+        inside ^= cond
+        j = i
+    return inside
+
+
+def _label_direction_geofence(lats, lons):
+    """
+    State-machine trip direction labeling using the fixed loading/unloading geofences.
+
+    Outbound = vehicle leaving loading site toward unloading site (truck is loaded).
+    Inbound  = vehicle leaving unloading site back to loading site (truck is empty).
+
+    Returns
+    -------
+    directions : object array  — 'outbound' | 'inbound' | 'at_loading' |
+                                 'at_unloading' | 'unknown'
+    is_loaded  : bool array    — True while outbound (truck carries load)
+    """
+    lats = np.asarray(lats, dtype=float)
+    lons = np.asarray(lons, dtype=float)
+    n = len(lats)
+
+    in_load   = _point_in_polygon_vec(lats, lons, _LOADING_POLYGON)
+    clat, clon = _UNLOADING_CENTER
+    in_unload = _haversine_km(lats, lons, clat, clon) * 1000 < _UNLOADING_RADIUS_M
+
+    directions = np.full(n, "unknown", dtype=object)
+    state = "unknown"
+
+    for i in range(n):
+        if in_load[i]:
+            state = "at_loading"
+            directions[i] = "at_loading"
+        elif in_unload[i]:
+            state = "at_unloading"
+            directions[i] = "at_unloading"
+        elif state in ("at_loading", "outbound"):
+            state = "outbound"
+            directions[i] = "outbound"
+        elif state in ("at_unloading", "inbound"):
+            state = "inbound"
+            directions[i] = "inbound"
+        # else: unknown — data starts mid-route before first geofence hit
+
+    is_loaded = (directions == "outbound")
+    return directions, is_loaded
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 0 — LOAD RAW DATA
 # ══════════════════════════════════════════════════════════════════════════════
@@ -149,6 +229,7 @@ def load_gps(path: str) -> dict:
                   for reg, grp in df.groupby("registration_number", sort=False)}
 
     print(f"  GPS rows: {len(df):,}  |  Vehicles: {len(gps_by_veh)}")
+    del df; gc.collect()
     return gps_by_veh
 
 
@@ -166,6 +247,7 @@ def load_vcu(path: str) -> dict:
                   for reg, grp in df.groupby("registration_number", sort=False)}
 
     print(f"  VCU rows: {len(df):,}  |  Vehicles: {len(vcu_by_veh)}")
+    del df; gc.collect()
     return vcu_by_veh
 
 
@@ -223,6 +305,7 @@ def load_bms(path: str) -> tuple:
                   for reg, grp in df.groupby("registration_number", sort=False)}
 
     print(f"  BMS rows loaded: {len(df):,}")
+    del df; gc.collect()
     return bms_by_veh, bms_val_cols, fleet_thr
 
 
@@ -256,7 +339,88 @@ def load_current_table(path: str) -> dict:
     by_veh = {reg: grp.sort_values("timestamp").reset_index(drop=True)
               for reg, grp in df.groupby("registration_number", sort=False)}
     print(f"  Rows: {len(df):,}  |  Vehicles: {len(by_veh)}")
+    del df; gc.collect()
     return by_veh
+
+
+def load_alerts(path: str) -> pd.DataFrame:
+    """
+    Load alerts CSV and return a raw DataFrame with gps_time (ms epoch) and all
+    numeric alert columns.  Aggregation happens later per session time window.
+
+    Returns an empty DataFrame if the file is not found.
+    """
+    import os
+    if not os.path.exists(path):
+        print(f"  [alerts] File not found: {path} — skipping.")
+        return pd.DataFrame()
+
+    print(f"Loading alerts from {path} ...")
+    df = pd.read_csv(path, low_memory=False)
+    df["registration_number"] = df["registration_number"].astype(str)
+    df["gps_time"] = pd.to_numeric(df["gps_time"], errors="coerce")
+    df = df.dropna(subset=["gps_time", "registration_number"])
+    df["gps_time"] = df["gps_time"].astype("int64")
+
+    # Identify numeric alert columns (exclude identity / metadata columns)
+    _meta = {"registration_number", "gps_time", "event_datetime", "vendor", "spv"}
+    alert_cols = [c for c in df.columns if c not in _meta]
+    for c in alert_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+    print(f"  Alert rows: {len(df):,}  |  Vehicles: {df['registration_number'].nunique()}  "
+          f"|  Alert columns: {len(alert_cols)}")
+    result = df[["registration_number", "gps_time"] + alert_cols].copy()
+    del df; gc.collect()
+    return result
+
+
+def join_alerts_onto_cycles(cycles: pd.DataFrame, alerts: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each session in cycles, sum alert counts whose gps_time falls within
+    [start_time, end_time] for the same vehicle.
+
+    Uses per-vehicle searchsorted (O(n log m)) — sessions are assumed non-overlapping
+    within a vehicle (as produced by label_sessions).
+    Sessions with no alerts in their window get 0 for all alert columns.
+    """
+    if alerts.empty:
+        return cycles
+
+    alert_cols = [c for c in alerts.columns if c not in {"registration_number", "gps_time"}]
+
+    for c in alert_cols:
+        cycles[c] = 0.0
+    cycles["total_alerts"] = 0.0
+
+    for reg, alert_v in alerts.groupby("registration_number", sort=False):
+        sess_mask = cycles["registration_number"] == reg
+        if not sess_mask.any():
+            continue
+
+        sess_v   = cycles.loc[sess_mask].sort_values("start_time")
+        starts   = sess_v["start_time"].values
+        ends     = sess_v["end_time"].values
+        a_times  = alert_v["gps_time"].values
+        a_data   = alert_v[alert_cols].values.astype(float)
+
+        # For each alert find the rightmost session whose start_time <= alert gps_time
+        pos = np.searchsorted(starts, a_times, side="right") - 1
+
+        # Keep only alerts that also fall within that session's end_time
+        valid = (pos >= 0) & (a_times <= ends[np.clip(pos, 0, len(ends) - 1)])
+
+        if valid.any():
+            sums = np.zeros((len(sess_v), len(alert_cols)))
+            np.add.at(sums, pos[valid], a_data[valid])
+            for i, col in enumerate(alert_cols):
+                cycles.loc[sess_v.index, col] = sums[:, i]
+            cycles.loc[sess_v.index, "total_alerts"] = sums.sum(axis=1)
+
+    cycles[alert_cols + ["total_alerts"]] = (
+        cycles[alert_cols + ["total_alerts"]].astype(int)
+    )
+    return cycles
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -361,97 +525,43 @@ def detect_depot(gps_by_veh: dict) -> dict:
 
 def label_trip_direction(gps_vcu: pd.DataFrame, depots: dict) -> pd.DataFrame:
     """
-    Add per-row columns:
-      dist_from_depot_km    — haversine distance to vehicle's depot
-      head_aligns_outbound  — True if vehicle heading points away from depot (±90°)
-      trip_direction        — 'outbound' | 'inbound' | 'unknown'
-      is_loaded             — True for inbound (trucks return loaded)
-      altitude_trend        — 'ascending' | 'descending' | 'flat' (5-point rolling)
+    Add per-row columns using fixed loading/unloading geofences:
+      trip_direction — 'outbound' | 'inbound' | 'at_loading' | 'at_unloading' | 'unknown'
+      is_loaded      — True while outbound (truck is loaded: Manawar → Dhule)
+      dist_from_loading_km — haversine distance to loading site centroid
 
-    Algorithm:
-      For each trip segment (gap > TRIP_GAP_MIN):
-        1. Compute distance from depot per GPS point.
-        2. Find argmax (furthest point = turnaround).
-        3. Points before turnaround → outbound; after → inbound.
-        4. If no clear turnaround (max at boundary): use heading alignment.
+    Outbound = truck leaving Manawar Loading Area toward Dhule Unloading Area (loaded).
+    Inbound  = truck leaving Dhule Unloading Area back to Manawar (empty).
 
-    Note: Outbound = zero load (empty trucks departing depot).
-          Inbound  = loaded  (trucks returning to depot with cargo).
+    State machine: resets only on geofence entry, not on time gaps, so it correctly
+    handles overnight stops mid-route.
     """
     df = gps_vcu.copy()
-    df["dist_from_depot_km"]   = np.nan
-    df["head_aligns_outbound"] = np.nan
     df["trip_direction"]       = "unknown"
     df["is_loaded"]            = False
-    df["altitude_trend"]       = "flat"
+    df["dist_from_loading_km"] = np.nan
 
-    trip_gap_ms = TRIP_GAP_MIN * 60 * 1000
+    load_centroid = _LOADING_POLYGON.mean(axis=0)  # [lat, lon]
 
     for reg, grp_orig in df.groupby("registration_number"):
-        if reg not in depots:
-            continue
-        depot_lat, depot_lon, depot_alt = depots[reg]
         grp = grp_orig.sort_values("gps_time")
         idx = grp.index
 
-        # Distance from depot (vectorised)
-        dist = _haversine_km(grp["latitude"].values, grp["longitude"].values,
-                             depot_lat, depot_lon)
-        df.loc[idx, "dist_from_depot_km"] = dist
+        lats = grp["latitude"].values
+        lons = grp["longitude"].values
 
-        # Heading alignment
-        if grp["head"].notna().any():
-            brg = _bearing_deg(
-                np.full(len(grp), depot_lat), np.full(len(grp), depot_lon),
-                grp["latitude"].values, grp["longitude"].values,
-            )
-            adiff = _angle_diff(grp["head"].values, brg)
-            # cast to float (1.0/0.0/NaN) to stay compatible with float64 column
-            df.loc[idx, "head_aligns_outbound"] = np.where(
-                np.isnan(adiff), np.nan, (adiff < 90.0).astype(float)
-            )
+        df.loc[idx, "dist_from_loading_km"] = _haversine_km(
+            lats, lons, load_centroid[0], load_centroid[1]
+        )
 
-        # Altitude trend (5-point rolling gradient)
-        if grp["altitude"].notna().sum() > 5:
-            alt_grad = grp["altitude"].rolling(5, min_periods=2).mean().diff()
-            trend = pd.cut(alt_grad,
-                           bins=[-np.inf, -0.3, 0.3, np.inf],
-                           labels=["descending", "flat", "ascending"])
-            df.loc[idx, "altitude_trend"] = trend.astype(str).values
-
-        # Segment loop
-        dt_ms  = grp["gps_time"].diff().fillna(0).values
-        seg_id = np.cumsum(dt_ms > trip_gap_ms)
-
-        for seg in np.unique(seg_id):
-            seg_mask    = seg_id == seg
-            seg_indices = idx[seg_mask]
-            seg_dist    = dist[seg_mask]
-            n           = len(seg_dist)
-
-            if n < 3:
-                continue
-
-            max_pos = int(np.argmax(seg_dist))
-
-            if max_pos == 0 or max_pos == n - 1:
-                # No clear turnaround — fall back to heading
-                seg_align = df.loc[seg_indices, "head_aligns_outbound"]
-                if seg_align.notna().any():
-                    direction = "outbound" if seg_align.dropna().mean() > 0.5 else "inbound"
-                    df.loc[seg_indices, "trip_direction"] = direction
-            else:
-                out_idx = seg_indices[: max_pos + 1]
-                in_idx  = seg_indices[max_pos :]
-                df.loc[out_idx, "trip_direction"] = "outbound"
-                df.loc[in_idx,  "trip_direction"] = "inbound"
-
-    df["is_loaded"] = df["trip_direction"] == "inbound"
+        directions, is_loaded = _label_direction_geofence(lats, lons)
+        df.loc[idx, "trip_direction"] = directions
+        df.loc[idx, "is_loaded"]      = is_loaded
 
     dir_counts = df["trip_direction"].value_counts().to_dict()
     print(f"  Trip direction breakdown: {dir_counts}")
-    known = df["trip_direction"].isin(["outbound", "inbound"]).mean()
-    print(f"  Direction coverage: {known:.1%} of GPS rows classified")
+    classified = df["trip_direction"].isin(["outbound", "inbound"]).mean()
+    print(f"  Direction coverage (outbound+inbound): {classified:.1%} of GPS rows")
 
     return df
 
@@ -517,8 +627,6 @@ def add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
       cell_overvoltage     = max_cell_voltage > CELL_V_WARN_HI  (3.5 V)
       cell_spread_warn     = cell_spread > CELL_SPREAD_WARN     (0.02 V)
     """
-    df = df.copy()
-
     if "max_cell_voltage" in df.columns and "min_cell_voltage" in df.columns:
         df["cell_spread"]     = (df["max_cell_voltage"] - df["min_cell_voltage"]).astype("float32")
         df["cell_undervoltage"] = df["min_cell_voltage"] < CELL_V_WARN_LO
@@ -690,8 +798,6 @@ def label_sessions(df: pd.DataFrame) -> pd.DataFrame:
       moving_charging → session_type = 'discharge' (keeps drive session continuous)
       capacity_ah_charge is credited separately in extract_cycles().
     """
-    df = df.copy()
-
     # Smooth current per vehicle
     df["current_sm"] = (
         df.groupby("registration_number")["current"]
@@ -799,8 +905,6 @@ def _merge_discharge_gaps(df: pd.DataFrame, max_gap_sec: float = MERGE_GAP_SEC) 
 
     Raw current values are never modified — capacity_ah and regen_ah are unaffected.
     """
-    df = df.copy()
-
     # Build session-level boundary table
     sess = (
         df.groupby(["registration_number", "session_id"], sort=False)
@@ -875,7 +979,6 @@ def compute_voltage_sag(df: pd.DataFrame, thresholds: dict = None) -> pd.DataFra
     reference.
     Session-level count n_vsag is computed in extract_cycles().
     """
-    df  = df.copy()
     SK  = ["registration_number", "session_id"]
 
     if thresholds:
@@ -922,7 +1025,6 @@ def compute_ir_metrics(df: pd.DataFrame, thresholds: dict = None) -> pd.DataFram
     Session-level ir_ohm_mean, n_high_ir and rate-of-change (d_ir_per_cycle)
     are computed in extract_cycles().
     """
-    df  = df.copy()
     SK  = ["registration_number", "session_id"]
 
     if thresholds and "high_curr_thr" in thresholds:
@@ -1009,7 +1111,6 @@ def extract_cycles(df: pd.DataFrame) -> pd.DataFrame:
       d_n_high_ir         — session-to-session delta in n_high_ir count
       d_ir_ohm_per_cycle  — session-to-session delta in ir_ohm_mean
     """
-    df  = df.copy()
     SK  = ["registration_number", "session_id", "session_type"]
 
     # Coulomb counting
@@ -1332,7 +1433,6 @@ def compute_block_linkage(agg: pd.DataFrame) -> pd.DataFrame:
       block_n_sessions   — active session count in block
       block_odometer_km  — total km in block (discharge blocks, if GPS available)
     """
-    agg = agg.copy()
     agg = agg.sort_values(["registration_number", "start_time"]).reset_index(drop=True)
 
     # ── Step 1: identify block boundaries from discharge + charging sessions ──
@@ -1424,8 +1524,6 @@ def add_fleet_flags(cycles: pd.DataFrame) -> pd.DataFrame:
       cell_health_poor      — n_cell_undervoltage + n_cell_overvoltage > 0
                               OR n_cell_spread_warn / n_rows > 10%
     """
-    cycles = cycles.copy()
-
     # BMS coverage
     cycles["bms_coverage"] = (
         (cycles["n_rows"] * (10.0 / 3600.0)) /
@@ -1492,7 +1590,6 @@ def add_engineered_features(cycles: pd.DataFrame) -> pd.DataFrame:
     """
     from config import EFC_MAX, BATTERY_CAPACITY_KWH
 
-    cycles = cycles.copy()
     cycles = cycles.sort_values(["registration_number", "start_time"])
 
     # ── 1. EFC and calendar aging ──────────────────────────────────────────
@@ -1583,7 +1680,8 @@ def add_engineered_features(cycles: pd.DataFrame) -> pd.DataFrame:
 
     # ── 6. load_direction encoding ─────────────────────────────────────────
     if "load_direction" in cycles.columns:
-        direction_map = {"outbound": 0, "inbound": 1, "unknown": np.nan}
+        direction_map = {"outbound": 0, "inbound": 1,
+                         "at_loading": np.nan, "at_unloading": np.nan, "unknown": np.nan}
         cycles["load_direction_enc"] = cycles["load_direction"].map(direction_map)
 
     new_cols = [
@@ -1632,7 +1730,6 @@ def add_capacity_soh(cycles: pd.DataFrame) -> pd.DataFrame:
     """
     CHARGE_COULOMBIC_EFF = 0.97   # ~97% coulombic efficiency for LiNMC
 
-    cycles = cycles.copy()
     n_total = cycles["registration_number"].nunique()
 
     # ── Discharge side — block-level ──────────────────────────────────────────
@@ -1939,50 +2036,17 @@ if __name__ == "__main__":
         _vcu_rate_v = gps_v["vcu_odometer"].notna().mean()
         vehicle_vcu_rates.append(_vcu_rate_v)
 
-        # Step 2: Trip direction (inline per-vehicle, avoids full-fleet label_trip_direction)
-        if reg in depots:
-            depot_lat, depot_lon, _ = depots[reg]
-            dist = _haversine_km(gps_v["latitude"].values, gps_v["longitude"].values,
-                                 depot_lat, depot_lon)
-            gps_v["dist_from_depot_km"] = dist
-
-            if gps_v["head"].notna().any():
-                brg   = _bearing_deg(np.full(len(gps_v), depot_lat),
-                                     np.full(len(gps_v), depot_lon),
-                                     gps_v["latitude"].values, gps_v["longitude"].values)
-                adiff = _angle_diff(gps_v["head"].values, brg)
-                head_out = np.where(np.isnan(adiff), np.nan, (adiff < 90.0).astype(float))
-            else:
-                head_out = np.full(len(gps_v), np.nan)
-            gps_v["head_aligns_outbound"] = head_out
-
-            dt_ms  = gps_v["gps_time"].diff().fillna(0).values
-            seg_id = np.cumsum(dt_ms > TRIP_GAP_MIN * 60 * 1000)
-            trip_dir = np.full(len(gps_v), "unknown", dtype=object)
-
-            for seg in np.unique(seg_id):
-                seg_pos  = np.where(seg_id == seg)[0]
-                seg_dist = dist[seg_pos]
-                n        = len(seg_pos)
-                if n < 3:
-                    continue
-                max_pos = int(np.argmax(seg_dist))
-                if max_pos == 0 or max_pos == n - 1:
-                    valid_h = head_out[seg_pos]
-                    valid_h = valid_h[~np.isnan(valid_h)]
-                    if len(valid_h):
-                        trip_dir[seg_pos] = "outbound" if valid_h.mean() > 0.5 else "inbound"
-                else:
-                    trip_dir[seg_pos[: max_pos + 1]] = "outbound"
-                    trip_dir[seg_pos[max_pos:]]      = "inbound"
-
-            gps_v["trip_direction"] = trip_dir
-            gps_v["is_loaded"]      = (trip_dir == "inbound").astype(int)
-        else:
-            gps_v["dist_from_depot_km"]   = np.nan
-            gps_v["head_aligns_outbound"] = np.nan
-            gps_v["trip_direction"]       = "unknown"
-            gps_v["is_loaded"]            = 0
+        # Step 2: Trip direction via fixed loading/unloading geofences
+        directions, is_loaded = _label_direction_geofence(
+            gps_v["latitude"].values, gps_v["longitude"].values
+        )
+        gps_v["trip_direction"]       = directions
+        gps_v["is_loaded"]            = is_loaded.astype(int)
+        load_centroid = _LOADING_POLYGON.mean(axis=0)
+        gps_v["dist_from_loading_km"] = _haversine_km(
+            gps_v["latitude"].values, gps_v["longitude"].values,
+            load_centroid[0], load_centroid[1],
+        )
 
         # Step 3: GPS+VCU ← BMS
         bms_right = ["gps_time"] + [c for c in bms_val_cols if c in bms_v.columns]
@@ -2070,7 +2134,10 @@ if __name__ == "__main__":
             if c in df_v.columns
         ]])
 
-        del df_v  # free per-vehicle RAM immediately
+        del df_v; gc.collect()  # free per-vehicle RAM immediately
+
+    # Free raw data dicts — no longer needed after vehicle loop
+    del bms_by_veh, gps_by_veh, vcu_by_veh, curr_by_veh; gc.collect()
 
     # ── Fleet BMS match rate summary (Fix E) ──────────────────────────────────
     if vehicle_bms_rates:
@@ -2088,12 +2155,15 @@ if __name__ == "__main__":
     # ── Combine ───────────────────────────────────────────────────────────────
     print("\nCombining vehicle results ...")
     cycles = pd.concat(all_cycles).reset_index(drop=True)
+    del all_cycles; gc.collect()
     df_disc = pd.concat(all_disc_rows).reset_index(drop=True) if all_disc_rows else pd.DataFrame()
+    del all_disc_rows; gc.collect()
 
     # Fleet anomaly report on sampled data
     if anomaly_frames:
         report_anomalies(pd.concat(anomaly_frames).reset_index(drop=True),
                          label="post-join sample (5k rows/vehicle)")
+    del anomaly_frames; gc.collect()
 
     # Fleet-level post-processing
     cycles = add_capacity_soh(cycles)
@@ -2113,6 +2183,10 @@ if __name__ == "__main__":
 
     # ── Engineered features for ML degradation models ─────────────────────────
     cycles = add_engineered_features(cycles)
+
+    # ── Alerts join ───────────────────────────────────────────────────────────
+    alerts_agg = load_alerts(ALERTS_FILE)
+    cycles = join_alerts_onto_cycles(cycles, alerts_agg)
 
     # ── Final sanity report ───────────────────────────────────────────────────
     n_disc = (cycles["session_type"] == "discharge").sum()
@@ -2175,8 +2249,8 @@ if __name__ == "__main__":
     # Loaded vs unloaded EPK
     if "is_loaded" in cycles.columns and "energy_per_km" in cycles.columns:
         dm = cycles["session_type"] == "discharge"
-        for grp_name, mask in [("Unloaded (outbound)", dm & (cycles["is_loaded"] == 0)),
-                                ("Loaded   (inbound)",  dm & (cycles["is_loaded"] == 1))]:
+        for grp_name, mask in [("Loaded   (outbound: Manawar→Dhule)", dm & (cycles["is_loaded"] == 1)),
+                                ("Unloaded (inbound:  Dhule→Manawar)", dm & (cycles["is_loaded"] == 0))]:
             epk = cycles.loc[mask, "energy_per_km"].dropna()
             if len(epk):
                 print(f"  EPK {grp_name}: n={len(epk)}  "
@@ -2249,6 +2323,22 @@ if __name__ == "__main__":
         "c_rate_chg", "dod_stress", "thermal_stress", "energy_per_loaded_session",
         # Load direction
         "load_direction_enc",
+        # Alert counts (per-day totals joined from alerts_full_ultratech_intangles.csv)
+        "total_alerts",
+        "motor_total_faults", "motor_temperature_alarm", "mcu_temperature_alarm",
+        "over_current_alarm", "over_voltage_alarm", "under_voltage_alarm",
+        "battery_overcharge_fault", "insulation_fault", "cell_voltage_diff_fault",
+        "battery_mismatch_alarm", "soc_jump_alarm", "soc_over_high_alarm", "soc_over_low_alarm",
+        "cell_over_high_alarm", "cell_over_low_alarm",
+        "battery_over_high_voltage_alarm", "battery_over_low_voltage_alarm",
+        "temperature_over_high_alarm", "temperature_diff_fault_alarm",
+        "hv_connector_level1_fault", "soc_over_low_level1_fault",
+        "recharge_current_over_high_l1", "discharge_current_over_high_l1",
+        "total_voltage_over_high_l1_fault", "total_voltage_over_low_l1_fault",
+        "cell_voltage_over_high_l1_fault", "cell_voltage_over_low_l1_fault",
+        "charge_current_over_high_l1", "battery_insulation_l1_fault",
+        "battery_over_high_temperature_l1_fault",
+        "highest_fault_level", "battery_alarm_level_fault", "hall_sensor_fault", "hv_fault",
     ]
     _existing = [c for c in _col_order if c in cycles.columns]
     _remaining = [c for c in cycles.columns if c not in set(_existing)]
@@ -2273,9 +2363,11 @@ if __name__ == "__main__":
     # ── Sequence extraction ───────────────────────────────────────────────────
     print("\nExtracting discharge sequences ...")
     sequences, seq_meta = extract_sequences(df_disc, cycles)
+    del df_disc; gc.collect()
 
     if sequences:
         arr = np.stack(sequences).astype(np.float32)
+        del sequences; gc.collect()
         np.save(SEQ_NPY, arr)
         pd.DataFrame(seq_meta).to_csv(SEQ_META, index=False)
         print(f"Saved sequences → {SEQ_NPY}  shape={arr.shape}")

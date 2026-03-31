@@ -202,3 +202,49 @@ The three current/energy sources produce fundamentally different discharge Ah co
 4. **4.6% of Source C discharge blocks below 0%:** Caused by small or near-zero `energy_kwh` values in short discharge sessions, or high `voltage_mean` outliers
 
 **Recommended next step:** Plot `hves1_current` vs `current_mean` time-series for one or two representative sessions to identify whether the discharge discrepancy is a constant scaling factor, a measurement-point difference, or session-boundary effects.
+
+---
+
+## Changes Made (2026-03-31)
+
+### 3. `code/data_prep_1.py` — Geofence-based trip direction, alerts integration, memory optimisations
+
+#### 3a. Fixed-route geofence trip direction (replaces depot-distance heuristic)
+
+**Before:** `label_trip_direction()` estimated trip direction by computing haversine distance to the vehicle's inferred depot, finding the turnaround point (argmax distance per trip segment), and falling back to heading alignment when no clear turnaround existed. `is_loaded` was set to `True` for *inbound* (trucks returning to depot = loaded cargo).
+
+**After:** Direction is determined by a state machine keyed on two fixed geofences:
+
+| Geofence | Type | Coordinates |
+|---|---|---|
+| Manawar Loading Area | Polygon (4 vertices) | ~22.26–22.27°N, 75.13–75.14°E |
+| Dhule Unloading Area | Circle (100 m radius) | 21.151°N, 74.850°E |
+
+Logic:
+- Entering loading polygon → state = `at_loading`
+- Entering unloading circle → state = `at_unloading`
+- Leaving loading site → `outbound` (truck is **loaded**: Manawar → Dhule)
+- Leaving unloading site → `inbound` (truck is **empty**: Dhule → Manawar)
+- `is_loaded = True` for `outbound` sessions (corrected from old inbound=loaded)
+
+New columns: `trip_direction` (`outbound` | `inbound` | `at_loading` | `at_unloading` | `unknown`), `dist_from_loading_km` (replaces `dist_from_depot_km`).
+
+`load_direction_enc` updated: `at_loading` and `at_unloading` map to `NaN` (previously only `unknown` was NaN).
+
+EPK summary print updated to reflect corrected semantics: *Loaded (outbound: Manawar→Dhule)* / *Unloaded (inbound: Dhule→Manawar)*.
+
+#### 3b. Alerts integration
+
+Added `ALERTS_FILE` constant pointing to `data/alerts_full_ultratech_intangles.csv`.
+
+New functions:
+- `load_alerts(path)` — loads the alerts CSV, coerces all non-metadata columns to numeric, returns `(registration_number, gps_time, <alert_cols>)` DataFrame. Returns empty DataFrame if file not found (graceful skip).
+- `join_alerts_onto_cycles(cycles, alerts)` — per-vehicle searchsorted join: for each session in `cycles`, sums alert counts whose `gps_time` falls within `[start_time, end_time]`. O(n log m) per vehicle.
+
+Columns added to `cycles.csv` output: `total_alerts` plus ~35 individual alert columns (fault/alarm counts per session) sourced from `alerts_full_ultratech_intangles.csv`.
+
+#### 3c. Memory optimisations
+
+- Added `import gc` and `gc.collect()` after large DataFrame operations throughout the pipeline: after `load_gps`, `load_vcu`, `load_bms`, `load_current_table`, `del df_v`, and after all concat/del operations in the main block.
+- Removed in-function `.copy()` calls from `add_derived_columns`, `label_sessions`, `_merge_discharge_gaps`, `compute_voltage_sag`, `compute_ir_metrics`, `extract_cycles`, `compute_block_linkage`, `add_fleet_flags`, `add_engineered_features`, `add_capacity_soh` — these functions now mutate the passed DataFrame in place, reducing peak RAM.
+- Added explicit `del` for `bms_by_veh`, `gps_by_veh`, `vcu_by_veh`, `curr_by_veh` after the vehicle loop and for intermediate concat results (`all_cycles`, `all_disc_rows`, `anomaly_frames`, `sequences`).
