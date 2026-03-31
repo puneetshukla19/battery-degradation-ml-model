@@ -366,7 +366,7 @@ def load_alerts(path: str) -> pd.DataFrame:
     _meta = {"registration_number", "gps_time", "event_datetime", "vendor", "spv"}
     alert_cols = [c for c in df.columns if c not in _meta]
     for c in alert_cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).clip(lower=0)
 
     print(f"  Alert rows: {len(df):,}  |  Vehicles: {df['registration_number'].nunique()}  "
           f"|  Alert columns: {len(alert_cols)}")
