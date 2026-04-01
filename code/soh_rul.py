@@ -41,12 +41,13 @@ BOOTSTRAP_N        = 200
 # Primary SoH signal: ekf_soh_norm (EKF-filtered, physics-grounded) is used when
 # ekf_soh.csv is available; falls back to soh_slope_norm (OLS) if not.
 COMPOSITE_WEIGHTS = {
-    "soh_health_norm":   0.30,  # primary: EKF SoH health deficit (or OLS slope fallback)
-    "vsag_slope_norm":   0.15,  # rising severe voltage sags = capacity loss
-    "ir_slope_norm":     0.15,  # rising high-IR events = internal resistance growth
-    "energy_slope_norm": 0.15,  # rising energy-per-km = efficiency loss
-    "heat_slope_norm":   0.13,  # rising temp-rise-rate = thermal degradation
-    "spread_slope_norm": 0.12,  # rising cell-voltage spread = growing imbalance
+    "soh_health_norm":        0.25,  # primary: EKF SoH health deficit (or OLS slope fallback)
+    "cycle_soh_slope_norm":   0.10,  # per-cycle SoH trend (all session types; more data points)
+    "vsag_slope_norm":        0.15,  # rising severe voltage sags = capacity loss
+    "ir_slope_norm":          0.15,  # rising high-IR events = internal resistance growth
+    "energy_slope_norm":      0.13,  # rising energy-per-km = efficiency loss
+    "heat_slope_norm":        0.11,  # rising temp-rise-rate = thermal degradation
+    "spread_slope_norm":      0.11,  # rising cell-voltage spread = growing imbalance
 }
 
 
@@ -167,9 +168,12 @@ def rul_dual_axis(fit: dict, current_soh: float,
 def bayesian_rul_vehicle(efc: np.ndarray, days: np.ndarray,
                          soh: np.ndarray,
                          eol: float = EOL_SOH,
-                         daily_efc_rate: float = np.nan) -> dict:
+                         daily_efc_rate: float = np.nan,
+                         extra_features: np.ndarray | None = None) -> dict:
     """
-    Fit BayesianRidge on [cum_efc, days_since_first, efc*days] → capacity_soh.
+    Fit BayesianRidge on [cum_efc, days_since_first, efc*days, ...extra] → capacity_soh.
+    extra_features: optional (n, k) array of additional per-session features
+                    (e.g. cycle_soh, ir_ohm_mean, cell_spread_mean, temp_mean).
     Returns point-estimate SOH, 1-sigma uncertainty, and RUL estimate.
     """
     n = len(soh)
@@ -178,7 +182,16 @@ def bayesian_rul_vehicle(efc: np.ndarray, days: np.ndarray,
     if n < 5:
         return empty
 
-    X = np.column_stack([efc, days, efc * days])
+    base = np.column_stack([efc, days, efc * days])
+    if extra_features is not None and extra_features.shape[0] == n:
+        # Replace NaN in extra features with column medians before stacking
+        ef = extra_features.copy().astype(float)
+        col_medians = np.nanmedian(ef, axis=0)
+        for c in range(ef.shape[1]):
+            ef[np.isnan(ef[:, c]), c] = col_medians[c]
+        X = np.column_stack([base, ef])
+    else:
+        X = base
     model = BayesianRidge(max_iter=500)
     try:
         model.fit(X, soh)
@@ -197,9 +210,14 @@ def bayesian_rul_vehicle(efc: np.ndarray, days: np.ndarray,
         # Approximate gradient: d(SoH)/d(day) via finite differences
         efc_last, day_last = float(efc[-1]), float(days[-1])
         delta = 1.0   # 1 day ahead
-        X_next = np.array([[efc_last + daily_efc_rate * delta,
-                             day_last + delta,
-                             (efc_last + daily_efc_rate * delta) * (day_last + delta)]])
+        base_next = [efc_last + daily_efc_rate * delta,
+                     day_last + delta,
+                     (efc_last + daily_efc_rate * delta) * (day_last + delta)]
+        if extra_features is not None and extra_features.shape[0] == n:
+            # Forward-project extra features by repeating last row
+            X_next = np.array([base_next + list(X[-1, 3:])])
+        else:
+            X_next = np.array([base_next])
         soh_next = float(model.predict(X_next)[0])
         daily_soh_change = soh_next - soh_pred
         if daily_soh_change < 0:
@@ -273,16 +291,31 @@ if __name__ == "__main__":
     disc.to_csv(TREND_FILE, index=False)
     print(f"Saved SoH trends: {TREND_FILE}")
 
+    # ── Young-fleet sanity notice ─────────────────────────────────────────────
+    fleet_max_days = disc["date_days"].max() if len(disc) else 0
+    if fleet_max_days < 180:
+        print(f"\n{'='*75}")
+        print(f"YOUNG FLEET NOTICE  (max data span ~{fleet_max_days:.0f} days)")
+        print("="*75)
+        print("  With <6 months of data:")
+        print("  • OLS trend slopes are highly uncertain (few unique BMS SoH values)")
+        print("  • Most vehicles will show rul_reliability = 'insufficient_data'")
+        print("  • Composite scores reflect operating PATTERNS more than degradation STATE")
+        print("  • EKF SoH near 100% and wide uncertainty bands are CORRECT behaviour")
+        print("  • Anomaly detection is most actionable: flags unusual sessions NOW")
+        print("  • Re-run after 6+ months for meaningful RUL estimates")
+
     # ── Per-vehicle trend fitting ──────────────────────────────────────────────
     np.random.seed(42)
     vehicle_results = []
     fleet_soh_slopes, fleet_epk_slopes, fleet_heat_slopes = [], [], []
 
-    has_epk    = "energy_per_km"    in disc.columns
-    has_heat   = "temp_rise_rate"   in disc.columns
-    has_spread = "cell_spread_mean" in disc.columns
-    has_vsag   = "n_vsag"           in disc.columns  # data_prep_1 consolidates severity into one count
-    has_ir     = "n_high_ir"        in disc.columns
+    has_epk        = "energy_per_km"    in disc.columns
+    has_heat       = "temp_rise_rate"   in disc.columns
+    has_spread     = "cell_spread_mean" in disc.columns
+    has_vsag       = "n_vsag"           in disc.columns  # data_prep_1 consolidates severity into one count
+    has_ir         = "n_high_ir"        in disc.columns
+    has_cycle_soh  = "cycle_soh"        in cycles.columns  # new per-cycle SoH estimate
 
     for reg, veh in disc.groupby("registration_number"):
         veh = veh.sort_values("date_days")
@@ -375,8 +408,18 @@ if __name__ == "__main__":
                     "dual_dominant_path":  ("calendar" if dual_rul["rul_cal_days"] <= dual_rul["rul_efc_days"]
                                             else "cycle"),
                 }
+                # Build extra features for BayesianRidge: cycle_soh, ir_ohm_mean,
+                # cell_spread_mean, temp_rise_rate (where available)
+                extra_cols = ["cycle_soh", "ir_ohm_mean", "cell_spread_mean", "temp_rise_rate",
+                              "ir_ohm_mean_ewm10", "cell_spread_mean_ewm10",
+                              "vsag_rate_per_hr", "dod_stress", "c_rate_chg", "thermal_stress",
+                              "weak_subsystem_consistency", "subsystem_voltage_std",
+                              "current_mean_discharge", "is_loaded"]
+                avail_extra = [c for c in extra_cols if c in veh_chg.columns]
+                extra_arr = veh_chg[avail_extra].values if avail_extra else None
                 bayes_row = bayesian_rul_vehicle(chg_efc, chg_days, chg_cap,
-                                                 daily_efc_rate=avg_efc_per_day)
+                                                 daily_efc_rate=avg_efc_per_day,
+                                                 extra_features=extra_arr)
 
         row = {
             "registration_number":  reg,
@@ -468,6 +511,25 @@ if __name__ == "__main__":
                 row["ir_r2"]            = np.nan
             row["total_high_ir"] = int(veh["n_high_ir"].sum())
 
+        # cycle_soh trend — use all sessions (not just discharge or charging).
+        # Fit on the full cycles DataFrame so we maximise data points.
+        if has_cycle_soh:
+            veh_all = cycles[cycles["registration_number"] == reg].copy()
+            veh_all["_days"] = (
+                (veh_all["start_time"] - veh_all["start_time"].min()) / 86_400_000.0
+            )
+            cs_all = veh_all["cycle_soh"].dropna()
+            if len(cs_all) >= MIN_CYCLES_FOR_FIT:
+                cs_all_days = veh_all.loc[cs_all.index, "_days"].values
+                cs_fit = fit_degradation(cs_all_days, cs_all.values)
+                row["cycle_soh_slope_per_day"] = round(cs_fit["slope"], 5)
+                row["cycle_soh_r2"]            = round(cs_fit["r2"], 3)
+                row["cycle_soh_current"]        = round(float(cs_all.iloc[-1]), 3)
+            else:
+                row["cycle_soh_slope_per_day"] = np.nan
+                row["cycle_soh_r2"]            = np.nan
+                row["cycle_soh_current"]        = np.nan
+
         vehicle_results.append(row)
 
     # ── Fleet-average fallback for vehicles with too few cycles ───────────────
@@ -537,24 +599,28 @@ if __name__ == "__main__":
         rul_df["soh_health_norm"] = rul_df["soh_slope_norm"]
         print("  Composite: ekf_soh.csv not found — falling back to OLS slope")
 
-    rul_df["energy_slope_norm"] = norm_col("epk_slope_per_day",    invert=False) \
-                                  if "epk_slope_per_day"    in rul_df.columns else 0.0
-    rul_df["heat_slope_norm"]   = norm_col("heat_slope_per_day",   invert=False) \
-                                  if "heat_slope_per_day"   in rul_df.columns else 0.0
-    rul_df["spread_slope_norm"] = norm_col("spread_slope_per_day", invert=False) \
-                                  if "spread_slope_per_day" in rul_df.columns else 0.0
-    rul_df["vsag_slope_norm"]   = norm_col("vsag_slope_per_day",   invert=False) \
-                                  if "vsag_slope_per_day"   in rul_df.columns else 0.0
-    rul_df["ir_slope_norm"]     = norm_col("ir_slope_per_day",     invert=False) \
-                                  if "ir_slope_per_day"     in rul_df.columns else 0.0
+    rul_df["energy_slope_norm"]     = norm_col("epk_slope_per_day",         invert=False) \
+                                      if "epk_slope_per_day"         in rul_df.columns else 0.0
+    rul_df["heat_slope_norm"]       = norm_col("heat_slope_per_day",        invert=False) \
+                                      if "heat_slope_per_day"        in rul_df.columns else 0.0
+    rul_df["spread_slope_norm"]     = norm_col("spread_slope_per_day",      invert=False) \
+                                      if "spread_slope_per_day"      in rul_df.columns else 0.0
+    rul_df["vsag_slope_norm"]       = norm_col("vsag_slope_per_day",        invert=False) \
+                                      if "vsag_slope_per_day"        in rul_df.columns else 0.0
+    rul_df["ir_slope_norm"]         = norm_col("ir_slope_per_day",          invert=False) \
+                                      if "ir_slope_per_day"          in rul_df.columns else 0.0
+    # cycle_soh slope: negative slope = SoH declining = worse → invert so high norm = worse
+    rul_df["cycle_soh_slope_norm"]  = norm_col("cycle_soh_slope_per_day",   invert=True) \
+                                      if "cycle_soh_slope_per_day"   in rul_df.columns else 0.0
 
     rul_df["composite_degradation_score"] = (
-        COMPOSITE_WEIGHTS["soh_health_norm"]   * rul_df["soh_health_norm"].fillna(0) +
-        COMPOSITE_WEIGHTS["vsag_slope_norm"]   * rul_df["vsag_slope_norm"].fillna(0) +
-        COMPOSITE_WEIGHTS["ir_slope_norm"]     * rul_df["ir_slope_norm"].fillna(0) +
-        COMPOSITE_WEIGHTS["energy_slope_norm"] * rul_df["energy_slope_norm"].fillna(0) +
-        COMPOSITE_WEIGHTS["heat_slope_norm"]   * rul_df["heat_slope_norm"].fillna(0) +
-        COMPOSITE_WEIGHTS["spread_slope_norm"] * rul_df["spread_slope_norm"].fillna(0)
+        COMPOSITE_WEIGHTS["soh_health_norm"]       * rul_df["soh_health_norm"].fillna(0) +
+        COMPOSITE_WEIGHTS["cycle_soh_slope_norm"]  * rul_df["cycle_soh_slope_norm"].fillna(0) +
+        COMPOSITE_WEIGHTS["vsag_slope_norm"]       * rul_df["vsag_slope_norm"].fillna(0) +
+        COMPOSITE_WEIGHTS["ir_slope_norm"]         * rul_df["ir_slope_norm"].fillna(0) +
+        COMPOSITE_WEIGHTS["energy_slope_norm"]     * rul_df["energy_slope_norm"].fillna(0) +
+        COMPOSITE_WEIGHTS["heat_slope_norm"]       * rul_df["heat_slope_norm"].fillna(0) +
+        COMPOSITE_WEIGHTS["spread_slope_norm"]     * rul_df["spread_slope_norm"].fillna(0)
     ).round(4)
 
     # ── Fleet-flag rates per vehicle ──────────────────────────────────────────
@@ -595,12 +661,13 @@ if __name__ == "__main__":
             anom.groupby("registration_number")
             .agg(
                 n_if_anomalies    = ("if_anomaly",       "sum"),
-                n_cusum_soh       = ("cusum_soh_alarm",   "sum"),
-                n_cusum_epk       = ("cusum_epk_alarm",   "sum"),
-                n_cusum_heat      = ("cusum_heat_alarm",  "sum"),
-                n_cusum_spread    = ("cusum_spread_alarm","sum"),
-                n_combined_anom   = ("anomaly",           "sum"),
-                if_score_mean     = ("if_score",          "mean"),
+                n_cusum_soh       = ("cusum_soh_alarm",        "sum"),
+                n_cusum_epk       = ("cusum_epk_alarm",        "sum"),
+                n_cusum_heat      = ("cusum_heat_alarm",       "sum"),
+                n_cusum_spread    = ("cusum_spread_alarm",     "sum"),
+                n_cusum_cycle_soh = ("cusum_cycle_soh_alarm",  "sum"),
+                n_combined_anom   = ("anomaly",                "sum"),
+                if_score_mean     = ("if_score",               "mean"),
             )
             .reset_index()
         )
@@ -636,7 +703,8 @@ if __name__ == "__main__":
     print("VEHICLE DEGRADATION RANKING  (worst -> best, by composite score)")
     print("=" * 75)
     show_cols = ["registration_number", "n_cycles", "current_soh",
-                 "soh_slope_%per_day", "rul_days", "soh_r2",
+                 "soh_slope_%per_day", "rul_reliability", "rul_days", "soh_r2",
+                 "cycle_soh_current", "cycle_soh_slope_per_day", "cycle_soh_r2",
                  "dual_rul_days", "dual_rul_cal_days", "dual_rul_efc_days", "dual_dominant_path",
                  "bayes_rul_days", "bayes_soh_pred", "bayes_soh_std",
                  "vsag_slope_per_day", "ir_slope_per_day",
@@ -647,9 +715,21 @@ if __name__ == "__main__":
                  "composite_degradation_score",
                  "n_combined_anom", "if_score_mean",
                  "n_neural_anomalies", "neural_rec_err_mean"]
-    show = rul_df[[c for c in show_cols if c in rul_df.columns]].dropna(subset=["soh_slope_%per_day"])
+    show = rul_df[[c for c in show_cols if c in rul_df.columns]]
     print(show.to_string(index=False))
 
     print(f"\nFleet mean SoH degradation : {fleet_mean_soh_slope:.5f} %SoH/day")
     print(f"Fleet mean RUL             : {rul_from_fit(98.0, fleet_mean_soh_slope):.0f} days")
     print(f"\nSaved RUL estimates        : {RUL_FILE}")
+
+    # ── Young fleet reliability summary ──────────────────────────────────────
+    if "rul_reliability" in rul_df.columns:
+        rel_counts = rul_df["rul_reliability"].value_counts()
+        print(f"\nRUL reliability distribution:")
+        for cat, cnt in rel_counts.items():
+            print(f"  {cat:<25}: {cnt} vehicles")
+        n_insuff = rel_counts.get("insufficient_data", 0)
+        if n_insuff / max(len(rul_df), 1) > 0.5:
+            print(f"\n  WARNING: {n_insuff}/{len(rul_df)} vehicles have insufficient_data reliability.")
+            print("     This is expected for a young fleet (<6 months).")
+            print("     Composite scores and anomaly flags are still valid and actionable.")

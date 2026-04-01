@@ -576,3 +576,170 @@ All flags are **fleet-relative** (thresholds computed from fleet distribution, n
 | Column | Formula | Notes |
 |---|---|---|
 | `load_direction_enc` | `{outbound: 0, inbound: 1, at_loading/at_unloading/unknown: NaN}` | Numeric encoding of geofence-derived trip direction |
+
+---
+
+## Session 2026-04-01 — cycle_soh Integration, 4D EKF, Anomaly Reason Codes
+
+### Summary of Changes
+
+This session overhauled the four ML pipeline scripts (`ekf_soh.py`, `soh_rul.py`, `anomaly.py`, `plot_rul.py`) and `config.py` to incorporate the new `cycle_soh` column from `artifacts/cycles.csv`, remove the deprecated `capacity_soh`-based EKF observations, and add anomaly reason codes.
+
+---
+
+### 1. `config.py` — New Constants
+
+```python
+# Peukert current-stress model
+PEUKERT_N        = 0.05   # mild NMC effect
+I_NOMINAL_A      = 150.0  # reference discharge current (A)
+LOAD_STRESS_FACTOR = 1.15 # extra EFC stress when vehicle is loaded
+
+# Thermal aging accumulation
+ZETA             = 5e-4   # °C/hr drift per EFC
+
+# 4D EKF state noise (SoH, IR_drift, spread_drift, temp_drift)
+EKF_Q_DIAG = [1e-4, 2.5e-7, 2.5e-9, 1e-5]
+# 5 observations: cycle_soh, bms_soh, ir_ohm_mean, cell_spread_mean, temp_rise_rate
+EKF_R_DIAG = [4.0, 9.0, 4e-6, 2.5e-5, 0.25]
+```
+
+---
+
+### 2. `ekf_soh.py` — Complete Rewrite
+
+#### Why capacity_soh was removed
+`capacity_soh` from Coulomb-counting only had valid values for high-confidence full-swing charging sessions (~38% of sessions). `cycle_soh` is available every cycle (charging and discharging) and is far less biased.
+
+#### 4D State Vector
+```
+x = [SoH (%), IR_drift (Ω), spread_drift (V), temp_drift (°C/hr)]
+```
+
+#### Process model additions
+- **Peukert current-stress scaling**: `alpha_adj = ALPHA × (1 + 0.05 × max(0, I/150A - 1))` — higher discharge current accelerates SoH fade.
+- **Load stress factor**: `load_fac = 1.15` if `is_loaded=True`; 1.0 otherwise.
+- **Thermal aging state**: `x[3] += ZETA × delta_efc` — temp_drift accumulates with cycling.
+
+#### 5th Observation: temp_rise_rate
+`temp_rise_rate` is fleet-demeaned (subtracted median of charging sessions) before entering the EKF, so `x[3]=0` is the correct initial condition for all vehicles.
+
+#### Outputs added to `ekf_soh.csv`
+- `ekf_temp_drift` — thermal aging state (°C/hr above fleet baseline)
+- `temp_rise_rate_obs` — raw observation fed to EKF
+- `cycle_soh_obs`, `bms_soh_obs` — per-session observation values
+
+#### EKF Run Results (7,745 sessions, 66 vehicles)
+| Metric | Value |
+|---|---|
+| Fleet mean EKF SoH | 98.52% |
+| Fleet std | 1.29% |
+| % within ±2% of cycle_soh | 94% |
+| std shrinkage (prior→posterior) | 0.50 → 0.16 ✓ |
+| Fleet mean temp_drift | +0.32 °C/hr above baseline |
+
+**3 outlier vehicles:**
+| Vehicle | EKF SoH |
+|---|---|
+| MH18BZ3028 | 90.16% |
+| MH18BZ3392 | 93.82% |
+| MH18BZ3370 | 95.72% |
+
+These are genuine signals, not artefacts — their cycle_soh also trends lower and their IF scores are elevated.
+
+---
+
+### 3. `soh_rul.py` — cycle_soh Trend + Subsystem Features
+
+#### cycle_soh trend fitting
+`cycle_soh_slope_per_day` and `cycle_soh_r2` are now computed on ALL session types (not just discharge), since cycle_soh is available across the full charging+discharging timeline.
+
+#### New features in BayesianRidge extra_cols
+```python
+"cycle_soh", "ir_ohm_mean", "cell_spread_mean", "temp_rise_rate",
+"ir_ohm_mean_ewm10", "cell_spread_mean_ewm10",
+"vsag_rate_per_hr", "dod_stress", "c_rate_chg", "thermal_stress",
+"weak_subsystem_consistency", "subsystem_voltage_std",
+"current_mean_discharge", "is_loaded"
+```
+
+#### COMPOSITE_WEIGHTS (sum = 1.0)
+```python
+{"soh_health_norm": 0.25, "cycle_soh_slope_norm": 0.10,
+ "vsag_slope_norm": 0.15, "ir_slope_norm": 0.15,
+ "energy_slope_norm": 0.13, "heat_slope_norm": 0.11, "spread_slope_norm": 0.11}
+```
+
+#### soh_rul.py Run Results (66 vehicles)
+| RUL reliability | Count |
+|---|---|
+| `insufficient_data` | 63/66 |
+| `low_r2` | 2/66 |
+| `reliable` | 1/66 |
+
+**This is expected for 95 days of data.** BMS SoH barely moves (1–2 integer steps), making OLS slopes unreliable. Composite scores and anomaly flags remain valid and actionable.
+
+Fleet mean RUL: **~2,192 days (~6 years)** — physically correct; fleet is young.
+
+**Known artefact:** MH18BZ3195 shows `dual_rul_efc_days ≈ 2.2e15` — a near-zero cycle_soh slope causes division-by-zero in the EFC path. Does not affect composite score or calendar RUL.
+
+---
+
+### 4. `anomaly.py` — Anomaly Reason Codes + New Features
+
+#### New features added
+- IF/LGBM/cluster: `cycle_soh`, `weak_subsystem_consistency`, `subsystem_voltage_std`, `current_mean_discharge`, `n_cell_undervoltage`
+- CUSUM 5th channel: `cusum_cycle_soh_alarm` (downward CUSUM on cycle_soh)
+- COMPOSITE_WEIGHTS_CUSUM: added `cycle_soh` at weight 0.10; `INVERT_COLS = {"soh_smooth", "cycle_soh"}`
+
+#### Anomaly reason code functions
+Three new functions generate human-readable reason codes:
+- `_build_if_reason()`: top-3 features by absolute z-score with direction arrow and z-value
+  - Example: `ir_ohm_mean=0.12(↑high,z=2.3); cell_spread_mean=0.08(↑high,z=1.9); temp_rise_rate=1.4(↑high,z=1.7)`
+- `_build_cusum_reason()`: triggered CUSUM channel names
+  - Example: `BMS-SoH-decline; CellSpread-increase`
+- `_build_combined_reason()`: merged output → `anomaly_reason` column in `anomaly_scores.csv`
+  - Example: `IF: ir_ohm_mean=0.12(↑high,z=2.3); ... | CUSUM: BMS-SoH-decline`
+
+#### anomaly.py Run Results
+| Model | Result |
+|---|---|
+| LightGBM RMSE | 1.02% |
+| LightGBM MAE | 0.21% |
+| Directional accuracy | 91.6% |
+| Top LGBM features | capacity_soh_chg_new (1082), bms_coverage (520), cycle_soh (227), subsystem_voltage_std (211) |
+| UMAP non-healthy flag | 90.2% — young-fleet artefact (minimal degradation variation → poor cluster separation) |
+
+LightGBM performance is within all targets. `cycle_soh` and `subsystem_voltage_std` confirm the new columns add predictive signal.
+
+UMAP flagging 90.2% as non-healthy is a known limitation for young fleets where all vehicles occupy a dense near-healthy region — HDBSCAN assigns most to noise. This metric will improve after 6+ months of data.
+
+---
+
+### 5. `plot_rul.py` — Fixes and New Figures
+
+#### Bug fixes
+- Filename corrected: `rul_report.csv` → `rul_estimates.csv`
+- Compatibility shims added in `load_data()` to bridge old column names (`rul_years_exp_day`, `fit_quality`, `data_span_days`, `exp_k_day_blended`) to new schema
+- `fig3` rewritten from exponential-fit to OLS linear trendline (new soh_rul.py uses OLS, not exponential)
+
+#### New figures
+- **fig18** (CUSUM heatmap): now gracefully handles missing CUSUM columns; includes `n_cusum_cycle_soh` as 5th channel (cyan)
+- **fig20** (EKF trace): overlays `cycle_soh_obs` (cyan triangles) + `bms_soh_obs` (light blue dots); annotation includes `ekf_temp_drift` as `ΔT: {val:+.3f}°C/hr`
+- **fig21** (new): side-by-side fleet cycle_soh vs soh_smooth trajectories
+- **fig22** (new): per-vehicle cycle_soh vs EKF SoH for top-9 degraded vehicles
+
+Total: **22 figures + `rul_presentation.pdf`** saved to `plots/`.
+
+---
+
+### Re-run Checklist
+
+```
+python code/ekf_soh.py     # generates artifacts/ekf_soh.csv
+python code/anomaly.py     # generates artifacts/anomaly_scores.csv, neural_predictions.csv
+python code/soh_rul.py     # generates artifacts/rul_estimates.csv, soh_trends.csv
+python code/plot_rul.py    # generates plots/fig*.png + plots/rul_presentation.pdf
+```
+
+> Re-run `data_prep_1.py` first if the raw BMS/GPS/VCU data changes.

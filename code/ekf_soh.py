@@ -4,25 +4,38 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) if "__file__" in d
 """
 ekf_soh.py — Extended Kalman Filter for per-vehicle SoH tracking.
 
-State vector  x = [SoH (%), IR_drift (Ω), spread_drift (V)]
+State vector  x = [SoH (%), IR_drift (Ω), spread_drift (V), temp_drift (°C/hr)]
+               ^4-dimensional; temp_drift captures gradual thermal aging effect.
 
 Process model (per charging-session step):
-    SoH(k+1)    = SoH(k)    − α·Δefc − β·Δdays·(CAL_AGING_RATE/365)   + w₁
-    IR(k+1)     = IR(k)     + γ·Δefc                                    + w₂
-    spread(k+1) = spread(k) + δ·Δefc                                    + w₃
+    SoH(k+1)      = SoH(k) − α·I_norm·load_fac·Δefc − β·Δdays·(CAL/365) + w₁
+    IR(k+1)       = IR(k)  + γ·Δefc                                       + w₂
+    spread(k+1)   = spread(k) + δ·Δefc                                    + w₃
+    temp_drift(k+1) = temp_drift(k) + ζ·Δefc                              + w₄
 
-Observation model (charging sessions only, non-NaN observations):
-    z = [capacity_soh, bms_soh, ir_ohm_mean, cell_spread_mean]
-    H = [[1, 0, 0],   # capacity_soh ≈ SoH
-         [1, 0, 0],   # bms_soh      ≈ SoH (noisier)
-         [0, 1, 0],   # ir_ohm_mean  ≈ baseline_ir + IR_drift
-         [0, 0, 1]]   # cell_spread  ≈ baseline_spread + spread_drift
+  Where:
+    I_norm   = current_mean_discharge / I_NOMINAL  (Peukert current stress)
+    load_fac = LOAD_STRESS_FACTOR if is_loaded else 1.0
+
+Observation model (charging sessions; non-NaN entries only):
+    z = [cycle_soh, bms_soh, ir_ohm_mean, cell_spread_mean, temp_rise_rate_demeaned]
+    H = [[1, 0, 0, 0],   # cycle_soh            ≈ SoH
+         [1, 0, 0, 0],   # bms_soh              ≈ SoH (noisier; integer steps)
+         [0, 1, 0, 0],   # ir_ohm_mean          ≈ baseline_ir + IR_drift
+         [0, 0, 1, 0],   # cell_spread_mean      ≈ baseline_spread + spread_drift
+         [0, 0, 0, 1]]   # temp_rise_rate - μ_T ≈ temp_drift
+
+  Notes:
+    - capacity_soh REMOVED: replaced by cycle_soh (available every cycle, not just
+      full-swing charges). cycle_soh removes the 38%-coverage bias of Coulomb counting.
+    - temp_rise_rate is fleet-demeaned before use so x[3]=0 for a typical vehicle.
 
 Outputs
 -------
 ekf_soh.csv  — one row per charging session with:
-    ekf_soh, ekf_soh_std, ekf_ir, ekf_spread,
-    ekf_rul_days, ekf_rul_days_lo, ekf_rul_days_hi
+    ekf_soh, ekf_soh_std, ekf_ir, ekf_spread, ekf_temp_drift,
+    ekf_rul_days, ekf_rul_days_lo, ekf_rul_days_hi,
+    cycle_soh_obs, bms_soh_obs, temp_rise_rate_obs
 """
 
 import numpy as np
@@ -31,78 +44,96 @@ from config import (
     CYCLES_CSV, EKF_CSV, BASE,
     EKF_Q_DIAG, EKF_R_DIAG,
     EOL_SOH, EFC_MAX, CAL_AGING_RATE,
-    EKF_ALPHA,
+    EKF_ALPHA, PEUKERT_N, I_NOMINAL_A, LOAD_STRESS_FACTOR, ZETA,
 )
 
 # ── EKF physical parameters ────────────────────────────────────────────────────
-# Process model coefficients (fleet-wide priors; refined per vehicle via EKF)
-ALPHA = EKF_ALPHA  # %SoH lost per EFC (cycle aging) — set in config.py
-BETA  = 1.0      # scale factor on calendar aging term
-GAMMA = 0.001    # Ω per EFC            (IR growth)
-DELTA = 0.0001   # V per EFC            (spread growth)
+ALPHA = EKF_ALPHA   # %SoH lost per EFC (base cycle aging)
+BETA  = 1.0         # scale on calendar aging term
+GAMMA = 0.001       # Ω per EFC  (IR growth)
+DELTA = 0.0001      # V per EFC  (spread growth)
+# ZETA imported from config  (°C/hr drift per EFC, thermal aging)
 
-# Initial state and covariance
-X0    = np.array([100.0, 0.0, 0.0])          # fresh pack
-P0    = np.diag([4.0, 1e-3, 1e-4])           # ±2% SoH, small IR/spread uncertainty
+# Initial state and covariance — 4D
+X0 = np.array([100.0, 0.0, 0.0, 0.0])          # fresh pack: full SoH, no drift
+P0 = np.diag([4.0, 1e-3, 1e-4, 1e-3])          # ±2% SoH, small IR/spread/thermal uncertainty
 
-# Noise matrices
-Q     = np.diag(EKF_Q_DIAG)                  # process noise
-R_ALL = np.diag(EKF_R_DIAG)                  # observation noise (all 4 obs)
+# Noise matrices — built from config so both Q and R always match the state/obs dim
+Q     = np.diag(EKF_Q_DIAG)   # process noise (4×4)
+R_ALL = np.diag(EKF_R_DIAG)   # observation noise (5×5)
 
-# Observation matrix H  (4 × 3)
+# Observation matrix H  (5 × 4)
 H_ALL = np.array([
-    [1.0, 0.0, 0.0],   # capacity_soh → SoH
-    [1.0, 0.0, 0.0],   # bms_soh      → SoH
-    [0.0, 1.0, 0.0],   # ir_ohm_mean  → IR_drift
-    [0.0, 0.0, 1.0],   # cell_spread  → spread_drift
+    [1.0, 0.0, 0.0, 0.0],   # cycle_soh            → SoH
+    [1.0, 0.0, 0.0, 0.0],   # bms_soh              → SoH
+    [0.0, 1.0, 0.0, 0.0],   # ir_ohm_mean          → IR_drift
+    [0.0, 0.0, 1.0, 0.0],   # cell_spread_mean     → spread_drift
+    [0.0, 0.0, 0.0, 1.0],   # temp_rise_rate (demeaned) → temp_drift
 ])
 
-# Observation column names (must match cycles.csv)
-OBS_COLS = ["capacity_soh", "soh", "ir_ohm_mean", "cell_spread_mean"]
+# Observation column names (positions match z vector built in run_ekf_fleet)
+OBS_COLS = ["cycle_soh", "soh", "ir_ohm_mean", "cell_spread_mean", "temp_rise_rate"]
 
 
 # ── EKF core ───────────────────────────────────────────────────────────────────
 
-def _build_F(delta_efc: float, delta_days: float) -> np.ndarray:
-    """State transition Jacobian F (3×3) for one step."""
-    return np.array([
-        [1.0,  0.0,  0.0],
-        [0.0,  1.0,  0.0],
-        [0.0,  0.0,  1.0],
-    ])
+def _build_F() -> np.ndarray:
+    """State transition Jacobian F (4×4) — identity since model is linear in state."""
+    return np.eye(4)
 
 
-def _process(x: np.ndarray, delta_efc: float, delta_days: float) -> np.ndarray:
-    """Nonlinear state transition (same as F since model is linear in state)."""
+def _process(x: np.ndarray, delta_efc: float, delta_days: float,
+             current_mean_discharge: float = np.nan,
+             is_loaded: bool = False) -> np.ndarray:
+    """
+    Nonlinear (but linear-in-state) state transition.
+
+    Peukert current stress:
+        I_norm = max(current_mean_discharge / I_NOMINAL_A, 1.0)
+        alpha_adj = ALPHA * (1 + PEUKERT_N * (I_norm - 1))
+    Load stress: multiply effective EFC by LOAD_STRESS_FACTOR when loaded.
+    """
     x_new = x.copy()
-    x_new[0] -= ALPHA * delta_efc + BETA * delta_days * (CAL_AGING_RATE / 365.0)
+
+    # Current-adjusted cycle aging coefficient
+    if np.isfinite(current_mean_discharge) and current_mean_discharge > 0:
+        I_norm    = current_mean_discharge / I_NOMINAL_A
+        alpha_adj = ALPHA * (1.0 + PEUKERT_N * max(0.0, I_norm - 1.0))
+    else:
+        alpha_adj = ALPHA
+
+    load_fac = LOAD_STRESS_FACTOR if is_loaded else 1.0
+
+    x_new[0] -= (alpha_adj * load_fac * delta_efc +
+                 BETA * delta_days * (CAL_AGING_RATE / 365.0))
     x_new[1] += GAMMA * delta_efc
     x_new[2] += DELTA * delta_efc
+    x_new[3] += ZETA  * delta_efc   # thermal drift accumulates with cycling
     return x_new
 
 
 def ekf_step(x: np.ndarray, P: np.ndarray,
              z_obs: np.ndarray,
-             delta_efc: float, delta_days: float) -> tuple:
+             delta_efc: float, delta_days: float,
+             current_mean_discharge: float = np.nan,
+             is_loaded: bool = False) -> tuple:
     """
     One EKF predict + update step.
 
     Parameters
     ----------
-    x         : current state (3,)
-    P         : current covariance (3,3)
-    z_obs     : observation vector (4,) — NaN entries are skipped
-    delta_efc : EFC change since last session
-    delta_days: calendar days since last session
-
-    Returns
-    -------
-    x_new, P_new
+    x                    : current state (4,)
+    P                    : current covariance (4,4)
+    z_obs                : observation vector (5,) — NaN entries are skipped
+    delta_efc            : EFC change since last session
+    delta_days           : calendar days since last session
+    current_mean_discharge: mean discharge current this session (A)
+    is_loaded            : whether vehicle was loaded this session
     """
     # ── Predict ──
-    F     = _build_F(delta_efc, delta_days)
-    x_p   = _process(x, delta_efc, delta_days)
-    P_p   = F @ P @ F.T + Q
+    F   = _build_F()
+    x_p = _process(x, delta_efc, delta_days, current_mean_discharge, is_loaded)
+    P_p = F @ P @ F.T + Q
 
     # ── Update (skip NaN observations) ──
     valid = ~np.isnan(z_obs)
@@ -113,13 +144,13 @@ def ekf_step(x: np.ndarray, P: np.ndarray,
     R_v = R_ALL[np.ix_(valid, valid)]
     z_v = z_obs[valid]
 
-    S   = H_v @ P_p @ H_v.T + R_v
-    K   = P_p @ H_v.T @ np.linalg.inv(S)
-    inn = z_v - H_v @ x_p                  # innovation
+    S     = H_v @ P_p @ H_v.T + R_v
+    K     = P_p @ H_v.T @ np.linalg.inv(S)
+    inn   = z_v - H_v @ x_p              # innovation
 
     x_new = x_p + K @ inn
-    x_new[0] = np.clip(x_new[0], 0.0, 105.0)   # SoH must be in plausible range
-    P_new = (np.eye(3) - K @ H_v) @ P_p
+    x_new[0] = np.clip(x_new[0], 0.0, 105.0)  # SoH plausible range
+    P_new = (np.eye(4) - K @ H_v) @ P_p
 
     return x_new, P_new
 
@@ -128,24 +159,20 @@ def ekf_step(x: np.ndarray, P: np.ndarray,
 
 def _rul_from_ekf(soh: float, soh_std: float, avg_efc_per_day: float,
                   eol: float = EOL_SOH) -> dict:
-    """Compute point + uncertainty RUL from EKF state and its std."""
+    """Compute point + uncertainty RUL from EKF SoH and its posterior std."""
     if soh <= eol or not np.isfinite(avg_efc_per_day) or avg_efc_per_day <= 0:
         return {"ekf_rul_days": 0.0, "ekf_rul_days_lo": 0.0, "ekf_rul_days_hi": 0.0}
 
-    # Rate: combined calendar + cycle, approximated from EKF process parameters
-    daily_soh_rate = (ALPHA * avg_efc_per_day +
-                      BETA * CAL_AGING_RATE / 365.0)
+    daily_soh_rate = (ALPHA * avg_efc_per_day + BETA * CAL_AGING_RATE / 365.0)
     if daily_soh_rate <= 0:
         return {"ekf_rul_days": np.inf, "ekf_rul_days_lo": np.inf, "ekf_rul_days_hi": np.inf}
 
-    remaining = soh - eol
-    rul_point = remaining / daily_soh_rate
-
-    # Uncertainty bands: propagate SoH std through remaining / rate
+    remaining    = soh - eol
+    rul_point    = remaining / daily_soh_rate
     remaining_lo = max(0.0, remaining - 1.96 * soh_std)
     remaining_hi = remaining + 1.96 * soh_std
-    rul_lo = remaining_lo / daily_soh_rate
-    rul_hi = remaining_hi / daily_soh_rate
+    rul_lo       = remaining_lo / daily_soh_rate
+    rul_hi       = remaining_hi / daily_soh_rate
 
     def _cap(v):
         return round(min(v, 36500.0), 0) if np.isfinite(v) else None
@@ -161,16 +188,14 @@ def _rul_from_ekf(soh: float, soh_std: float, avg_efc_per_day: float,
 
 def run_ekf_fleet(cycles: pd.DataFrame) -> pd.DataFrame:
     """
-    Run EKF on charging sessions for every vehicle. Skips sessions where
-    soh_low_confidence=True or capacity_soh is NaN (prediction-only step).
-
-    Returns a DataFrame with one row per charging session plus EKF columns.
+    Run EKF on charging sessions for every vehicle.
+    Uses cycle_soh (not capacity_soh) as the primary SoH observation.
+    Also uses current_mean_discharge and is_loaded to adjust cycle aging.
     """
-    # Use charging sessions only — the reliable side for capacity_soh
+    # Charging sessions — cycle_soh is available here and is the reliable SoH proxy
     chg = cycles[cycles["session_type"] == "charging"].copy()
     chg = chg.sort_values(["registration_number", "start_time"]).reset_index(drop=True)
 
-    # Compute cum_efc and days_since_first if not already present
     if "cum_efc" not in chg.columns:
         chg["_efc_s"] = chg["soc_range"].abs() / 100.0
         chg["cum_efc"] = chg.groupby("registration_number")["_efc_s"].transform("cumsum")
@@ -182,12 +207,19 @@ def run_ekf_fleet(cycles: pd.DataFrame) -> pd.DataFrame:
             .transform(lambda x: (x - x.min()) / 86_400_000.0)
         )
 
+    # Fleet-wide temp_rise_rate baseline for demeaning the thermal observation
+    fleet_temp_mu = float(
+        chg["temp_rise_rate"].median()
+        if "temp_rise_rate" in chg.columns and chg["temp_rise_rate"].notna().any()
+        else 0.0
+    )
+    print(f"  Fleet temp_rise_rate baseline (median): {fleet_temp_mu:.4f} °C/hr")
+
     results = []
 
     for reg, veh in chg.groupby("registration_number"):
         veh = veh.sort_values("start_time").reset_index(drop=True)
 
-        # Per-vehicle avg EFC/day for RUL projection
         days_span = float(veh["days_since_first"].iloc[-1])
         efc_total = float(veh["cum_efc"].iloc[-1])
         avg_efc_per_day = (efc_total / days_span) if days_span > 1.0 else np.nan
@@ -196,43 +228,52 @@ def run_ekf_fleet(cycles: pd.DataFrame) -> pd.DataFrame:
         P = P0.copy()
 
         for _, row in veh.iterrows():
-            # Step increments
             delta_efc  = float(row.get("soc_range", 0.0) or 0.0) / 100.0
             delta_days = float(row.get("days_since_first", 0.0) or 0.0)
             if len(results) > 0 and results[-1]["registration_number"] == reg:
-                prev_days = float(results[-1].get("days_since_first_session", delta_days))
+                prev_days  = float(results[-1].get("days_since_first_session", delta_days))
                 delta_days = max(0.0, delta_days - prev_days)
             else:
                 delta_days = 0.0
 
-            # Build observation vector
-            low_conf = bool(row.get("soh_low_confidence", False))
+            # Session-level current and load
+            current_disc = float(row.get("current_mean_discharge", np.nan) or np.nan)
+            is_loaded    = bool(row.get("is_loaded", False))
+
+            # Build observation vector — temp_rise_rate demeaned by fleet baseline
             z = np.array([
-                float(row["capacity_soh"]) if (not low_conf and "capacity_soh" in row and
-                                               pd.notna(row["capacity_soh"])) else np.nan,
-                float(row["soh"]) if pd.notna(row.get("soh")) else np.nan,
+                float(row["cycle_soh"]) if pd.notna(row.get("cycle_soh"))    else np.nan,
+                float(row["soh"])        if pd.notna(row.get("soh"))          else np.nan,
                 float(row["ir_ohm_mean"]) if pd.notna(row.get("ir_ohm_mean")) else np.nan,
                 float(row["cell_spread_mean"]) if pd.notna(row.get("cell_spread_mean")) else np.nan,
+                (float(row["temp_rise_rate"]) - fleet_temp_mu)
+                    if pd.notna(row.get("temp_rise_rate")) else np.nan,
             ])
 
-            x, P = ekf_step(x, P, z, delta_efc, delta_days)
+            x, P = ekf_step(x, P, z, delta_efc, delta_days,
+                            current_mean_discharge=current_disc,
+                            is_loaded=is_loaded)
 
             ekf_soh     = float(x[0])
             ekf_soh_std = float(np.sqrt(max(0.0, P[0, 0])))
             rul_dict    = _rul_from_ekf(ekf_soh, ekf_soh_std, avg_efc_per_day)
 
             results.append({
-                "registration_number":    reg,
-                "session_id":             row.get("session_id"),
-                "start_time":             row.get("start_time"),
+                "registration_number":      reg,
+                "session_id":               row.get("session_id"),
+                "start_time":               row.get("start_time"),
                 "days_since_first_session": float(row.get("days_since_first", 0.0)),
-                "cum_efc":                float(row.get("cum_efc", 0.0)),
-                "capacity_soh_obs":       z[0],
-                "bms_soh_obs":            z[1],
-                "ekf_soh":                round(ekf_soh, 3),
-                "ekf_soh_std":            round(ekf_soh_std, 4),
-                "ekf_ir":                 round(float(x[1]), 6),
-                "ekf_spread":             round(float(x[2]), 6),
+                "cum_efc":                  float(row.get("cum_efc", 0.0)),
+                "cycle_soh_obs":            z[0],
+                "bms_soh_obs":              z[1],
+                "temp_rise_rate_obs":       z[4],       # demeaned value
+                "current_mean_discharge":   current_disc,
+                "is_loaded":                is_loaded,
+                "ekf_soh":                  round(ekf_soh, 3),
+                "ekf_soh_std":              round(ekf_soh_std, 4),
+                "ekf_ir":                   round(float(x[1]), 6),
+                "ekf_spread":               round(float(x[2]), 6),
+                "ekf_temp_drift":           round(float(x[3]), 4),
                 **rul_dict,
             })
 
@@ -245,6 +286,13 @@ if __name__ == "__main__":
     cycles = pd.read_csv(CYCLES_CSV)
     print(f"  {len(cycles):,} sessions, {cycles['registration_number'].nunique()} vehicles")
 
+    # ── Young-fleet notice ────────────────────────────────────────────────────
+    max_days = cycles.get("days_since_first", pd.Series([0])).max() if "days_since_first" in cycles.columns else 0
+    if max_days < 180:
+        print(f"\n  NOTE: Young fleet detected (max data span ≈ {max_days:.0f} days).")
+        print("  EKF SoH estimates are dominated by the prior for <6 months of data.")
+        print("  Expect EKF SoH near 100% and wide uncertainty bands — this is correct behaviour.")
+
     print("Running EKF fleet-wide ...")
     ekf_df = run_ekf_fleet(cycles)
     print(f"  EKF output: {len(ekf_df):,} charging sessions")
@@ -252,45 +300,58 @@ if __name__ == "__main__":
     ekf_df.to_csv(EKF_CSV, index=False)
     print(f"Saved: {EKF_CSV}")
 
-    # ── Verification summary ───────────────────────────────────────────────────
-    print("\n" + "=" * 70)
-    print("EKF SOH TRACKING SUMMARY  (per vehicle)")
-    print("=" * 70)
+    # ── Summary ───────────────────────────────────────────────────────────────
+    print("\n" + "=" * 75)
+    print("EKF SOH TRACKING SUMMARY  (per vehicle, sorted by ekf_soh)")
+    print("=" * 75)
     summary = (
         ekf_df.groupby("registration_number")
         .agg(
-            n_sessions      = ("ekf_soh",     "count"),
-            ekf_soh_final   = ("ekf_soh",     "last"),
-            ekf_soh_std_mean= ("ekf_soh_std", "mean"),
-            ekf_rul_days    = ("ekf_rul_days", "last"),
-            cum_efc_final   = ("cum_efc",      "last"),
+            n_sessions       = ("ekf_soh",         "count"),
+            ekf_soh_final    = ("ekf_soh",          "last"),
+            ekf_soh_std_mean = ("ekf_soh_std",      "mean"),
+            ekf_ir_final     = ("ekf_ir",           "last"),
+            ekf_temp_drift   = ("ekf_temp_drift",   "last"),
+            ekf_rul_days     = ("ekf_rul_days",     "last"),
+            cum_efc_final    = ("cum_efc",          "last"),
         )
-        .round(3)
+        .round(4)
         .sort_values("ekf_soh_final")
     )
     print(summary.to_string())
 
-    print(f"\nFleet EKF SoH: "
-          f"mean={ekf_df.groupby('registration_number')['ekf_soh'].last().mean():.2f}%  "
-          f"std={ekf_df.groupby('registration_number')['ekf_soh'].last().std():.2f}%")
-    print(f"Fleet EKF RUL: "
-          f"median={ekf_df.groupby('registration_number')['ekf_rul_days'].last().median():.0f} days")
+    fleet_last = ekf_df.groupby("registration_number")
+    print(f"\nFleet EKF SoH  : "
+          f"mean={fleet_last['ekf_soh'].last().mean():.2f}%  "
+          f"std={fleet_last['ekf_soh'].last().std():.2f}%")
+    print(f"Fleet EKF RUL  : "
+          f"median={fleet_last['ekf_rul_days'].last().median():.0f} days")
+    print(f"Fleet EKF temp_drift: "
+          f"mean={fleet_last['ekf_temp_drift'].last().mean():.4f} °C/hr "
+          "(0 = nominal; positive = heating faster than fleet baseline)")
 
-    # Verification checks
+    # ── Verification ─────────────────────────────────────────────────────────
     print("\n── Verification checks ──")
     ekf_last = ekf_df.groupby("registration_number").last().reset_index()
 
-    # Check: ekf_soh vs capacity_soh_obs should be within ±2%
-    valid_obs = ekf_last.dropna(subset=["capacity_soh_obs"])
-    if len(valid_obs):
-        diff = (valid_obs["ekf_soh"] - valid_obs["capacity_soh_obs"]).abs()
+    valid_csoh = ekf_last.dropna(subset=["cycle_soh_obs"])
+    if len(valid_csoh):
+        diff = (valid_csoh["ekf_soh"] - valid_csoh["cycle_soh_obs"]).abs()
         pct_within_2 = (diff <= 2.0).mean() * 100
-        print(f"  ekf_soh within ±2% of capacity_soh: {pct_within_2:.0f}% of vehicles ✓" if pct_within_2 >= 80
-              else f"  ⚠ ekf_soh vs capacity_soh: only {pct_within_2:.0f}% within ±2%")
+        msg = f"  ekf_soh within ±2% of cycle_soh: {pct_within_2:.0f}% of vehicles"
+        print(msg + " ✓" if pct_within_2 >= 80 else msg + " ⚠")
 
-    # Check: ekf_soh_std shrinks with more data
     if len(ekf_df) > 100:
-        early  = ekf_df[ekf_df["cum_efc"] < ekf_df["cum_efc"].quantile(0.25)]["ekf_soh_std"].mean()
-        late   = ekf_df[ekf_df["cum_efc"] > ekf_df["cum_efc"].quantile(0.75)]["ekf_soh_std"].mean()
-        print(f"  ekf_soh_std early vs late sessions: {early:.4f} → {late:.4f} "
-              f"({'shrinking ✓' if late < early else '⚠ not shrinking'})")
+        early = ekf_df[ekf_df["cum_efc"] < ekf_df["cum_efc"].quantile(0.25)]["ekf_soh_std"].mean()
+        late  = ekf_df[ekf_df["cum_efc"] > ekf_df["cum_efc"].quantile(0.75)]["ekf_soh_std"].mean()
+        print(f"  ekf_soh_std early vs late: {early:.4f} → {late:.4f} "
+              f"({'shrinking ✓' if late < early else '⚠ not shrinking — may need more data'})")
+
+    # Young fleet: check RUL isn't misleadingly low
+    median_rul = ekf_df.groupby("registration_number")["ekf_rul_days"].last().median()
+    if median_rul is not None and np.isfinite(float(median_rul or np.inf)):
+        if float(median_rul) < 365:
+            print(f"  ⚠ Median EKF RUL = {median_rul:.0f} days. "
+                  "For a young fleet this likely reflects prior uncertainty rather than real degradation.")
+        else:
+            print(f"  Median EKF RUL = {median_rul:.0f} days ✓ (consistent with young fleet)")
