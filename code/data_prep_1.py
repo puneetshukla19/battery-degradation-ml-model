@@ -389,9 +389,18 @@ def join_alerts_onto_cycles(cycles: pd.DataFrame, alerts: pd.DataFrame) -> pd.Da
 
     alert_cols = [c for c in alerts.columns if c not in {"registration_number", "gps_time"}]
 
-    for c in alert_cols:
-        cycles[c] = 0.0
-    cycles["total_alerts"] = 0.0
+    # Pre-allocate all alert columns as a single contiguous block (avoids per-column
+    # fragmentation that triggers PerformanceWarning on wide DataFrames).
+    _all_alert_cols = alert_cols + ["total_alerts"]
+    _alert_block = pd.DataFrame(
+        0,
+        index=cycles.index,
+        columns=_all_alert_cols,
+        dtype=np.float64,
+    )
+    cycles = pd.concat([cycles, _alert_block], axis=1)
+    del _alert_block
+    gc.collect()
 
     for reg, alert_v in alerts.groupby("registration_number", sort=False):
         sess_mask = cycles["registration_number"] == reg
@@ -1602,6 +1611,9 @@ def add_engineered_features(cycles: pd.DataFrame) -> pd.DataFrame:
     """
     from config import EFC_MAX, BATTERY_CAPACITY_KWH
 
+    # Consolidate fragmented column blocks accumulated by earlier pipeline steps
+    # before adding ~19 more columns (avoids PerformanceWarning).
+    cycles = cycles.copy()
     cycles = cycles.sort_values(["registration_number", "start_time"])
 
     # ── 1. EFC and calendar aging ──────────────────────────────────────────
