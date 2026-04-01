@@ -281,3 +281,239 @@ has_new_cols = (
 Previously `cycle_soh` was always computed from `block_capacity_ah / block_soc_diff`, which suffers from the same idle-parking under-count as Source A (BMS current). Now that `capacity_soh_disc_new` / `capacity_soh_chg_new` (derived from the hves1_current sensor) are present in `cycles.csv`, using them directly as the anchor for `cycle_soh` avoids re-normalising already-normalised SOH values and leverages the higher-fidelity current source.
 
 Step 2 (linear interpolation + extrapolation between anchor points, and forward/backward fill) is **unchanged** in both paths.
+
+---
+
+## Changes Made (2026-04-01) — cont.
+
+### 5. `code/data_prep_1.py` — Add `current_mean_new` (hves1_current session mean) to cycles.csv
+
+Added `current_mean_new` to the `extract_cycles` aggregation spec alongside the existing `voltage_mean_new`:
+
+```python
+if "hves1_current" in df.columns:
+    agg_spec["current_mean_new"] = (
+        "hves1_current",
+        lambda x: x[x > 0].mean() if (x > 0).sum() > (x < 0).sum() else x[x < 0].mean(),
+    )
+```
+
+Same sign-direction logic as `current_mean` (BMS): uses mean of positive values for discharge sessions, mean of negative values for charging sessions. Added to `_col_order` immediately after `voltage_mean_new` in the *Electrical — hves1 source* block.
+
+---
+
+## Engineered Columns Reference
+
+All columns in `cycles.csv` that are not directly aggregated from raw BMS/GPS/VCU rows. Formulas are shown in Python notation; constants from `config.py` are used where referenced.
+
+---
+
+### Row-level derived columns (computed before session aggregation, in `add_derived_columns`)
+
+| Column | Formula | Notes |
+|---|---|---|
+| `cell_spread` | `max_cell_voltage − min_cell_voltage` | Per-BMS-record cell imbalance (V) |
+| `cell_undervoltage` | `min_cell_voltage < 3.0` | Bool flag: lowest cell below 3.0 V |
+| `cell_overvoltage` | `max_cell_voltage > 3.5` | Bool flag: highest cell above 3.5 V |
+| `cell_spread_warn` | `cell_spread > 0.02` | Bool flag: spread > 20 mV |
+| `temp_highest` | `= temperature_highest` | Alias for highest probe temperature |
+
+---
+
+### Session-level columns (aggregated in `extract_cycles`)
+
+#### Capacity accumulators
+
+Coulomb counting uses `_dt_hr = diff(gps_time) / 3,600,000`, clipped to `MAX_DT_MIN / 60` hours. Regen uses a tighter cap (`REGEN_DT_MAX_SEC = 5 s`).
+
+| Column | Formula | Notes |
+|---|---|---|
+| `capacity_ah_discharge` | `Σ (current × dt_hr)` where `current > 0` | BMS discharge Ah per session |
+| `capacity_ah_charge` | `Σ |hves1_current × dt_hr_regen|` where moving & `current < CHARGE_A` | Regen Ah (5 s dt cap) |
+| `capacity_ah_plugin` | `Σ |current × dt_hr|` where `detailed_type == 'charging'` | Stationary charging Ah |
+| `capacity_ah` | `capacity_ah_discharge − capacity_ah_charge − capacity_ah_plugin` | Net signed Ah (legacy; used by `add_capacity_soh`) |
+| `capacity_ah_charge_total` | `capacity_ah_charge + capacity_ah_plugin` | All charging Ah (regen + plugin) |
+| `capacity_ah_discharge_new` | Same as `capacity_ah_discharge` but using `hves1_current` | hves1 discharge Ah |
+| `capacity_ah_charge_new` | Same as `capacity_ah_charge` but using `hves1_current` | hves1 regen Ah |
+| `capacity_ah_plugin_new` | Same as `capacity_ah_plugin` but using `hves1_current` | hves1 plugin Ah |
+| `capacity_ah_charge_total_new` | `capacity_ah_charge_new + capacity_ah_plugin_new` | hves1 total charging Ah |
+
+#### Electrical
+
+| Column | Formula | Notes |
+|---|---|---|
+| `voltage_mean` | Mean of `voltage` (BMS) per session | Pack voltage (V) |
+| `voltage_min` | Min of `voltage` (BMS) per session | Lowest pack voltage in session |
+| `current_mean` | Mean of `current > 0` rows if discharge session, else mean of `current < 0` rows | BMS direction-aware current mean (A) |
+| `current_max` | Max of `current` per session | Peak discharge current (A) |
+| `current_mean_discharge` | Mean of `current` where `current > 0` | BMS discharge rows only |
+| `current_mean_charge` | Mean of `current` where moving & `current < CHARGE_A` | BMS regen rows only |
+| `voltage_mean_new` | Mean of `hves1_voltage_level` per session | hves1 pack voltage mean (V) |
+| `current_mean_new` | Same sign-direction logic as `current_mean`, applied to `hves1_current` | hves1 direction-aware current mean (A) |
+
+#### Timing
+
+| Column | Formula | Notes |
+|---|---|---|
+| `duration_hr` | `(end_time − start_time) / 3,600,000` | Session duration in hours |
+| `time_delta_hr` | `(start_time − prev_end_time) / 3,600,000` | Gap from end of previous session to start of this one |
+| `cycle_number` | `cumcount() + 1` per vehicle | Session ordinal per vehicle (all session types) |
+
+#### SoC
+
+| Column | Formula | Notes |
+|---|---|---|
+| `soc_diff` | `soc_end − soc_start` | Signed SoC change (negative = discharge) |
+| `soc_range` | `|soc_start − soc_end|` for discharge; `|soc_end − soc_start|` for charging | Absolute SoC swing; used for quality gates and EPK |
+
+#### Energy
+
+| Column | Formula | Notes |
+|---|---|---|
+| `energy_kwh` | `capacity_ah × voltage_mean / 1000` | Absolute energy exchange in the session (kWh). Derived from BMS Coulomb counting × mean pack voltage. Positive for discharge, negative for charging (because `capacity_ah` is signed). **Not a rate; does not account for distance.** |
+| `energy_per_km` | `(|block_soc_diff| / 100 × BATTERY_CAPACITY_KWH) / block_odometer_km` | Energy efficiency (kWh/km). Derived from **block-level** SoC depletion and odometer — one value per discharge block. Units: kWh consumed per km driven. Discharge sessions only; NaN where `block_odometer_km ≤ 0.5`. Capped at `EPK_MAX_KWH_KM`. |
+| `charging_rate_kw` | `energy_kwh / duration_hr` | Average charging power (kW). Charging sessions only; NaN for discharge/idle. Positive because `energy_kwh` is negative for charging sessions and the sign is intentionally not flipped — values will be negative in the raw column for charging. *(Used as absolute magnitude in fleet flag computations.)* |
+
+> **energy_kwh vs energy_per_km:** `energy_kwh` is the total energy drawn from the pack in one session, calculated from the current sensor (∫ V·I dt). `energy_per_km` is the energy efficiency over a full drive-to-charge block, calculated from the SoC drop and odometer without any current sensor — it is closer to a "how many kWh does this truck spend per km" number. They measure different things: `energy_kwh` is an absolute quantity per session; `energy_per_km` is a normalised efficiency metric per block.
+
+#### Temperature
+
+| Column | Formula | Notes |
+|---|---|---|
+| `temp_rise_rate` | `(temp_max − temp_start) / duration_hr` | °C per hour of temperature rise within session |
+
+#### Odometer
+
+| Column | Formula | Notes |
+|---|---|---|
+| `odometer_km` | `(odometer_end − odometer_start).clip(0)` | Session distance from VCU odometer (km) |
+
+#### Voltage sag & IR (from `compute_voltage_sag` / `compute_ir_metrics`)
+
+| Column | Formula | Notes |
+|---|---|---|
+| `n_vsag` | Count of rows where voltage drops below fleet p25 discharge voltage (`vsag_mild`) during discharge | Number of sag events per session |
+| `d_vsag_per_cycle` | `diff(n_vsag)` across discharge sessions per vehicle | Session-to-session change in sag count |
+| `ir_ohm_mean` | Mean of `|ΔV / ΔI|` where `|ΔI| ≥ 2 A` per session | Estimated internal resistance (Ω) |
+| `n_high_ir` | Count of rows where `ir_ohm > IR_THRESHOLD_MOHM / 1000` per session | High-IR event count |
+| `d_n_high_ir` | `diff(n_high_ir)` across discharge sessions per vehicle | Session-to-session change |
+| `d_ir_ohm_per_cycle` | `diff(ir_ohm_mean)` across discharge sessions per vehicle | Session-to-session IR trend |
+
+#### Cell health
+
+| Column | Formula | Notes |
+|---|---|---|
+| `n_cell_undervoltage` | Count of rows where `min_cell_voltage < 3.0 V` | Per session |
+| `n_cell_overvoltage` | Count of rows where `max_cell_voltage > 3.5 V` | Per session |
+| `n_cell_spread_warn` | Count of rows where `cell_spread > 0.02 V` | Per session |
+| `cell_spread_mean` | Mean of `cell_spread` per session | Average imbalance (V) |
+| `cell_spread_max` | Max of `cell_spread` per session | Worst-case imbalance (V) |
+
+#### Subsystem location
+
+| Column | Formula | Notes |
+|---|---|---|
+| `weak_subsystem_id` | Mode of `min_cell_voltage_subsystem_number` per session | Which subsystem has the weakest cell most often |
+| `weak_cell_id` | Mode of `min_cell_voltage_number` per session | Which cell slot is weakest most often |
+| `weak_subsystem_consistency` | `mean(min_cell_voltage_subsystem_number == fleet_modal_subsystem)` | Fraction of rows in session where the fleet-modal weak subsystem is also the weakest. High value → persistent single-subsystem degradation. Fleet-modal subsystem computed once across all discharge rows. |
+| `hot_subsystem_id` | Mode of `temperature_highest_subsystem_number` per session | Which subsystem runs hottest most often |
+| `hot_probe_id` | Mode of `temperature_highest_probe_number` per session | Which temperature probe registers highest most often |
+| `hot_subsystem_consistency` | `mean(temperature_highest_subsystem_number == fleet_modal_hot_subsystem)` | Fraction of rows in session where the fleet-modal hot subsystem is also the hottest. High value → that subsystem persistently runs hotter than others. Fleet-modal subsystem computed once across all rows with `temperature_highest_subsystem_number`. |
+| `subsystem_voltage_std` | `std(subsystem_voltage)` per session | Pack voltage imbalance across subsystems |
+
+---
+
+### Block-level columns (from `compute_block_linkage`)
+
+A *block* is all sessions of the same type (discharge or charging) between two type-switching events.
+
+| Column | Formula | Notes |
+|---|---|---|
+| `block_id` | Per-vehicle integer, increments at each discharge↔charging boundary | |
+| `block_type` | `'discharge'` or `'charging'` | |
+| `block_soc_diff` | `block_soc_end − block_soc_start` | Negative for discharge blocks |
+| `block_capacity_ah` | `Σ capacity_ah_discharge` (discharge blocks) or `Σ capacity_ah_charge_total` (charge blocks) | BMS-source Ah for the full block |
+| `block_n_sessions` | Count of active sessions (discharge or charging) in block | |
+| `block_odometer_km` | `Σ odometer_km` across discharge sessions in block | Total distance per discharge block |
+
+---
+
+### Fleet-flag columns (from `add_fleet_flags`)
+
+All flags are **fleet-relative** (thresholds computed from fleet distribution, not fixed).
+
+| Column | Formula | Notes |
+|---|---|---|
+| `bms_coverage` | `(n_rows × 10 s / 3600) / duration_hr`, clipped [0, 1] | Fraction of session time with BMS samples (assumes ~10 s BMS interval) |
+| `ecu_fault_suspected` | `bms_coverage < 0.20` | True if fewer than 20% of expected BMS rows arrived |
+| `rapid_heating` | `temp_rise_rate > p75(non-zero temp_rise_rate)` fleet-wide | True for unusual heat-rise sessions |
+| `high_energy_per_km` | `energy_per_km > p75(discharge EPK)` fleet-wide | True for high-consumption discharge sessions |
+| `slow_charging` | `charging_rate_kw < p25(charging sessions)` fleet-wide | Below-average charging power |
+| `fast_charging` | `charging_rate_kw > p75(charging sessions)` fleet-wide | Above-average charging power |
+| `cell_health_poor` | `(n_cell_undervoltage + n_cell_overvoltage > 0)` OR `(n_cell_spread_warn / n_rows > 0.10)` | Any cell voltage exceedance or persistent imbalance |
+
+---
+
+### SOH columns (from `add_capacity_soh` + `add_cycle_soh`)
+
+| Column | Formula | Notes |
+|---|---|---|
+| `ref_capacity_ah` | `436` (fixed) | Nominal pack capacity (Ah); hard-fixed to avoid idle-parking under-count |
+| `capacity_soh` | `clip(norm_cap / 436 × 100, 0, 100)` | BMS-source SOH %; discharge uses block Coulombs, charging uses session Coulombs |
+| `capacity_soh_source` | `'discharge'` or `'charge'` | Which side produced the estimate |
+| `capacity_soh_disc_new` | `clip((capacity_ah_discharge_new / (|soc_diff| / 100)) / 436 × 100, 0, 100)` | hves1-source discharge SOH; NaN where `|soc_diff| < 15%` |
+| `capacity_soh_chg_new` | `clip((capacity_ah_charge_total_new × 0.97 / (|soc_range| / 100)) / 436 × 100, 0, 100)` | hves1-source charging SOH; 0.97 = coulombic efficiency correction; NaN where `|soc_range| < 10%` |
+| `cycle_soh` | `clip(mean(disc_block_soh, chg_block_soh), 0, 100)`, then linearly interpolated per vehicle | Paired-block SOH; uses `capacity_soh_disc_new`/`capacity_soh_chg_new` when available, falls back to `block_capacity_ah / block_soc_diff / 436 × 100` |
+
+---
+
+### Engineered ML features (from `add_engineered_features`)
+
+#### EFC and calendar aging
+
+| Column | Formula | Notes |
+|---|---|---|
+| `cum_efc` | `cumsum(|soc_range| / 100)` per vehicle | Cumulative equivalent full cycles |
+| `days_since_first` | `(start_time − min(start_time)) / 86,400,000` per vehicle | Days since vehicle's first record |
+| `aging_index` | `clip(0.7 × cum_efc / EFC_MAX + 0.3 × days_since_first / 3650, 0, 1)` | Composite aging proxy: 70% cycle-based + 30% calendar |
+
+#### Normalised rate features
+
+| Column | Formula | Notes |
+|---|---|---|
+| `vsag_rate_per_hr` | `n_vsag / duration_hr.clip(0.1)` | Sag events per hour (removes session-length confound) |
+| `ir_event_rate` | `n_high_ir / n_rows.clip(1)` | Fraction of rows with high IR per session |
+
+#### Rolling OLS trend slopes (20-session window, min 5 valid)
+
+| Column | Source signal | Notes |
+|---|---|---|
+| `vsag_trend_slope` | `vsag_rate_per_hr` | Positive = worsening sag rate |
+| `ir_event_trend_slope` | `ir_event_rate` | Positive = more frequent high-IR events |
+| `ir_ohm_trend_slope` | `ir_ohm_mean` | Positive = rising resistance |
+| `spread_trend_slope` | `cell_spread_mean` | Positive = growing cell imbalance |
+| `soh_trend_slope` | `capacity_soh` | Negative = SOH declining |
+
+#### EWM-smoothed signals (span=10, min 3)
+
+| Column | Source signal |
+|---|---|
+| `ir_ohm_mean_ewm10` | `ir_ohm_mean` |
+| `cell_spread_mean_ewm10` | `cell_spread_mean` |
+| `temp_rise_rate_ewm10` | `temp_rise_rate` |
+| `vsag_rate_per_hr_ewm10` | `vsag_rate_per_hr` |
+
+#### Operating stress
+
+| Column | Formula | Notes |
+|---|---|---|
+| `c_rate_chg` | `charging_rate_kw / BATTERY_CAPACITY_KWH` (= `/ 282`) | Charging C-rate (fraction of pack capacity per hour) |
+| `dod_stress` | `(|soc_range| / 100)^1.5` | Non-linear DoD severity proxy (NMC aging accelerates at high DoD) |
+| `thermal_stress` | `(temp_max − 45).clip(0)` | Degrees above 45 °C; zero for cool sessions |
+| `energy_per_loaded_session` | `energy_kwh / (is_loaded + 1)` | Normalised energy: divides by 2 when loaded, by 1 when unloaded — scales energy attribution per cargo state |
+
+#### Load direction encoding
+
+| Column | Formula | Notes |
+|---|---|---|
+| `load_direction_enc` | `{outbound: 0, inbound: 1, at_loading/at_unloading/unknown: NaN}` | Numeric encoding of geofence-derived trip direction |
