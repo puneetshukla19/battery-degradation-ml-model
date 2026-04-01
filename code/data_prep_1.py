@@ -1933,9 +1933,19 @@ def add_cycle_soh(cycles: pd.DataFrame) -> pd.DataFrame:
     """
     Compute cycle_soh by pairing adjacent discharge + charging blocks per vehicle.
 
-    Step 1 — Anchor: For each quality disc+chg block pair (SoC swing gates met),
-      cycle_soh = mean(norm_disc, norm_chg) / NOMINAL_CAPACITY_AH * 100  (clipped 0–100)
-      where norm_X = block_capacity_ah / (|block_soc_diff| / 100).
+    Step 1 — Anchor: For each quality disc+chg block pair, compute:
+      cycle_soh = mean(disc_soh, chg_soh)  (clipped 0–100)
+
+      Primary path (when hves1_current-derived columns are available):
+        disc_soh = mean of capacity_soh_disc_new across sessions in the discharge block
+        chg_soh  = mean of capacity_soh_chg_new  across sessions in the charging block
+        Quality gates are already embedded in these columns (NaN when gates fail).
+
+      Fallback (when new columns are absent):
+        disc_soh = block_capacity_ah / (|block_soc_diff| / 100) / NOMINAL_CAPACITY_AH * 100
+        chg_soh  = same formula for the charging block
+        SoC-swing quality gates (MIN_SOC_RANGE_DISC_PCT / MIN_SOC_RANGE_PCT) applied here.
+
       Broadcast the anchor value to all sessions in both paired blocks.
 
     Step 2 — Fill: Per vehicle, interpolate linearly by elapsed time between anchors,
@@ -1945,42 +1955,83 @@ def add_cycle_soh(cycles: pd.DataFrame) -> pd.DataFrame:
     cycles = cycles.sort_values(["registration_number", "start_time"]).reset_index(drop=True)
     cycles["cycle_soh"] = np.nan
 
+    has_new_cols = (
+        "capacity_soh_disc_new" in cycles.columns and
+        "capacity_soh_chg_new"  in cycles.columns
+    )
+
     for reg, idx in cycles.groupby("registration_number", sort=False).groups.items():
         grp = cycles.loc[idx]
 
         # ── Step 1: anchor points from quality block pairs ─────────────────────
-        blocks = (
-            grp.dropna(subset=["block_id"])
-               .sort_values("start_time")
-               .drop_duplicates("block_id", keep="first")
-               [["block_id", "block_type", "block_capacity_ah", "block_soc_diff"]]
-               .reset_index(drop=True)
-        )
+        if has_new_cols:
+            # Aggregate session-level hves1_current SOH per block
+            block_soh = (
+                grp.dropna(subset=["block_id"])
+                   .groupby("block_id", sort=False)
+                   .agg(
+                       block_type     = ("block_type",            "first"),
+                       block_soh_disc = ("capacity_soh_disc_new", "mean"),
+                       block_soh_chg  = ("capacity_soh_chg_new",  "mean"),
+                       start_time     = ("start_time",            "min"),
+                   )
+                   .reset_index()
+                   .sort_values("start_time")
+                   .reset_index(drop=True)
+            )
 
-        for i in range(len(blocks) - 1):
-            a, b = blocks.iloc[i], blocks.iloc[i + 1]
-            if set([a["block_type"], b["block_type"]]) != {"discharge", "charging"}:
-                continue
+            for i in range(len(block_soh) - 1):
+                a, b = block_soh.iloc[i], block_soh.iloc[i + 1]
+                if set([a["block_type"], b["block_type"]]) != {"discharge", "charging"}:
+                    continue
 
-            disc = a if a["block_type"] == "discharge" else b
-            chg  = b if b["block_type"] == "charging"  else a
+                disc = a if a["block_type"] == "discharge" else b
+                chg  = b if b["block_type"] == "charging"  else a
 
-            dod  = abs(disc["block_soc_diff"])
-            csoc = abs(chg["block_soc_diff"])
-            if dod < MIN_SOC_RANGE_DISC_PCT or csoc < MIN_SOC_RANGE_PCT:
-                continue
-            if disc["block_capacity_ah"] <= 0 or chg["block_capacity_ah"] <= 0:
-                continue
+                disc_soh = disc["block_soh_disc"]
+                chg_soh  = chg["block_soh_chg"]
+                if pd.isna(disc_soh) or pd.isna(chg_soh):
+                    continue
 
-            norm_disc = disc["block_capacity_ah"] / (dod  / 100.0)
-            norm_chg  = chg["block_capacity_ah"]  / (csoc / 100.0)
-            soh_val   = float(np.clip(
-                np.mean([norm_disc, norm_chg]) / NOMINAL_CAPACITY_AH * 100,
-                0, 100
-            ))
+                soh_val = float(np.clip(np.mean([disc_soh, chg_soh]), 0, 100))
 
-            pair_mask = grp["block_id"].isin([disc["block_id"], chg["block_id"]])
-            cycles.loc[idx[pair_mask.values], "cycle_soh"] = soh_val
+                pair_mask = grp["block_id"].isin([disc["block_id"], chg["block_id"]])
+                cycles.loc[idx[pair_mask.values], "cycle_soh"] = soh_val
+
+        else:
+            # Fallback: original block_capacity_ah / block_soc_diff approach
+            blocks = (
+                grp.dropna(subset=["block_id"])
+                   .sort_values("start_time")
+                   .drop_duplicates("block_id", keep="first")
+                   [["block_id", "block_type", "block_capacity_ah", "block_soc_diff"]]
+                   .reset_index(drop=True)
+            )
+
+            for i in range(len(blocks) - 1):
+                a, b = blocks.iloc[i], blocks.iloc[i + 1]
+                if set([a["block_type"], b["block_type"]]) != {"discharge", "charging"}:
+                    continue
+
+                disc = a if a["block_type"] == "discharge" else b
+                chg  = b if b["block_type"] == "charging"  else a
+
+                dod  = abs(disc["block_soc_diff"])
+                csoc = abs(chg["block_soc_diff"])
+                if dod < MIN_SOC_RANGE_DISC_PCT or csoc < MIN_SOC_RANGE_PCT:
+                    continue
+                if disc["block_capacity_ah"] <= 0 or chg["block_capacity_ah"] <= 0:
+                    continue
+
+                norm_disc = disc["block_capacity_ah"] / (dod  / 100.0)
+                norm_chg  = chg["block_capacity_ah"]  / (csoc / 100.0)
+                soh_val   = float(np.clip(
+                    np.mean([norm_disc, norm_chg]) / NOMINAL_CAPACITY_AH * 100,
+                    0, 100
+                ))
+
+                pair_mask = grp["block_id"].isin([disc["block_id"], chg["block_id"]])
+                cycles.loc[idx[pair_mask.values], "cycle_soh"] = soh_val
 
         # ── Step 2: interpolate + extrapolate ──────────────────────────────────
         s = cycles.loc[idx, "cycle_soh"].copy()

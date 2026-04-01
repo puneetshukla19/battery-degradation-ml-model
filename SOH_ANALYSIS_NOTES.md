@@ -248,3 +248,36 @@ Columns added to `cycles.csv` output: `total_alerts` plus ~35 individual alert c
 - Added `import gc` and `gc.collect()` after large DataFrame operations throughout the pipeline: after `load_gps`, `load_vcu`, `load_bms`, `load_current_table`, `del df_v`, and after all concat/del operations in the main block.
 - Removed in-function `.copy()` calls from `add_derived_columns`, `label_sessions`, `_merge_discharge_gaps`, `compute_voltage_sag`, `compute_ir_metrics`, `extract_cycles`, `compute_block_linkage`, `add_fleet_flags`, `add_engineered_features`, `add_capacity_soh` — these functions now mutate the passed DataFrame in place, reducing peak RAM.
 - Added explicit `del` for `bms_by_veh`, `gps_by_veh`, `vcu_by_veh`, `curr_by_veh` after the vehicle loop and for intermediate concat results (`all_cycles`, `all_disc_rows`, `anomaly_frames`, `sequences`).
+
+---
+
+## Changes Made (2026-04-01)
+
+### 4. `code/data_prep_1.py` — `add_cycle_soh`: hves1_current primary path + fallback
+
+#### What changed
+
+The `add_cycle_soh` function now has **two code paths** selected by a single flag:
+
+```python
+has_new_cols = (
+    "capacity_soh_disc_new" in cycles.columns and
+    "capacity_soh_chg_new"  in cycles.columns
+)
+```
+
+**Primary path** (when hves1_current columns are present):
+- Aggregates session-level `capacity_soh_disc_new` / `capacity_soh_chg_new` per block using `groupby.agg(mean)`.
+- Quality gates are already embedded: sessions where hves1 quality gates failed are `NaN` in those columns, so the block mean is `NaN` → the block pair is skipped (`pd.isna` check).
+- `cycle_soh = clip(mean(disc_soh, chg_soh), 0, 100)` — no division by `NOMINAL_CAPACITY_AH` required; SOH is already in %.
+
+**Fallback path** (when new columns are absent — original logic):
+- Uses `block_capacity_ah` and `block_soc_diff` aggregated at block level (one row per block via `drop_duplicates`).
+- Applies explicit SoC-swing quality gates: `dod >= MIN_SOC_RANGE_DISC_PCT`, `csoc >= MIN_SOC_RANGE_PCT`, and `block_capacity_ah > 0`.
+- `cycle_soh = clip(mean(norm_disc, norm_chg) / NOMINAL_CAPACITY_AH × 100, 0, 100)`.
+
+#### Why
+
+Previously `cycle_soh` was always computed from `block_capacity_ah / block_soc_diff`, which suffers from the same idle-parking under-count as Source A (BMS current). Now that `capacity_soh_disc_new` / `capacity_soh_chg_new` (derived from the hves1_current sensor) are present in `cycles.csv`, using them directly as the anchor for `cycle_soh` avoids re-normalising already-normalised SOH values and leverages the higher-fidelity current source.
+
+Step 2 (linear interpolation + extrapolation between anchor points, and forward/backward fill) is **unchanged** in both paths.
