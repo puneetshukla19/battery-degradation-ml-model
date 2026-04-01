@@ -35,29 +35,76 @@ CLUSTER_FILE   = os.path.join(ARTIFACTS_DIR, "regime_clusters.csv")
 
 # ── Isolation Forest features ──────────────────────────────────────────────────
 # All used gracefully: only columns that exist in df are selected.
+# Human-readable labels for reason-code generation (feature → direction label)
+# "high" = flagged because value is HIGH; "low" = flagged because value is LOW.
+IF_FEATURE_DIRECTION = {
+    "voltage_min":              "low",
+    "voltage_mean":             "low",
+    "cycle_soh":                "low",
+    "capacity_soh_disc_new":    "low",
+    "soh":                      "low",
+    "ir_ohm_mean":              "high",
+    "ir_event_rate":            "high",
+    "cell_spread_mean":         "high",
+    "cell_spread_max":          "high",
+    "temp_max":                 "high",
+    "temp_mean":                "high",
+    "temp_rise_rate":           "high",
+    "temp_lowest_mean":         "low",
+    "n_vsag":                   "high",
+    "n_high_ir":                "high",
+    "n_low_soc":                "high",
+    "d_vsag_per_cycle":         "high",
+    "d_n_high_ir":              "high",
+    "d_ir_ohm_per_cycle":       "high",
+    "energy_per_km":            "high",
+    "energy_per_loaded_session":"high",
+    "current_mean_discharge":   "high",
+    "current_max":              "high",
+    "capacity_ah_discharge":    "low",
+    "insulation_mean":          "low",
+    "odometer_km":              "any",
+    "speed_mean":               "any",
+    "time_delta_hr":            "high",
+    "soc_diff":                 "low",   # more negative = deeper discharge
+    "soc_range":                "low",
+}
+
 IF_FEATURES = [
     # Core discharge profile
     "voltage_mean", "voltage_min",
     "cell_spread_mean", "cell_spread_max",
-    "temp_max", "temp_rise_rate",
-    "capacity_ah", "duration_hr",
+    "temp_max", "temp_mean", "temp_rise_rate", "temp_lowest_mean",
+    "capacity_ah", "capacity_ah_discharge", "duration_hr",
     # SoC / SoH
     "soc_range", "soc_diff",        # soc_diff negative for discharge; deep discharge = more negative
     "soh",                          # BMS SoH (capacity_soh removed: Coulomb counting captures only 38%
                                     # of actual discharge energy, making it systematically 60-95% too low)
+    "cycle_soh",                    # per-cycle computed SoH (new column from data_prep)
+    "capacity_soh_disc_new",        # discharge-side capacity SoH (new method)
     # Health flag counts
     # n_vsag: single consolidated voltage-sag count (data_prep_1.py consolidates
     # the three severity buckets into one flag per row; see compute_voltage_sag)
     "n_vsag",
     "n_high_ir", "n_low_soc",
+    # Internal resistance
+    "ir_ohm_mean", "ir_event_rate",
     # Efficiency & thermal
-    "energy_per_km",
+    "energy_per_km", "energy_per_loaded_session",
+    # Current characteristics
+    "current_mean_discharge", "current_max",
     # Degradation rate-of-change (discharge-to-discharge delta; NaN for other session types)
     # d_vsag_per_cycle and d_n_high_ir now correctly compare consecutive discharge sessions only
     "d_vsag_per_cycle", "d_n_high_ir", "d_ir_ohm_per_cycle",
+    # Trip context
+    "odometer_km", "speed_mean",
     # Session context
     "insulation_mean",              # low insulation = safety concern
     "time_delta_hr",                # unusually long gap before session = abnormal operating pattern
+    # Subsystem health
+    "weak_subsystem_consistency",   # 1 = same subsystem always weakest = accelerating imbalance
+    "subsystem_voltage_std",        # spread across subsystems; high = one hot/weak subsystem dominates
+    "n_cell_undervoltage", "n_cell_overvoltage", "n_cell_spread_warn",
 ]
 
 # CUSUM parameters
@@ -65,22 +112,112 @@ CUSUM_K = 0.5   # allowance (half the shift size to detect), in std units
 CUSUM_H = 4.0   # decision threshold in std units (lower = more sensitive)
 
 
-def isolation_forest_scores(df: pd.DataFrame) -> pd.Series:
+def _build_if_reason(X_orig: pd.DataFrame, X_scaled: np.ndarray,
+                     feats: list, anomaly_mask: pd.Series,
+                     top_n: int = 3) -> pd.Series:
     """
-    Train Isolation Forest on all discharge cycles and return anomaly scores.
-    Only uses features that exist in df (graceful if columns not yet present).
-    Higher score = more anomalous.
+    For each Isolation-Forest–flagged session, return a human-readable string
+    explaining which features drove the anomaly score.
+
+    Format: "feat(direction=val, z=z.z); feat2(...); ..."
     """
-    feats = [f for f in IF_FEATURES if f in df.columns]
-    X     = df[feats].fillna(df[feats].median())
-    X_s   = StandardScaler().fit_transform(X)
+    reasons = []
+    X_arr   = np.asarray(X_orig[feats].fillna(X_orig[feats].median()))
+
+    for i, (idx, is_anom) in enumerate(anomaly_mask.items()):
+        if not is_anom:
+            reasons.append("")
+            continue
+
+        z = np.abs(X_scaled[i])
+        top_idxs = np.argsort(z)[::-1][:top_n]
+        parts = []
+        for j in top_idxs:
+            fname = feats[j]
+            val   = X_arr[i, j]
+            direction = IF_FEATURE_DIRECTION.get(fname, "any")
+            z_val = X_scaled[i, j]   # signed z-score
+            # Determine whether the direction matches the flagging concern
+            if direction == "high":
+                sign_note = "↑high" if z_val > 0 else "↓low"
+            elif direction == "low":
+                sign_note = "↓low" if z_val < 0 else "↑high"
+            else:
+                sign_note = f"{'↑' if z_val > 0 else '↓'}"
+            try:
+                val_str = f"{val:.3g}"
+            except Exception:
+                val_str = str(val)
+            parts.append(f"{fname}={val_str}({sign_note},z={z[j]:.1f})")
+        reasons.append("; ".join(parts))
+
+    return pd.Series(reasons, index=anomaly_mask.index, name="if_reason")
+
+
+def isolation_forest_scores(df: pd.DataFrame) -> tuple:
+    """
+    Train Isolation Forest on all discharge cycles.
+    Returns:
+      - if_score  (Series): anomaly score, higher = more anomalous
+      - if_reason (Series): human-readable reason string for flagged sessions
+    Only uses features that exist in df.
+    """
+    feats   = [f for f in IF_FEATURES if f in df.columns]
+    X_df    = df[feats].fillna(df[feats].median())
+    scaler  = StandardScaler()
+    X_s     = scaler.fit_transform(X_df)
 
     iso = IsolationForest(n_estimators=200, contamination=0.05,
                           random_state=SEED, n_jobs=-1)
     iso.fit(X_s)
-    raw = iso.decision_function(X_s)
+    raw  = iso.decision_function(X_s)
     print(f"  IF features used ({len(feats)}): {feats}")
-    return pd.Series(-raw, index=df.index, name="if_score")   # inverted: higher = worse
+
+    scores      = pd.Series(-raw, index=df.index, name="if_score")
+    anomaly_tmp = scores > scores.quantile(0.95)
+    reasons     = _build_if_reason(df[feats], X_s, feats, anomaly_tmp)
+    return scores, reasons
+
+
+def _build_cusum_reason(disc: pd.DataFrame) -> pd.Series:
+    """
+    For each session, build a string listing which CUSUM channels fired.
+    Returns empty string for sessions with no CUSUM alarm.
+    """
+    channel_labels = {
+        "cusum_soh_alarm":          "BMS-SoH-decline",
+        "cusum_cycle_soh_alarm":    "CycleSoH-decline",
+        "cusum_epk_alarm":          "EnergyPerKm-rise",
+        "cusum_heat_alarm":         "TempRise-increase",
+        "cusum_spread_alarm":       "CellSpread-increase",
+        "cusum_composite_alarm":    "Composite-score-rise",
+        "cusum_ir_slope_alarm":     "IR-slope-rise",
+        "cusum_spread_slope_alarm": "SpreadSlope-rise",
+    }
+    reasons = []
+    for _, row in disc.iterrows():
+        parts = [label for col, label in channel_labels.items()
+                 if row.get(col, False)]
+        reasons.append("; ".join(parts) if parts else "")
+    return pd.Series(reasons, index=disc.index, name="cusum_reason")
+
+
+def _build_combined_reason(disc: pd.DataFrame) -> pd.Series:
+    """
+    Merge IF and CUSUM reason strings into one 'anomaly_reason' column.
+    Format: "IF: feat1=v(↑,z=2.3); feat2=... | CUSUM: channel1; channel2"
+    """
+    reasons = []
+    for _, row in disc.iterrows():
+        parts  = []
+        if_r   = str(row.get("if_reason",    "") or "").strip()
+        cusu_r = str(row.get("cusum_reason", "") or "").strip()
+        if if_r:
+            parts.append(f"IF: {if_r}")
+        if cusu_r:
+            parts.append(f"CUSUM: {cusu_r}")
+        reasons.append(" | ".join(parts) if parts else "")
+    return pd.Series(reasons, index=disc.index, name="anomaly_reason")
 
 
 def cusum_per_vehicle(series: pd.Series, k: float = CUSUM_K,
@@ -118,7 +255,7 @@ def run_cusum_signals(disc: pd.DataFrame) -> pd.DataFrame:
         .transform(lambda s: s.rolling(5, center=True, min_periods=1).median())
     )
 
-    cusum_soh, cusum_epk, cusum_heat, cusum_spread = [], [], [], []
+    cusum_soh, cusum_epk, cusum_heat, cusum_spread, cusum_cycle_soh = [], [], [], [], []
 
     for reg, veh in disc.groupby("registration_number"):
         # SoH — downward shift is bad
@@ -145,15 +282,24 @@ def run_cusum_signals(disc: pd.DataFrame) -> pd.DataFrame:
         else:
             cusum_spread.append(pd.Series(False, index=veh.index))
 
-    disc["cusum_soh_alarm"]    = pd.concat(cusum_soh).reindex(disc.index).fillna(False)
-    disc["cusum_epk_alarm"]    = pd.concat(cusum_epk).reindex(disc.index).fillna(False)
-    disc["cusum_heat_alarm"]   = pd.concat(cusum_heat).reindex(disc.index).fillna(False)
-    disc["cusum_spread_alarm"] = pd.concat(cusum_spread).reindex(disc.index).fillna(False)
+        # cycle_soh — downward shift is bad (same polarity as soh_smooth)
+        if "cycle_soh" in veh.columns:
+            csoh = veh["cycle_soh"].fillna(veh["cycle_soh"].median())
+            cusum_cycle_soh.append(cusum_per_vehicle(csoh))
+        else:
+            cusum_cycle_soh.append(pd.Series(False, index=veh.index))
+
+    disc["cusum_soh_alarm"]        = pd.concat(cusum_soh).reindex(disc.index).fillna(False)
+    disc["cusum_epk_alarm"]        = pd.concat(cusum_epk).reindex(disc.index).fillna(False)
+    disc["cusum_heat_alarm"]       = pd.concat(cusum_heat).reindex(disc.index).fillna(False)
+    disc["cusum_spread_alarm"]     = pd.concat(cusum_spread).reindex(disc.index).fillna(False)
+    disc["cusum_cycle_soh_alarm"]  = pd.concat(cusum_cycle_soh).reindex(disc.index).fillna(False)
     disc["cusum_alarm"] = (
-        disc["cusum_soh_alarm"]    |
-        disc["cusum_epk_alarm"]    |
-        disc["cusum_heat_alarm"]   |
-        disc["cusum_spread_alarm"]
+        disc["cusum_soh_alarm"]       |
+        disc["cusum_epk_alarm"]       |
+        disc["cusum_heat_alarm"]      |
+        disc["cusum_spread_alarm"]    |
+        disc["cusum_cycle_soh_alarm"]
     )
     return disc
 
@@ -166,24 +312,42 @@ def run_cusum_signals(disc: pd.DataFrame) -> pd.DataFrame:
 LGBM_FEATURES = [
     # Aging clock
     "cum_efc", "days_since_first", "aging_index",
+    # SoH signals (new)
+    "cycle_soh",                   # per-cycle SoH estimate (all session types)
+    "capacity_soh_disc_new",       # discharge-based capacity SoH (new method)
+    "capacity_soh_chg_new",        # charge-based capacity SoH (new method)
+    "soh_trend_slope",             # vehicle-level SoH trend slope
     # IR signals
     "ir_ohm_mean", "ir_ohm_mean_ewm10", "ir_ohm_trend_slope",
+    "ir_event_rate", "ir_event_trend_slope",
     # Voltage sag
-    "vsag_rate_per_hr", "vsag_trend_slope",
+    "vsag_rate_per_hr", "vsag_rate_per_hr_ewm10", "vsag_trend_slope",
     # Cell spread
-    "cell_spread_mean", "spread_trend_slope",
+    "cell_spread_mean", "cell_spread_mean_ewm10", "spread_trend_slope",
     # Thermal
-    "temp_rise_rate", "thermal_stress", "rapid_heating",
+    "temp_rise_rate", "temp_rise_rate_ewm10", "temp_mean", "thermal_stress", "rapid_heating",
     # Charging stress
     "c_rate_chg", "fast_charging", "slow_charging",
     # Depth of discharge / energy
     "soc_range", "dod_stress", "energy_kwh", "charging_rate_kw",
+    "energy_per_loaded_session",
+    # Current characteristics
+    "current_mean_discharge", "current_mean_charge",
     # Load context
     "is_loaded", "load_direction_enc",
     # Data quality
     "bms_coverage", "cell_health_poor",
     # Insulation
     "insulation_mean",
+    # Trip distance
+    "odometer_km", "speed_mean",
+    # Subsystem health
+    "weak_subsystem_consistency",   # 1 = same subsystem consistently weakest
+    "subsystem_voltage_std",        # inter-subsystem voltage spread
+    "n_cell_undervoltage", "n_cell_overvoltage", "n_cell_spread_warn",
+    # Fault/alarm presence
+    "ecu_fault_suspected",
+    "total_alerts",
 ]
 
 
@@ -347,6 +511,13 @@ CLUSTER_FEATURES = [
     "c_rate_chg", "dod_stress", "thermal_stress", "is_loaded",
     "ir_ohm_trend_slope", "spread_trend_slope", "vsag_trend_slope",
     "cum_efc", "bms_coverage", "capacity_soh", "cell_health_poor",
+    "cycle_soh",                   # per-cycle SoH (captures degradation regime shifts)
+    "capacity_soh_disc_new",       # discharge-based SoH (new method)
+    "ir_event_rate",               # rate of high-IR events per hour
+    "soh_trend_slope",             # vehicle-level SoH trend
+    "aging_index",                 # combined aging stress metric
+    "weak_subsystem_consistency",  # subsystem imbalance consistency
+    "subsystem_voltage_std",       # inter-subsystem voltage spread
 ]
 
 
@@ -446,11 +617,12 @@ def run_umap_hdbscan(cycles: pd.DataFrame) -> pd.DataFrame | None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 COMPOSITE_WEIGHTS_CUSUM = {
-    "soh_smooth":        0.30,
-    "ir_ohm_mean_ewm10": 0.20,
-    "cell_spread_mean_ewm10": 0.20,
-    "vsag_rate_per_hr_ewm10": 0.15,
-    "temp_rise_rate_ewm10":   0.15,
+    "soh_smooth":             0.25,
+    "cycle_soh":              0.10,  # per-cycle SoH — downward shift = degradation
+    "ir_ohm_mean_ewm10":      0.20,
+    "cell_spread_mean_ewm10": 0.18,
+    "vsag_rate_per_hr_ewm10": 0.13,
+    "temp_rise_rate_ewm10":   0.14,
 }
 
 
@@ -461,20 +633,19 @@ def compute_composite_score(disc: pd.DataFrame) -> pd.Series:
     Higher score = more degraded.
     """
     score = pd.Series(0.0, index=disc.index)
+    # Signals where lower = worse (invert so high normalised score = worse)
+    INVERT_COLS = {"soh_smooth", "cycle_soh"}
     for col, w in COMPOSITE_WEIGHTS_CUSUM.items():
         if col not in disc.columns:
             continue
         s = disc[col].copy()
-        # For soh_smooth: lower = worse → invert
-        if col == "soh_smooth":
-            lo, hi = s.min(), s.max()
-            if hi > lo:
-                s = 1.0 - (s - lo) / (hi - lo)
-            else:
-                s = pd.Series(0.0, index=disc.index)
+        lo, hi = s.min(), s.max()
+        if hi > lo:
+            s = (s - lo) / (hi - lo)
+            if col in INVERT_COLS:
+                s = 1.0 - s
         else:
-            lo, hi = s.min(), s.max()
-            s = (s - lo) / (hi - lo) if hi > lo else pd.Series(0.0, index=disc.index)
+            s = pd.Series(0.0, index=disc.index)
         score += w * s.fillna(0.0)
     return score
 
@@ -519,9 +690,9 @@ def run_cusum_composite(disc: pd.DataFrame) -> pd.DataFrame:
     n_ir     = disc["cusum_ir_slope_alarm"].sum()
     n_spread = disc["cusum_spread_slope_alarm"].sum()
     print(f"\n  [Model C] Enhanced CUSUM on composite score:")
-    print(f"    Composite alarm sessions  : {n_comp:,}")
-    print(f"    IR slope alarm sessions   : {n_ir:,}")
-    print(f"    Spread slope alarm sessions: {n_spread:,}")
+    print(f"    Composite alarm sessions    : {n_comp:,}")
+    print(f"    IR slope alarm sessions     : {n_ir:,}")
+    print(f"    Spread slope alarm sessions : {n_spread:,}")
 
     return disc
 
@@ -538,14 +709,14 @@ if __name__ == "__main__":
 
     # ── Isolation Forest ──────────────────────────────────────────────────────
     print("\nFitting Isolation Forest ...")
-    disc["if_score"]   = isolation_forest_scores(disc)
+    disc["if_score"], disc["if_reason"] = isolation_forest_scores(disc)
     disc["if_anomaly"] = disc["if_score"] > disc["if_score"].quantile(0.95)
 
     # ── CUSUM on four signals ─────────────────────────────────────────────────
     print("Running CUSUM change-point detection ...")
     disc = run_cusum_signals(disc)
 
-    # Combined flag (original: IF + 4-channel CUSUM)
+    # Combined flag (original: IF + 5-channel CUSUM)
     disc["anomaly"] = disc["if_anomaly"] | disc["cusum_alarm"]
 
     # ── Model C: Enhanced CUSUM on composite score + trend slopes ─────────────
@@ -558,6 +729,11 @@ if __name__ == "__main__":
         disc["cusum_ir_slope_alarm"]   |
         disc["cusum_spread_slope_alarm"]
     )
+
+    # ── Reason codes ──────────────────────────────────────────────────────────
+    print("Building anomaly reason codes ...")
+    disc["cusum_reason"]   = _build_cusum_reason(disc)
+    disc["anomaly_reason"] = _build_combined_reason(disc)
 
     disc.to_csv(ANOMALY_FILE, index=False)
     print(f"Saved: {ANOMALY_FILE}")
@@ -581,14 +757,15 @@ if __name__ == "__main__":
     print("ANOMALY SUMMARY PER VEHICLE  (discharge sessions only)")
     print("=" * 75)
     agg_cols = dict(
-        cycles          = ("if_score",           "count"),
-        if_anomalies    = ("if_anomaly",          "sum"),
-        cusum_soh       = ("cusum_soh_alarm",     "sum"),
-        cusum_energy    = ("cusum_epk_alarm",     "sum"),
-        cusum_heating   = ("cusum_heat_alarm",    "sum"),
-        cusum_spread    = ("cusum_spread_alarm",  "sum"),
-        combined        = ("anomaly",             "sum"),
-        if_score_mean   = ("if_score",            "mean"),
+        cycles             = ("if_score",              "count"),
+        if_anomalies       = ("if_anomaly",             "sum"),
+        cusum_soh          = ("cusum_soh_alarm",        "sum"),
+        cusum_energy       = ("cusum_epk_alarm",        "sum"),
+        cusum_heating      = ("cusum_heat_alarm",       "sum"),
+        cusum_spread       = ("cusum_spread_alarm",     "sum"),
+        cusum_cycle_soh    = ("cusum_cycle_soh_alarm",  "sum"),
+        combined           = ("anomaly",                "sum"),
+        if_score_mean      = ("if_score",               "mean"),
     )
     summary = (
         disc.groupby("registration_number")
@@ -603,12 +780,13 @@ if __name__ == "__main__":
     for v in sorted(cusum_veh):
         vdf        = disc[(disc["registration_number"] == v) & disc["cusum_alarm"]]
         first_date = pd.to_datetime(vdf["start_time"].min(), unit="ms").date()
-        soh_f      = disc[(disc["registration_number"] == v) & disc["cusum_soh_alarm"]].shape[0]
-        epk_f      = disc[(disc["registration_number"] == v) & disc["cusum_epk_alarm"]].shape[0]
-        heat_f     = disc[(disc["registration_number"] == v) & disc["cusum_heat_alarm"]].shape[0]
-        spread_f   = disc[(disc["registration_number"] == v) & disc["cusum_spread_alarm"]].shape[0]
+        soh_f       = disc[(disc["registration_number"] == v) & disc["cusum_soh_alarm"]].shape[0]
+        epk_f       = disc[(disc["registration_number"] == v) & disc["cusum_epk_alarm"]].shape[0]
+        heat_f      = disc[(disc["registration_number"] == v) & disc["cusum_heat_alarm"]].shape[0]
+        spread_f    = disc[(disc["registration_number"] == v) & disc["cusum_spread_alarm"]].shape[0]
+        csoh_f      = disc[(disc["registration_number"] == v) & disc["cusum_cycle_soh_alarm"]].shape[0]
         print(f"  {v}: first alarm {first_date} | "
-              f"SoH={soh_f}  Energy={epk_f}  Heating={heat_f}  Spread={spread_f} cycles flagged")
+              f"SoH={soh_f}  CycleSoH={csoh_f}  Energy={epk_f}  Heating={heat_f}  Spread={spread_f} cycles flagged")
 
     # ── Fleet-flag summary (from data_prep flags already in cycles.csv) ────────
     print("\n" + "=" * 75)

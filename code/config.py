@@ -84,17 +84,25 @@ CAL_AGING_LO   = 0.03
 CAL_AGING_HI   = 0.06    
 CAL_AGING_RATE = 0.045   
 
-#  EKF physical parameters 
+#  EKF physical parameters
 EKF_ALPHA = 0.005   # %SoH / EFC  (was 0.007)
 
-#  EKF state-space noise matrices 
-# Process noise Q — diagonal entries: [SoH (%), IR drift (Ω), spread drift (V)]
-EKF_Q_DIAG = [1e-4, 2.5e-7, 2.5e-9]      # [0.01², 0.0005², 0.00005²]
-# Observation noise R — diagonal: [capacity_soh, bms_soh, ir_ohm_mean, cell_spread_mean]
-# bms_soh noise raised from 4.0 → 9.0 (3.0²): BMS reports integer steps only;
-# higher R makes the EKF rely less on the noisy integer observation and more
-# on the physics-based process model, producing more stable SoH estimates.
-EKF_R_DIAG = [2.25, 9.0, 4e-6, 2.5e-5]   # [1.5², 3.0², 0.002², 0.005²]
+# Current-stress scaling (Peukert-like): extra SoH fade fraction per unit I/I_nom above 1
+PEUKERT_N       = 0.05    # dimensionless — mild effect for LFP chemistry
+I_NOMINAL_A     = 150.0   # A — typical fleet discharge current used as reference
+LOAD_STRESS_FACTOR = 1.15 # multiplicative EFC stress when vehicle is loaded (is_loaded=True)
+ZETA            = 5e-4    # °C/hr drift per EFC (thermal aging accumulation)
+
+#  EKF state-space noise matrices
+# State vector: [SoH (%), IR_drift (Ω), spread_drift (V), temp_drift (°C/hr)]
+# Process noise Q — 4 diagonal entries
+EKF_Q_DIAG = [1e-4, 2.5e-7, 2.5e-9, 1e-5]   # [0.01², 0.0005², 0.00005², ~0.003²]
+# Observation noise R — diagonal:
+#   [cycle_soh, bms_soh, ir_ohm_mean, cell_spread_mean, temp_rise_rate]
+# capacity_soh REMOVED: replaced by cycle_soh which is available every cycle.
+# bms_soh noise 9.0 (3²): integer-stepped, rely less on it.
+# temp_rise_rate noise 0.25 (0.5²): high ambient variability; weak thermal signal.
+EKF_R_DIAG = [4.0, 9.0, 4e-6, 2.5e-5, 0.25]  # [2², 3², 0.002², 0.005², 0.5²]
 
 # EKF output file
 EKF_CSV = os.path.join(ARTIFACTS_DIR, "ekf_soh.csv")
