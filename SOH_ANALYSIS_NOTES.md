@@ -302,6 +302,65 @@ Same sign-direction logic as `current_mean` (BMS): uses mean of positive values 
 
 ---
 
+### 6. `code/data_prep_1.py` — Add `hot_subsystem_consistency`
+
+Added alongside `weak_subsystem_consistency` in `extract_cycles`:
+
+```python
+if "temperature_highest_subsystem_number" in df.columns:
+    modal_hot = df["temperature_highest_subsystem_number"].mode()
+    if len(modal_hot) > 0:
+        agg_spec["hot_subsystem_consistency"] = (
+            "temperature_highest_subsystem_number",
+            lambda x, m=int(modal_hot.iloc[0]): (x == m).mean() if x.notna().any() else np.nan,
+        )
+```
+
+**What it measures:** Fraction of BMS rows in a session where `temperature_highest_subsystem_number` equals the fleet-modal hot subsystem. High value (→ 1.0) means that subsystem is persistently the hottest across the session. Low value means thermal hotspot rotates across subsystems.
+
+**Fleet-modal subsystem** is computed once across all rows with a valid `temperature_highest_subsystem_number` value (same approach as `weak_subsystem_consistency`). Added to `_col_order` after `hot_probe_id`.
+
+---
+
+### 7. `code/data_prep_1.py` — Fix `PerformanceWarning`: DataFrame is highly fragmented
+
+Pandas emits this warning when a DataFrame accumulates many single-column memory blocks (one per `df[col] = ...` assignment). Two sources were identified and fixed.
+
+#### `join_alerts_onto_cycles` (primary cause — ~36 columns)
+
+**Before:** Initialised each of ~35 alert columns plus `total_alerts` one by one:
+```python
+for c in alert_cols:
+    cycles[c] = 0.0
+cycles["total_alerts"] = 0.0
+```
+Each assignment creates a new single-column memory block → 36 separate allocations.
+
+**After:** Pre-allocates all alert columns as a single contiguous block, then `pd.concat` once:
+```python
+_alert_block = pd.DataFrame(
+    0, index=cycles.index,
+    columns=alert_cols + ["total_alerts"],
+    dtype=np.float64,
+)
+cycles = pd.concat([cycles, _alert_block], axis=1)
+del _alert_block; gc.collect()
+```
+All 36 columns share one memory allocation. The per-vehicle searchsorted fill loop and final `.astype(int)` cast are unchanged.
+
+#### `add_engineered_features` (secondary cause — ~80 fragmented cols entering + 19 more added)
+
+**Before:** By the time this function ran, `cycles` already had ~80+ columns accumulated piecemeal from earlier pipeline steps. Adding ~19 more one-by-one compounded the fragmentation.
+
+**After:** Added `cycles = cycles.copy()` at function entry:
+```python
+cycles = cycles.copy()   # consolidate fragmented column blocks
+cycles = cycles.sort_values(["registration_number", "start_time"])
+```
+`.copy()` causes pandas to consolidate all same-dtype columns into a minimal set of contiguous blocks before new columns are added, eliminating the warning for this step.
+
+---
+
 ## Engineered Columns Reference
 
 All columns in `cycles.csv` that are not directly aggregated from raw BMS/GPS/VCU rows. Formulas are shown in Python notation; constants from `config.py` are used where referenced.
