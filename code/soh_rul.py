@@ -511,24 +511,36 @@ if __name__ == "__main__":
                 row["ir_r2"]            = np.nan
             row["total_high_ir"] = int(veh["n_high_ir"].sum())
 
-        # cycle_soh trend — use all sessions (not just discharge or charging).
-        # Fit on the full cycles DataFrame so we maximise data points.
+        # cycle_soh trend — quality-gated: only use sessions where the Coulomb count
+        # is reliable (block DoD >= 20% and cycle_soh is not capped at 100%).
+        # This removes the 55% of sessions where cycle_soh = 100.0 exactly (cap
+        # artifact) and partial-charge sessions with noisy Coulomb counts.
         if has_cycle_soh:
             veh_all = cycles[cycles["registration_number"] == reg].copy()
             veh_all["_days"] = (
                 (veh_all["start_time"] - veh_all["start_time"].min()) / 86_400_000.0
             )
-            cs_all = veh_all["cycle_soh"].dropna()
-            if len(cs_all) >= MIN_CYCLES_FOR_FIT:
-                cs_all_days = veh_all.loc[cs_all.index, "_days"].values
-                cs_fit = fit_degradation(cs_all_days, cs_all.values)
+            # Quality gate: sufficient block DoD and not capped at 100%
+            _block_dod = (veh_all["block_soc_diff"].abs()
+                          if "block_soc_diff" in veh_all.columns
+                          else veh_all["soc_range"].abs())
+            _quality = (
+                veh_all["cycle_soh"].notna() &
+                (veh_all["cycle_soh"] < 99.5) &
+                (_block_dod >= 20.0)
+            )
+            cs_quality = veh_all.loc[_quality, "cycle_soh"]
+            # Record the current (most recent quality) cycle_soh for composite scoring
+            cs_all_raw = veh_all["cycle_soh"].dropna()
+            row["cycle_soh_current"] = round(float(cs_all_raw.iloc[-1]), 3) if len(cs_all_raw) else np.nan
+            if len(cs_quality) >= MIN_CYCLES_FOR_FIT:
+                cs_days = veh_all.loc[cs_quality.index, "_days"].values
+                cs_fit  = fit_degradation(cs_days, cs_quality.values)
                 row["cycle_soh_slope_per_day"] = round(cs_fit["slope"], 5)
                 row["cycle_soh_r2"]            = round(cs_fit["r2"], 3)
-                row["cycle_soh_current"]        = round(float(cs_all.iloc[-1]), 3)
             else:
                 row["cycle_soh_slope_per_day"] = np.nan
                 row["cycle_soh_r2"]            = np.nan
-                row["cycle_soh_current"]        = np.nan
 
         vehicle_results.append(row)
 

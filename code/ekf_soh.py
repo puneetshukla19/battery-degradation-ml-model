@@ -45,6 +45,7 @@ from config import (
     EKF_Q_DIAG, EKF_R_DIAG,
     EOL_SOH, EFC_MAX, CAL_AGING_RATE,
     EKF_ALPHA, PEUKERT_N, I_NOMINAL_A, LOAD_STRESS_FACTOR, ZETA,
+    CYCLE_SOH_OBS_CAP, CYCLE_SOH_MIN_BLOCK_DOD, CYCLE_SOH_REF_DOD,
 )
 
 # ── EKF physical parameters ────────────────────────────────────────────────────
@@ -116,19 +117,21 @@ def ekf_step(x: np.ndarray, P: np.ndarray,
              z_obs: np.ndarray,
              delta_efc: float, delta_days: float,
              current_mean_discharge: float = np.nan,
-             is_loaded: bool = False) -> tuple:
+             is_loaded: bool = False,
+             r_cycle_soh_override: float = None) -> tuple:
     """
     One EKF predict + update step.
 
     Parameters
     ----------
-    x                    : current state (4,)
-    P                    : current covariance (4,4)
-    z_obs                : observation vector (5,) — NaN entries are skipped
-    delta_efc            : EFC change since last session
-    delta_days           : calendar days since last session
+    x                     : current state (4,)
+    P                     : current covariance (4,4)
+    z_obs                 : observation vector (5,) — NaN entries are skipped
+    delta_efc             : EFC change since last session
+    delta_days            : calendar days since last session
     current_mean_discharge: mean discharge current this session (A)
-    is_loaded            : whether vehicle was loaded this session
+    is_loaded             : whether vehicle was loaded this session
+    r_cycle_soh_override  : if given, replaces R[0,0] for this step (adaptive DoD scaling)
     """
     # ── Predict ──
     F   = _build_F()
@@ -141,7 +144,14 @@ def ekf_step(x: np.ndarray, P: np.ndarray,
         return x_p, P_p
 
     H_v = H_ALL[valid]
-    R_v = R_ALL[np.ix_(valid, valid)]
+    R_v = R_ALL[np.ix_(valid, valid)].copy()
+
+    # Apply adaptive R for cycle_soh (observation index 0) if it is valid this step
+    if r_cycle_soh_override is not None and valid[0]:
+        # Find position of obs-0 in the compressed valid array
+        idx_in_valid = np.where(valid)[0].tolist().index(0)
+        R_v[idx_in_valid, idx_in_valid] = r_cycle_soh_override
+
     z_v = z_obs[valid]
 
     S     = H_v @ P_p @ H_v.T + R_v
@@ -224,6 +234,26 @@ def run_ekf_fleet(cycles: pd.DataFrame) -> pd.DataFrame:
         efc_total = float(veh["cum_efc"].iloc[-1])
         avg_efc_per_day = (efc_total / days_span) if days_span > 1.0 else np.nan
 
+        # ── Pre-compute EWM-smoothed cycle_soh per vehicle ───────────────────
+        # Only smooth on quality observations (not capped, sufficient block DoD).
+        # Sessions outside the quality gate keep their raw value (used to decide NaN later).
+        block_dod = veh["block_soc_diff"].abs() if "block_soc_diff" in veh.columns else veh["soc_range"].abs()
+        csoh_raw  = veh["cycle_soh"].copy()
+        quality_mask = (
+            csoh_raw.notna() &
+            (csoh_raw < CYCLE_SOH_OBS_CAP) &
+            (block_dod >= CYCLE_SOH_MIN_BLOCK_DOD)
+        )
+        # EWM on valid values only; propagate last valid to non-quality rows for bookkeeping
+        csoh_valid = csoh_raw.where(quality_mask)
+        csoh_ewm   = csoh_valid.ewm(span=5, min_periods=1).mean()
+        # Clamp smoothed values to physical range [88, 101]
+        csoh_ewm   = csoh_ewm.clip(lower=88.0, upper=101.0)
+        veh = veh.copy()
+        veh["_csoh_ewm"]   = csoh_ewm
+        veh["_block_dod"]  = block_dod
+        veh["_csoh_quality"] = quality_mask
+
         x = X0.copy()
         P = P0.copy()
 
@@ -240,9 +270,25 @@ def run_ekf_fleet(cycles: pd.DataFrame) -> pd.DataFrame:
             current_disc = float(row.get("current_mean_discharge", np.nan) or np.nan)
             is_loaded    = bool(row.get("is_loaded", False))
 
+            # ── cycle_soh quality gate ────────────────────────────────────────
+            # Use EWM-smoothed value only when quality conditions are met.
+            # Cap at 99.5%: a 100% reading is an artefact of the Coulomb-count
+            # ceiling, not a true measurement — it provides zero downward signal.
+            # Shallow blocks (block_dod < 20%) are too noisy to be informative.
+            use_csoh    = bool(row.get("_csoh_quality", False))
+            csoh_obs    = float(row["_csoh_ewm"]) if use_csoh and pd.notna(row["_csoh_ewm"]) else np.nan
+
+            # Adaptive R for cycle_soh: deeper DoD → more reliable → lower R
+            r_csoh_override = None
+            if use_csoh and np.isfinite(csoh_obs):
+                dod = float(row["_block_dod"])
+                ref = float(CYCLE_SOH_REF_DOD)
+                scale = (ref / max(dod, 10.0)) ** 2
+                r_csoh_override = float(EKF_R_DIAG[0]) * scale  # R_base * scaling factor
+
             # Build observation vector — temp_rise_rate demeaned by fleet baseline
             z = np.array([
-                float(row["cycle_soh"]) if pd.notna(row.get("cycle_soh"))    else np.nan,
+                csoh_obs,
                 float(row["soh"])        if pd.notna(row.get("soh"))          else np.nan,
                 float(row["ir_ohm_mean"]) if pd.notna(row.get("ir_ohm_mean")) else np.nan,
                 float(row["cell_spread_mean"]) if pd.notna(row.get("cell_spread_mean")) else np.nan,
@@ -252,7 +298,8 @@ def run_ekf_fleet(cycles: pd.DataFrame) -> pd.DataFrame:
 
             x, P = ekf_step(x, P, z, delta_efc, delta_days,
                             current_mean_discharge=current_disc,
-                            is_loaded=is_loaded)
+                            is_loaded=is_loaded,
+                            r_cycle_soh_override=r_csoh_override)
 
             ekf_soh     = float(x[0])
             ekf_soh_std = float(np.sqrt(max(0.0, P[0, 0])))
@@ -264,7 +311,7 @@ def run_ekf_fleet(cycles: pd.DataFrame) -> pd.DataFrame:
                 "start_time":               row.get("start_time"),
                 "days_since_first_session": float(row.get("days_since_first", 0.0)),
                 "cum_efc":                  float(row.get("cum_efc", 0.0)),
-                "cycle_soh_obs":            z[0],
+                "cycle_soh_obs":            csoh_obs,   # EWM-smoothed quality-gated value
                 "bms_soh_obs":              z[1],
                 "temp_rise_rate_obs":       z[4],       # demeaned value
                 "current_mean_discharge":   current_disc,
@@ -289,7 +336,7 @@ if __name__ == "__main__":
     # ── Young-fleet notice ────────────────────────────────────────────────────
     max_days = cycles.get("days_since_first", pd.Series([0])).max() if "days_since_first" in cycles.columns else 0
     if max_days < 180:
-        print(f"\n  NOTE: Young fleet detected (max data span ≈ {max_days:.0f} days).")
+        print(f"\n  NOTE: Young fleet detected (max data span ~{max_days:.0f} days).")
         print("  EKF SoH estimates are dominated by the prior for <6 months of data.")
         print("  Expect EKF SoH near 100% and wide uncertainty bands — this is correct behaviour.")
 
@@ -331,27 +378,33 @@ if __name__ == "__main__":
           "(0 = nominal; positive = heating faster than fleet baseline)")
 
     # ── Verification ─────────────────────────────────────────────────────────
-    print("\n── Verification checks ──")
+    print("\n-- Verification checks --")
     ekf_last = ekf_df.groupby("registration_number").last().reset_index()
+
+    # Cycle_soh observation usage rate
+    n_total  = len(ekf_df)
+    n_csoh   = ekf_df["cycle_soh_obs"].notna().sum()
+    print(f"  cycle_soh obs used: {n_csoh:,}/{n_total:,} sessions "
+          f"({100*n_csoh/n_total:.1f}%) — quality-gated + EWM-smoothed")
 
     valid_csoh = ekf_last.dropna(subset=["cycle_soh_obs"])
     if len(valid_csoh):
         diff = (valid_csoh["ekf_soh"] - valid_csoh["cycle_soh_obs"]).abs()
         pct_within_2 = (diff <= 2.0).mean() * 100
-        msg = f"  ekf_soh within ±2% of cycle_soh: {pct_within_2:.0f}% of vehicles"
-        print(msg + " ✓" if pct_within_2 >= 80 else msg + " ⚠")
+        msg = f"  ekf_soh within ±2% of cycle_soh (quality obs): {pct_within_2:.0f}% of vehicles"
+        print(msg + " [OK]" if pct_within_2 >= 80 else msg + " [WARN]")
 
     if len(ekf_df) > 100:
         early = ekf_df[ekf_df["cum_efc"] < ekf_df["cum_efc"].quantile(0.25)]["ekf_soh_std"].mean()
         late  = ekf_df[ekf_df["cum_efc"] > ekf_df["cum_efc"].quantile(0.75)]["ekf_soh_std"].mean()
-        print(f"  ekf_soh_std early vs late: {early:.4f} → {late:.4f} "
-              f"({'shrinking ✓' if late < early else '⚠ not shrinking — may need more data'})")
+        print(f"  ekf_soh_std early vs late: {early:.4f} -> {late:.4f} "
+              f"({'shrinking [OK]' if late < early else '[WARN] not shrinking - may need more data'})")
 
     # Young fleet: check RUL isn't misleadingly low
     median_rul = ekf_df.groupby("registration_number")["ekf_rul_days"].last().median()
     if median_rul is not None and np.isfinite(float(median_rul or np.inf)):
         if float(median_rul) < 365:
-            print(f"  ⚠ Median EKF RUL = {median_rul:.0f} days. "
+            print(f"  [WARN] Median EKF RUL = {median_rul:.0f} days. "
                   "For a young fleet this likely reflects prior uncertainty rather than real degradation.")
         else:
-            print(f"  Median EKF RUL = {median_rul:.0f} days ✓ (consistent with young fleet)")
+            print(f"  Median EKF RUL = {median_rul:.0f} days [OK] (consistent with young fleet)")
