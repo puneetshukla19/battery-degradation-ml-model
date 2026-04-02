@@ -99,10 +99,20 @@ ZETA            = 5e-4    # °C/hr drift per EFC (thermal aging accumulation)
 EKF_Q_DIAG = [1e-4, 2.5e-7, 2.5e-9, 1e-5]   # [0.01², 0.0005², 0.00005², ~0.003²]
 # Observation noise R — diagonal:
 #   [cycle_soh, bms_soh, ir_ohm_mean, cell_spread_mean, temp_rise_rate]
-# capacity_soh REMOVED: replaced by cycle_soh which is available every cycle.
+# cycle_soh noise 9.0 (3²): Coulomb-count has ~5% actual std on quality sessions;
+#   R is further scaled adaptively by block DoD depth (see ekf_soh.py).
 # bms_soh noise 9.0 (3²): integer-stepped, rely less on it.
 # temp_rise_rate noise 0.25 (0.5²): high ambient variability; weak thermal signal.
-EKF_R_DIAG = [4.0, 9.0, 4e-6, 2.5e-5, 0.25]  # [2², 3², 0.002², 0.005², 0.5²]
+EKF_R_DIAG = [9.0, 9.0, 4e-6, 2.5e-5, 0.25]  # [3², 3², 0.002², 0.005², 0.5²]
+
+# cycle_soh quality gates for EKF observation
+# cycle_soh >= this value is treated as an uninformative cap — skipped (set to NaN)
+CYCLE_SOH_OBS_CAP        = 99.5
+# Minimum block DoD (% SoC swing) for a cycle_soh observation to be accepted
+CYCLE_SOH_MIN_BLOCK_DOD  = 20.0
+# Adaptive R scaling reference depth: at this DoD, R = EKF_R_DIAG[0]
+# Shallower blocks get higher R (less trusted): R_eff = R_base * (REF_DOD/block_dod)^2
+CYCLE_SOH_REF_DOD        = 50.0
 
 # EKF output file
 EKF_CSV = os.path.join(ARTIFACTS_DIR, "ekf_soh.csv")
