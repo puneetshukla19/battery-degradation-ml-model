@@ -743,3 +743,124 @@ python code/plot_rul.py    # generates plots/fig*.png + plots/rul_presentation.p
 ```
 
 > Re-run `data_prep_1.py` first if the raw BMS/GPS/VCU data changes.
+
+---
+
+## Session 2026-04-02 — EKF cycle_soh Quality Gating, Adaptive R, EWM Smoothing
+
+### Problem Identified
+
+Running ekf_soh.py and inspecting the output revealed the EKF SoH estimates were unreliable in two directions:
+
+**Problem 1 — EKF anchored near 100% for most vehicles.**
+55.6% of all sessions (and a large fraction of charging sessions) had `cycle_soh = 100.0` exactly. This is a hard cap in the Coulomb-counting algorithm, not a real measurement. Feeding `z[0] = 100.0` as an observation every session continuously pulled the EKF state upward, preventing it from tracking any real degradation. The prior dominated; meaningful SoH decline was invisible.
+
+**Problem 2 — Three outlier vehicles at physically implausible SoH.**
+| Vehicle | EKF SoH (before) | BMS SoH (truth) |
+|---|---|---|
+| MH18BZ3028 | 90.16% | 97–98% |
+| MH18BZ3392 | 93.82% | 98–99% |
+| MH18BZ3370 | 95.72% | 98–99% |
+
+These vehicles had Coulomb-counting blocks with values of 55–77% caused by overnight parasitic SoC drain that the current sensor never captured (BMS off during parking). With `R[0] = 4.0` (±2% noise), the EKF treated these as reliable observations and crashed the state estimate.
+
+**Root cause diagnosis from data:**
+- `cycle_soh` distribution: median = 100.0%, std = 2.4% fleet-wide — heavily bimodal (either capped at 100% or in the 95–99% range)
+- High-quality observations (block_soc_diff ≥ 20%, not capped): only 2,595 of 7,745 charging sessions; actual std on these = **4.9%** — R should be ~9.0–25.0, not 4.0
+- `cycle_soh` is a block-level metric propagated per `block_id`. Block blocks with low DoD (< 20% SoC swing) have noise >> signal.
+
+---
+
+### Changes Made
+
+#### `config.py`
+
+```python
+# R for cycle_soh raised to match actual observation noise
+EKF_R_DIAG = [9.0, 9.0, 4e-6, 2.5e-5, 0.25]   # was [4.0, ...]
+
+# New quality-gate constants
+CYCLE_SOH_OBS_CAP       = 99.5   # cycle_soh >= this is a Coulomb-count cap artefact — skip
+CYCLE_SOH_MIN_BLOCK_DOD = 20.0   # minimum block SoC swing (%) for valid Coulomb count
+CYCLE_SOH_REF_DOD       = 50.0   # reference DoD for adaptive R scaling
+```
+
+#### `ekf_soh.py`
+
+Four improvements added inside `run_ekf_fleet()`:
+
+1. **EWM pre-smoothing per vehicle (span=5)**
+   Before the session loop, compute an EWM-smoothed `cycle_soh` on quality-only observations:
+   ```python
+   quality_mask = (csoh < CYCLE_SOH_OBS_CAP) & (block_dod >= CYCLE_SOH_MIN_BLOCK_DOD)
+   csoh_ewm = csoh.where(quality_mask).ewm(span=5, min_periods=1).mean().clip(88, 101)
+   ```
+
+2. **Quality gate on cycle_soh observation**
+   Only use cycle_soh as EKF input when both conditions hold:
+   - `cycle_soh < 99.5%` (not capped at ceiling)
+   - `block_soc_diff >= 20%` (sufficient DoD for reliable Coulomb count)
+   Sessions outside this gate have `z[0] = NaN` — the EKF evolves on the process model only.
+
+3. **Adaptive R for cycle_soh**
+   Deeper block DoD → lower R (more trust):
+   ```python
+   R_eff = R_base * (CYCLE_SOH_REF_DOD / max(block_dod, 10)) ** 2
+   # At 50% DoD: R = 9.0  (reference)
+   # At 25% DoD: R = 36.0 (less trust)
+   # At 10% DoD: R = 225  (nearly ignored)
+   ```
+   Implemented via new `r_cycle_soh_override` parameter on `ekf_step()`.
+
+4. **Observation clamping**
+   EWM-smoothed value is clamped to `[88, 101]` before use. Prevents extreme outlier blocks from destabilising the filter.
+
+#### `soh_rul.py`
+
+Same quality gate applied to the cycle_soh OLS trend fit:
+- Only use sessions with `block_soc_diff >= 20%` AND `cycle_soh < 99.5%`
+- Avoids fitting slope on capped or noisy partial-charge sessions
+- `cycle_soh_current` still records the most recent raw value (for composite scoring)
+
+---
+
+### Results
+
+| Metric | Before | After |
+|---|---|---|
+| Fleet mean EKF SoH | 98.52% | **97.56%** |
+| Fleet std EKF SoH | 1.29% | **0.47%** |
+| MH18BZ3028 | 90.16% | **94.97%** |
+| MH18BZ3392 | 93.82% | **97.40%** |
+| MH18BZ3370 | 95.72% | **97.34%** |
+| SoH trend over 95 days | Flat near 100% | **−1.0% monotonic decline** ✓ |
+| cycle_soh obs used | 7,745 (100%; ~half were caps) | **1,514 (19.5%) — all informative** |
+| Verification: ±2% from cycle_soh | 94% [OK] | **85% [OK]** |
+| Verification: std shrinking | 0.50 → 0.16 [OK] | **0.77 → 0.24 [OK]** |
+| Median EKF RUL | 1,364 days | **1,280 days** |
+
+**Fleet SoH by time quintile (Q1 = earliest sessions, Q5 = latest):**
+| Quintile | Fleet median EKF SoH |
+|---|---|
+| Q1 | 98.49% |
+| Q2 | 98.09% |
+| Q3 | 97.76% |
+| Q4 | 97.71% |
+| Q5 | 97.49% |
+
+This confirms the EKF now produces a physically meaningful, monotonically declining SoH signal in the high 90s — exactly correct for a 95-day-old fleet.
+
+**Quality obs coverage:** median 20 sessions per vehicle; 1 vehicle has 0 quality cycle_soh observations (relies purely on BMS soh + other observations).
+
+---
+
+### Is the EKF SoH reliable for downstream modeling?
+
+**Yes, with caveats:**
+
+- **Fleet mean (97.56%) and spread (std=0.47%) are physically correct** for a young fleet. Inter-vehicle variation is small and real, not noise-driven.
+- **Monotonic decline confirmed** — the EKF is now sensitive to actual degradation signals from quality Coulomb counts, IR drift, cell spread, and thermal state.
+- **MH18BZ3028 (94.97%)** remains the most flagged vehicle. Its quality Coulomb counts genuinely average lower than the fleet; it should be investigated for cell imbalance or parasitic drain. However, given BMS SoH = 97–98%, some residual downward bias may remain — this vehicle's Coulomb-counting reliability is fundamentally limited by its charging pattern.
+- **RUL estimates** (median 1,280 days / ~3.5 years) are consistent with a 95-day-old fleet far from EOL@80%. These will sharpen significantly after 6+ months of data.
+- **For supervised model training** (LightGBM SoH regression): `ekf_soh` is now a reliable feature — it differentiates vehicles by real operating patterns rather than Coulomb-count noise artefacts.
+
