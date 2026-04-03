@@ -1225,8 +1225,207 @@ Added `"cusum_ekf_soh_alarm": "EKF-SoH-decline"` to CUSUM channel labels so the 
 
 #### LightGBM SoH Regressor (Model A) — unchanged target, updated context
 - Train: 5,217 sessions | Test: 2,276 sessions
-- RMSE: **0.99%** (target <1.5%) 
+- RMSE: **0.99%** (target <1.5%)
 - MAE: **0.23%** (target <1.0%)
 - Directional accuracy: **90.9%** (target >65%)
 - Top features: `capacity_soh_chg_new`, `bms_coverage`, `cycle_soh`, `c_rate_chg`, `energy_per_loaded_session`
+
+---
+
+## Session 2026-04-03 (cont.) — Model Comparison: Equations, Coefficients, RUL Interpretation, Vehicle Fixed Effects
+
+### Model 1 — OLS (Per-vehicle linear trend)
+
+**Equation:**
+```
+ekf_soh(t) = intercept_i + slope_i × days_since_first_session
+```
+Fit independently per vehicle via OLS (`scipy.stats.linregress`).
+
+**Fleet slope distribution:**
+
+| Stat | Value |
+|---|---|
+| Mean slope | −0.030 %/day |
+| Min | −0.179 %/day (MH18BZ3195) |
+| 25th pct | −0.033 %/day |
+| Median | −0.026 %/day |
+| 75th pct | −0.020 %/day |
+| Max | +0.007 %/day (MH18BZ3382 — noise) |
+| Reliable fits (R² ≥ 0.4) | 58/66 |
+
+**What it tells:** Days until SoH hits EOL (80%) at the current rate. One slope per vehicle — simple and interpretable.
+
+**Caveats:**
+- Single predictor (time only) — cannot distinguish usage-driven from calendar-driven degradation
+- Slope CI is wide at 95 days; bootstrapped p5–p95 often spans 5×–10× the point estimate
+- Positive slopes (e.g. +0.007) are physically impossible long-term — artefact of short noisy window
+- No cross-vehicle learning — each vehicle fit independently
+
+---
+
+### Model 2 — Dual-Axis (Per-vehicle EFC + Calendar decomposition)
+
+**Equation:**
+```
+ekf_soh = SoH₀ − α·(cum_efc / 3000) − β·(days / 365)·0.045 − γ·(cum_efc × days)
+```
+Fit via `np.linalg.lstsq` per vehicle. Coefficients: α = cycle fade, β = calendar fade, γ = interaction.
+
+**Fleet split:**
+
+| Dominant path | Vehicles | Meaning |
+|---|---|---|
+| `calendar` | 35/66 | Aging driven by time/temperature — manage parking SoC, thermal environment |
+| `cycle` | 31/66 | Aging driven by charge throughput — reduce C-rate, avoid deep DoD |
+
+**What it tells:** Which intervention extends pack life most. `dual_dominant_path` is the most actionable output — it directs the type of corrective action.
+
+**Caveats:**
+- EFC and days are highly correlated at 95 days (fleet started simultaneously) → α vs β split is unreliable; treat `dual_dominant_path` as directional only
+- `dual_rul_days = min(rul_efc_days, rul_cal_days)` — useful as a conservative lower bound
+- Interaction term γ is unstable with short data; can flip sign across vehicles
+
+---
+
+### Model 3 — BayesianRidge (Per-vehicle, 16 physical features)
+
+**Equation:**
+```
+ekf_soh = β₀ + β₁·cum_efc + β₂·days + β₃·(efc×days)
+        + β₄·ir_ohm_mean + β₅·cell_spread_mean + β₆·temp_rise_rate
+        + β₇·ir_ewm10 + β₈·spread_ewm10 + β₉·vsag_rate_per_hr
+        + β₁₀·dod_stress + β₁₁·c_rate_chg + β₁₂·thermal_stress
+        + β₁₃·weak_subsystem_consistency + β₁₄·subsystem_voltage_std
+        + β₁₅·current_mean_discharge + β₁₆·is_loaded
+```
+
+**Fleet-wide standardised coefficients** (fitted globally for interpretability; actual pipeline fits per-vehicle):
+
+| Feature | Std. Coefficient | Interpretation |
+|---|---|---|
+| `days_since_first` | **−0.559** | Strongest signal — calendar aging dominates fleet |
+| `efc_x_days` | **+0.406** | Positive interaction: vehicles with both high cycles AND high age degrade slower than the additive sum — likely survivor bias (well-maintained vehicles accumulate more EFCs) |
+| `cum_efc` | −0.156 | Cycle aging — second driver |
+| `ir_ohm_mean_ewm10` | −0.079 | Rising smoothed IR = SoH decline |
+| `subsystem_voltage_std` | −0.030 | Higher inter-subsystem spread = worse health |
+| `c_rate_chg` | −0.029 | Faster charging = more electrochemical stress |
+| `vsag_rate_per_hr` | ~0.000 | Near-zero — dominated by its EWM version |
+| `cell_spread_mean` | +0.036 | Positive — likely multicollinearity with IR features |
+| `cell_spread_mean_ewm10` | +0.035 | Same — interpret with caution |
+| `weak_subsystem_consistency` | +0.055 | Positive — flag is noisy at this data volume |
+| `dod_stress` | +0.033 | Mild positive — counterintuitive; confounded with cycle count |
+| `thermal_stress` | +0.018 | Mild positive — confounded with operational intensity |
+
+Fleet intercept (mean EKF SoH): **97.95%**. Bayesian noise precision λ = 25.1, coefficient precision α = 5.5 — model is regularised, coefficients pulled toward zero.
+
+**What it tells:** Which operating factors drive SoH loss for this vehicle given its actual session history. `bayes_soh_std` quantifies confidence — typical std 0.12–0.19%; values >0.5% indicate sparse data or volatile charging pattern.
+
+**Caveats:**
+- Per-vehicle fit — cannot borrow cross-fleet information; each vehicle trained on ~400–600 rows
+- Positive `efc_x_days` and `cell_spread_mean` coefficients are multicollinearity artefacts in the fleet-wide version; per-vehicle fits may differ
+- 13/66 vehicles have no `bayes_soh_pred` (insufficient sessions after feature merge)
+- MH18BZ3028 has `bayes_soh_std = 4.54%` — extremely wide, model is uncertain; fewer quality sessions after merge
+
+---
+
+### Model 4 — LightGBM (Fleet-wide, charging sessions, Y = `capacity_soh_chg_new`)
+
+**Note: different target from models 1–3** — predicts `capacity_soh_chg_new` (charging-side Coulomb-count SoH), not `ekf_soh`.
+
+**Top-10 feature importances (split gain):**
+
+| Rank | Feature | Importance | Direction |
+|---|---|---|---|
+| 1 | `capacity_soh_chg_new` | 1,493 | Target — possible leakage risk (same derivation as Y) |
+| 2 | `bms_coverage` | 919 | Data quality — incomplete sessions appear degraded |
+| 3 | `cycle_soh` | 695 | Per-cycle SoH proxy |
+| 4 | `c_rate_chg` | 383 | Charge rate stress |
+| 5 | `energy_per_loaded_session` | 366 | Efficiency proxy |
+| 6 | `subsystem_voltage_std` | 351 | Imbalance signal |
+| 7 | `soc_range` | 288 | Depth of charge event |
+| 8 | `energy_kwh` | 282 | Energy throughput |
+| 9 | `days_since_first` | 278 | Calendar aging |
+| 10 | `weak_subsystem_consistency` | 210 | Structural imbalance |
+
+**Test performance:** RMSE 0.99%, MAE 0.23%, directional accuracy 90.9%.
+
+**What it tells:** Best predictive accuracy on the training distribution. 90.9% directional accuracy means it correctly predicts whether SoH went up or down on 9 in 10 charging sessions — useful for real-time charging session monitoring.
+
+**Caveats:**
+- `capacity_soh_chg_new` is in X and also the basis for Y — leakage risk; the 0.23% MAE may be optimistic
+- No vehicle fixed effect — treats all 66 vehicles as one population
+- Temporal 70/30 split reduces leakage but within short windows train/test look similar
+
+---
+
+### Which Model to Use?
+
+| Use case | Model | Reason |
+|---|---|---|
+| Primary RUL estimate for reporting | **OLS** | Most robust at 95 days; R² reliable for 58/66 vehicles; one interpretable number |
+| Cycle vs. calendar intervention decision | **Dual-axis** | Only model that separates degradation path; guides maintenance type |
+| Uncertainty-aware SoH forecast | **BayesianRidge** | Provides `bayes_soh_std`; cross-check for `low_r2` OLS vehicles |
+| Session-level charging health monitoring | **LightGBM** | Best accuracy on charging sessions; fast real-time scoring |
+| Overall risk ranking | **Composite score** | Weighted combination of all signals + anomaly counts |
+
+**Bottom line:** OLS is the primary model for RUL today. With 95 days of data, BayesianRidge per-vehicle fits have too few points to outperform OLS out-of-sample. Use BayesianRidge as a cross-check and for `low_r2` OLS vehicles. LightGBM is for operational monitoring (is this charging session normal?), not long-horizon RUL.
+
+---
+
+### Vehicle Fixed Effects — Current State and Gap
+
+**No model currently implements a vehicle fixed effect in the panel-regression sense.** Here is how each model handles vehicle heterogeneity:
+
+| Model | Vehicle handling | Fixed effect? |
+|---|---|---|
+| OLS | Fit per vehicle | Implicit — each vehicle gets its own intercept AND slope. Equivalent to a fully saturated FE model, but **no cross-vehicle learning** |
+| Dual-axis | Fit per vehicle | Same as OLS — SoH₀ is a per-vehicle intercept |
+| BayesianRidge | Fit per vehicle | Bayesian prior acts as partial pooling but not true shared-coefficient FE |
+| LightGBM | Fleet-wide pooled | **None** — no vehicle identity in features; assumes all vehicles exchangeable |
+
+**What a proper panel fixed effect would look like:**
+```
+ekf_soh_it = α_i + β₁·days_it + β₂·cum_efc_it + β₃·X_it + ε_it
+```
+where `α_i` is vehicle i's fixed intercept estimated jointly with shared slope coefficients `β` across the full fleet. This controls for the fact that some vehicles started with naturally lower SoH (MH18BZ3028 at 94.97% vs. MH18BZ3201 at 98.56%) and learns shared degradation dynamics from the full fleet simultaneously.
+
+**Why it matters:** Without fixed effects, the pooled LightGBM model cannot distinguish "this vehicle is degrading fast" from "this vehicle started lower." A FE model separates the level from the rate.
+
+**When to implement:** After 6+ months of data, when within-vehicle variation is large enough to reliably estimate `α_i`. A mixed-effects model (random slopes + fixed vehicle intercepts) would be the right architecture — it borrows strength across vehicles for the slope while allowing each vehicle its own baseline.
+
+---
+
+### Anomalous Vehicles — Summary
+
+**Tier 1 — Immediate attention (multiple signals converge):**
+
+| Vehicle | EKF SoH | OLS slope (%/day) | Composite | Combined anomalies | Primary signal |
+|---|---|---|---|---|---|
+| **MH18BZ3028** | 94.97% | −0.017 | 0.658 | 44 | Lowest SoH in fleet; 441 high-IR events; level-based anomaly |
+| **MH18BZ3392** | 97.40% | −0.062 | 0.565 | 31 | Steepest declining slope (2× fleet median); CUSUM alarm Feb-03 |
+| **MH18BZ3344** | 97.70% | −0.158 | 0.454 | 61 | Steepest slope in fleet (5× median); only 99 cycles — noisy but urgent to monitor |
+
+**Tier 2 — Monitor (EKF CUSUM firing, high anomaly count):**
+
+| Vehicle | EKF CUSUM alarms | BMS CUSUM alarms | Total anomalies | Note |
+|---|---|---|---|---|
+| MH18BZ3383 | **455** | 0 | 596 | EKF detects decline BMS misses entirely — primary EKF-only case |
+| MH18BZ3201 | **396** | 343 | 452 | Healthiest SoH (98.56%) but fastest degrading (−0.030/day); 622-day RUL |
+| MH18BZ3501 | 310 | 348 | 434 | Both channels firing; high energy/km (132 sessions) |
+| MH18BZ3374 | 198 | 340 | 476 | High energy/km; CUSUM first alarm Jan-24 |
+| MH18BZ3163 | 272 | 157 | 454 | Elevated IR; CUSUM first alarm Jan-25 |
+
+**Tier 3 — Elevated but operating-pattern driven (not degradation trend):**
+MH18BZ3386, MH18BZ2649, MH18BZ3038, MH18BZ3372, MH18BZ3368 — high cycle counts, normal SoH; alarms driven by energy-per-km or rapid-heating patterns rather than SoH decline.
+
+**Anomaly signal interpretation guide:**
+
+| Signal | What it detects | Example vehicle |
+|---|---|---|
+| EKF SoH level (IF feature) | Already degraded — current state is low | MH18BZ3028 (94.97%) |
+| EKF-SoH CUSUM | Sustained ongoing EKF decline within vehicle | MH18BZ3383, MH18BZ3201 |
+| `ekf_soh_delta` (IF feature) | Sudden one-session SoH drop | Any vehicle with abrupt event |
+| BMS-SoH CUSUM | BMS-visible integer SoH step-down | MH18BZ3386, MH18BZ3374 |
+| Composite score | Overall weighted risk rank | All vehicles |
 
