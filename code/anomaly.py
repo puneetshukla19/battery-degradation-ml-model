@@ -336,18 +336,16 @@ def run_cusum_signals(disc: pd.DataFrame) -> pd.DataFrame:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MODEL A — LightGBM Charging-SOH Regression (supervised)
+# MODEL A — LightGBM EKF-SoH Regression (supervised)
+# Y = ekf_soh  (physics-grounded, continuous, no SoH estimates in X)
+# All session types used (EKF rows cover discharge + charging + idle).
+# SoH estimates removed from X to eliminate circularity:
+#   removed: cycle_soh, capacity_soh_disc_new, capacity_soh_chg_new, soh_trend_slope
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Features for Model A (all must be present in cycles.csv after data_prep_1.py)
 LGBM_FEATURES = [
     # Aging clock
-    "cum_efc", "days_since_first", "aging_index",
-    # SoH signals (new)
-    "cycle_soh",                   # per-cycle SoH estimate (all session types)
-    "capacity_soh_disc_new",       # discharge-based capacity SoH (new method)
-    "capacity_soh_chg_new",        # charge-based capacity SoH (new method)
-    "soh_trend_slope",             # vehicle-level SoH trend slope
+    "cum_efc", "days_since_first_session", "aging_index",
     # IR signals
     "ir_ohm_mean", "ir_ohm_mean_ewm10", "ir_ohm_trend_slope",
     "ir_event_rate", "ir_event_trend_slope",
@@ -373,8 +371,8 @@ LGBM_FEATURES = [
     # Trip distance
     "odometer_km", "speed_mean",
     # Subsystem health
-    "weak_subsystem_consistency",   # 1 = same subsystem consistently weakest
-    "subsystem_voltage_std",        # inter-subsystem voltage spread
+    "weak_subsystem_consistency",
+    "subsystem_voltage_std",
     "n_cell_undervoltage", "n_cell_overvoltage", "n_cell_spread_warn",
     # Fault/alarm presence
     "ecu_fault_suspected",
@@ -384,14 +382,20 @@ LGBM_FEATURES = [
 
 def train_lgbm_soh(cycles: pd.DataFrame) -> pd.DataFrame | None:
     """
-    Model A: LightGBM regression to predict capacity_soh from stress features.
+    Model A: LightGBM regression to predict ekf_soh from physical stress features.
+
+    Y = ekf_soh (EKF state-estimated SoH — continuous, physics-grounded).
+    X = physical operating features only; all SoH estimates removed from X.
+    Sessions = all EKF rows (discharge + charging + idle); not restricted to
+               charging only since ekf_soh is defined at every session type
+               via the EKF state update.
 
     Training strategy: temporal split per vehicle — train on first 70% of each
-    vehicle's charging sessions (chronologically), test on last 30%.
+    vehicle's sessions (chronologically), test on last 30%.
 
     Returns DataFrame with columns: registration_number, session_id, start_time,
-    capacity_soh, lgbm_soh_pred, split (train/test).
-    Returns None if lightgbm not installed or insufficient data.
+    ekf_soh, lgbm_soh_pred, split (train/test).
+    Returns None if lightgbm not installed or EKF data unavailable.
     """
     try:
         from lightgbm import LGBMRegressor
@@ -399,24 +403,30 @@ def train_lgbm_soh(cycles: pd.DataFrame) -> pd.DataFrame | None:
         print("  [Model A] lightgbm not installed — skipping. pip install lightgbm")
         return None
 
-    # Charging sessions with high-confidence capacity_soh
-    target = "capacity_soh"
-    low_conf_col = "soh_low_confidence"
+    target = "ekf_soh"
 
-    mask = (
-        (cycles["session_type"] == "charging") &
-        (cycles[target].notna())
-    )
-    if low_conf_col in cycles.columns:
-        mask &= ~cycles[low_conf_col].fillna(False)
-    # Filter to sessions with sufficient SOC swing — small partial charges
-    # give unreliable Coulomb-counted capacity_soh (diagnostic finding: 99.95%
-    # of all charging sessions show exactly 100%, masking any real signal).
-    if "soc_range" in cycles.columns:
-        mask &= cycles["soc_range"].abs() >= MIN_SOC_RANGE_FOR_TREND
+    # Load EKF data and merge physical features from cycles
+    if not os.path.exists(EKF_CSV):
+        print("  [Model A] ekf_soh.csv not found — run ekf_soh.py first.")
+        return None
 
-    chg = cycles[mask].copy()
-    chg = chg.sort_values(["registration_number", "start_time"])
+    ekf = pd.read_csv(EKF_CSV).sort_values(["registration_number", "start_time"])
+    if target not in ekf.columns or ekf[target].notna().sum() < 50:
+        print(f"  [Model A] Insufficient {target} values in ekf_soh.csv.")
+        return None
+
+    # Merge physical features from cycles onto EKF rows
+    phys_cols = ["registration_number", "start_time", "session_type"] + [
+        f for f in LGBM_FEATURES if f not in ekf.columns
+    ]
+    phys = cycles[[c for c in phys_cols if c in cycles.columns]].copy()
+    ekf = ekf.merge(phys, on=["registration_number", "start_time"], how="left")
+
+    # Keep rows where ekf_soh is available
+    ekf = ekf[ekf[target].notna()].copy()
+    ekf = ekf.sort_values(["registration_number", "start_time"])
+
+    chg = ekf  # all session types
 
     feats = [f for f in LGBM_FEATURES if f in chg.columns]
     if len(feats) < 5:
@@ -502,7 +512,9 @@ def train_lgbm_soh(cycles: pd.DataFrame) -> pd.DataFrame | None:
         dir_total   += int(mask_nz.sum())
     dir_acc = dir_correct / dir_total * 100 if dir_total > 0 else np.nan
 
-    print(f"\n  [Model A] LightGBM SOH Regressor — Temporal Test Set:")
+    print(f"\n  [Model A] LightGBM EKF-SoH Regressor — Temporal Test Set:")
+    print(f"    Y = ekf_soh  |  X = physical features only (no SoH estimates)")
+    print(f"    Sessions: all EKF rows (discharge + charging + idle)")
     print(f"    Train sessions: {len(train_df):,}  |  Test sessions: {len(test_df):,}")
     print(f"    RMSE           : {rmse:.4f} %  (target < 1.5%)")
     print(f"    MAE            : {mae:.4f} %  (target < 1.0%)")
@@ -516,11 +528,12 @@ def train_lgbm_soh(cycles: pd.DataFrame) -> pd.DataFrame | None:
         print(f"      {feat:<35} {imp:>6.0f}")
 
     # Build output DataFrame
+    id_cols = [c for c in ["registration_number", "session_id", "start_time"] if c in train_df.columns]
     preds_train = model.predict(X_train)
-    out_train   = train_df[["registration_number", "session_id", "start_time", target]].copy()
+    out_train   = train_df[id_cols + [target]].copy()
     out_train["lgbm_soh_pred"] = preds_train
     out_train["split"]         = "train"
-    out_test    = test_df[["registration_number", "session_id", "start_time", target]].copy()
+    out_test    = test_df[id_cols + [target]].copy()
     out_test["lgbm_soh_pred"] = preds_test
     out_test["split"]         = "test"
 
