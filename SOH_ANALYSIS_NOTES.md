@@ -1019,6 +1019,54 @@ The OLS fit now works (58/66 reliable), but a 95-day trend projected over 600+ d
 |---|---|---|---|
 | OLS | `ekf_soh` | `days_since_first_session` | Simple linear degradation rate and days-to-EOL |
 | BayesianRidge | `ekf_soh` | 16 physical features (IR, spread, temp, stress, usage) | Physics-informed RUL with uncertainty; no SoH circularity |
+| Dual-axis | `ekf_soh` | `cum_efc/EFC_MAX`, `(days/365)×cal_rate`, `efc×days` | Separates cycle vs. calendar degradation path |
 | EFC RUL | `ekf_soh` | `cum_efc` | Cycle-throughput RUL path |
 | EKF | — | cycle_soh (quality-gated), bms_soh, IR, spread, temp | State estimation (produces `ekf_soh`) |
+
+---
+
+### Understanding the 3 RUL Models — Which One to Use
+
+The three models (OLS, Dual-axis, BayesianRidge) are **not a stacked ensemble** — they run independently and write separate columns to `rul_estimates.csv`. Each is a different lens on the same EKF SoH signal with different inputs and assumptions.
+
+#### Model Descriptions
+
+**1. OLS (Simple Linear Trend)**
+- Fits a straight line: `ekf_soh ~ days_since_first`
+- Gives: slope (%/day), R², and RUL = days until SoH hits 80%
+- Strength: simple, interpretable, works well even with limited data (58/66 reliable at 95 days)
+- Weakness: assumes purely linear calendar degradation; ignores how hard the vehicle was used
+
+**2. Dual-Axis (EFC + Calendar)**
+- Decomposes degradation into two physical paths: `SoH = SoH₀ - α·(efc/EFC_MAX) - β·(days/365)·cal_rate - γ·(efc×days)`
+- Gives: `dual_dominant_path` (cycle or calendar), `dual_rul_cal_days`, `dual_rul_efc_days`
+- Strength: physically grounded — a vehicle charging 3× per day degrades differently than one sitting idle
+- Weakness: with only 95 days of data, EFC and calendar terms are correlated; coefficient split is noisy
+
+**3. BayesianRidge (Physics-Informed)**
+- Fits: `ekf_soh ~ cum_efc + days + efc×days + IR + cell_spread + temp_rise_rate + vsag_rate + dod_stress + c_rate + thermal_stress + ...` (16 features)
+- Gives: `bayes_soh_pred` (point estimate), `bayes_soh_std` (uncertainty), `bayes_rul_days`
+- Strength: captures cross-vehicle variation due to operating conditions; provides calibrated uncertainty
+- Weakness: requires enough sessions with physical features merged; std is wide for data-sparse vehicles
+
+#### Which Model to Use for Each Question
+
+| Question | Use |
+|---|---|
+| "When will this vehicle hit 80% SoH?" | **OLS RUL** — most robust at 95 days |
+| "Is this vehicle cycling too hard vs. aging on the shelf?" | **Dual-axis** → `dual_dominant_path` |
+| "What operating factor is most predictive of faster degradation?" | **BayesianRidge** → inspect feature weights |
+| "How confident am I in the SoH prediction?" | **BayesianRidge** → `bayes_soh_std` |
+| "Overall fleet ranking for risk prioritisation?" | **Composite score** — synthesises all signals |
+
+**Recommended for dashboard / reporting:** use OLS RUL as the primary number, flag `dual_dominant_path` for intervention type, and show `bayes_soh_std` as a confidence band.
+
+#### Should the Models Be Stacked?
+
+Not yet. With 95 days of data, all three models are trained on the same short history per vehicle — stacking would overfit the narrow window. The right time to build a stacked ensemble is after **6+ months**, when:
+- OLS slopes have stabilised (more unique SoH values per vehicle)
+- Dual-axis EFC/calendar coefficients are separable
+- BayesianRidge has enough cross-vehicle variation to generalise
+
+At that point, a simple weighted average (e.g. 50% OLS + 30% BayesianRidge + 20% Dual-axis) would be a legitimate blended RUL output.
 
