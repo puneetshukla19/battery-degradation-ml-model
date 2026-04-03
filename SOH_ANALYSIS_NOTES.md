@@ -1070,3 +1070,43 @@ Not yet. With 95 days of data, all three models are trained on the same short hi
 
 At that point, a simple weighted average (e.g. 50% OLS + 30% BayesianRidge + 20% Dual-axis) would be a legitimate blended RUL output.
 
+---
+
+### The RUL Paradox — Why Healthy Vehicles Can Have Lower RUL
+
+**Observation:** MH18BZ3201 (healthiest fleet vehicle, EKF SoH=98.56%) has OLS RUL=622 days, while MH18BZ3028 (worst vehicle, EKF SoH=94.97%) has OLS RUL=903 days. This seems counterintuitive but is mathematically correct.
+
+**The formula:**
+```
+RUL = (current_soh - EOL_SOH) / |slope|
+```
+
+| Vehicle | EKF SoH | OLS slope (%/day) | Calculation | RUL |
+|---|---|---|---|---|
+| MH18BZ3028 (worst) | 94.97% | −0.0166 | (94.97 − 80) / 0.0166 | **903 days** |
+| MH18BZ3201 (best) | 98.56% | −0.0298 | (98.56 − 80) / 0.0298 | **622 days** |
+
+MH18BZ3201 is degrading nearly 2× faster than MH18BZ3028. Its high current SoH does not compensate for the steeper slope when projected to EOL.
+
+**The intuition:**
+- **MH18BZ3028** arrived at a low SoH early but is now degrading slowly — long runway remaining at its current rate, but already in a worse state today.
+- **MH18BZ3201** looks healthy today but is burning through SoH faster — it will close the gap within a year if the slope holds.
+
+**Why the composite score still ranks MH18BZ3028 as worse (0.658 vs 0.364):**
+The composite captures both dimensions simultaneously:
+- Current health deficit (EKF SoH distance from 100%) — MH18BZ3028 scores badly here
+- Rate-of-change signals (IR events, cell spread, vsag slope) — MH18BZ3028 has 441 high-IR events vs. 25 for MH18BZ3201
+
+The composite correctly signals: **MH18BZ3028 needs attention now** (already degraded, high IR stress). **MH18BZ3201 needs watching** (healthy today but degrading fast — investigate operating conditions).
+
+**Practical guide — which metric to use:**
+
+| Metric | Best for |
+|---|---|
+| **EKF SoH** (current value) | "Which vehicle is in trouble right now?" |
+| **OLS RUL** | "Which vehicle will hit EOL first?" |
+| **OLS slope** | "Which vehicle is degrading fastest?" |
+| **Composite score** | "Which vehicle needs overall attention?" |
+
+**Key rule:** Never use RUL alone as a health indicator on a young fleet. A vehicle can have short RUL and look perfectly healthy today (high SoH, steep slope), or long RUL and already be the most degraded vehicle in the fleet (low SoH, shallow slope). Always read RUL alongside current EKF SoH and the composite score.
+
