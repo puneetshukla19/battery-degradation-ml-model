@@ -26,7 +26,7 @@ import pandas as pd
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error
-from config import CYCLES_CSV, ARTIFACTS_DIR, SEED, SCALAR_FEATURES, MIN_SOC_RANGE_FOR_TREND
+from config import CYCLES_CSV, ARTIFACTS_DIR, SEED, SCALAR_FEATURES, MIN_SOC_RANGE_FOR_TREND, EKF_CSV
 import os
 
 ANOMALY_FILE   = os.path.join(ARTIFACTS_DIR, "anomaly_scores.csv")
@@ -43,6 +43,18 @@ IF_FEATURE_DIRECTION = {
     "cycle_soh":                "low",
     "capacity_soh_disc_new":    "low",
     "soh":                      "low",
+    # EKF-derived health signals
+    "ekf_soh":                  "low",   # low EKF SoH = degraded state
+    "ekf_soh_delta":            "low",   # negative delta = sudden drop this session
+    "capacity_ah_new":          "low",   # low measured capacity = degradation
+    # Aging / usage context
+    "cum_efc":                  "high",  # high cycle count = aged battery
+    "days_since_first_session": "high",  # old vehicle = more calendar aging
+    "thermal_stress":           "high",  # composite thermal aging proxy
+    "dod_stress":               "high",  # deep discharge stress
+    "total_alerts":             "high",  # BMS alert count
+    "aging_index":              "high",  # combined aging stress metric
+    # Existing signals
     "ir_ohm_mean":              "high",
     "ir_event_rate":            "high",
     "cell_spread_mean":         "high",
@@ -75,35 +87,43 @@ IF_FEATURES = [
     "voltage_mean", "voltage_min",
     "cell_spread_mean", "cell_spread_max",
     "temp_max", "temp_mean", "temp_rise_rate", "temp_lowest_mean",
-    "capacity_ah", "capacity_ah_discharge", "duration_hr",
+    "capacity_ah", "capacity_ah_discharge", "capacity_ah_new", "duration_hr",
     # SoC / SoH
     "soc_range", "soc_diff",        # soc_diff negative for discharge; deep discharge = more negative
-    "soh",                          # BMS SoH (capacity_soh removed: Coulomb counting captures only 38%
-                                    # of actual discharge energy, making it systematically 60-95% too low)
+    "soh",                          # BMS SoH (integer-stepped; kept for continuity)
     "cycle_soh",                    # per-cycle computed SoH (new column from data_prep)
     "capacity_soh_disc_new",        # discharge-side capacity SoH (new method)
+    # EKF-derived health signals (primary physics-grounded SoH)
+    "ekf_soh",                      # EKF state-estimated SoH (continuous, physics-grounded)
+    "ekf_soh_delta",                # session-to-session EKF SoH change — sudden drops are anomalous
+                                    # even when overall ekf_soh is still high
     # Health flag counts
-    # n_vsag: single consolidated voltage-sag count (data_prep_1.py consolidates
-    # the three severity buckets into one flag per row; see compute_voltage_sag)
     "n_vsag",
     "n_high_ir", "n_low_soc",
     # Internal resistance
     "ir_ohm_mean", "ir_event_rate",
     # Efficiency & thermal
     "energy_per_km", "energy_per_loaded_session",
+    "thermal_stress",               # composite thermal aging proxy
     # Current characteristics
     "current_mean_discharge", "current_max",
-    # Degradation rate-of-change (discharge-to-discharge delta; NaN for other session types)
-    # d_vsag_per_cycle and d_n_high_ir now correctly compare consecutive discharge sessions only
+    # Stress & aging context
+    "dod_stress",                   # depth-of-discharge stress proxy
+    "cum_efc",                      # cumulative equivalent full cycles (aging clock)
+    "days_since_first_session",     # calendar age (aging clock)
+    "aging_index",                  # combined aging stress metric
+    # Alerts
+    "total_alerts",                 # BMS alert count this session
+    # Degradation rate-of-change (discharge-to-discharge delta)
     "d_vsag_per_cycle", "d_n_high_ir", "d_ir_ohm_per_cycle",
     # Trip context
     "odometer_km", "speed_mean",
     # Session context
     "insulation_mean",              # low insulation = safety concern
-    "time_delta_hr",                # unusually long gap before session = abnormal operating pattern
+    "time_delta_hr",                # unusually long gap before session
     # Subsystem health
-    "weak_subsystem_consistency",   # 1 = same subsystem always weakest = accelerating imbalance
-    "subsystem_voltage_std",        # spread across subsystems; high = one hot/weak subsystem dominates
+    "weak_subsystem_consistency",
+    "subsystem_voltage_std",
     "n_cell_undervoltage", "n_cell_overvoltage", "n_cell_spread_warn",
 ]
 
@@ -186,6 +206,7 @@ def _build_cusum_reason(disc: pd.DataFrame) -> pd.Series:
     """
     channel_labels = {
         "cusum_soh_alarm":          "BMS-SoH-decline",
+        "cusum_ekf_soh_alarm":      "EKF-SoH-decline",
         "cusum_cycle_soh_alarm":    "CycleSoH-decline",
         "cusum_epk_alarm":          "EnergyPerKm-rise",
         "cusum_heat_alarm":         "TempRise-increase",
@@ -255,11 +276,19 @@ def run_cusum_signals(disc: pd.DataFrame) -> pd.DataFrame:
         .transform(lambda s: s.rolling(5, center=True, min_periods=1).median())
     )
 
-    cusum_soh, cusum_epk, cusum_heat, cusum_spread, cusum_cycle_soh = [], [], [], [], []
+    cusum_soh, cusum_epk, cusum_heat, cusum_spread, cusum_cycle_soh, cusum_ekf = [], [], [], [], [], []
 
     for reg, veh in disc.groupby("registration_number"):
-        # SoH — downward shift is bad
+        # BMS SoH (rolling median) — downward shift is bad
         cusum_soh.append(cusum_per_vehicle(veh["soh_smooth"]))
+
+        # EKF SoH — downward shift is bad; forward-filled from charging sessions
+        # Detects sustained EKF SoH decline within a vehicle even when current value is high
+        if "ekf_soh" in veh.columns and veh["ekf_soh"].notna().sum() >= 4:
+            esoh = veh["ekf_soh"].ffill().fillna(veh["ekf_soh"].median())
+            cusum_ekf.append(cusum_per_vehicle(esoh))
+        else:
+            cusum_ekf.append(pd.Series(False, index=veh.index))
 
         # Energy-per-km — upward shift is bad (negate)
         if "energy_per_km" in veh.columns:
@@ -282,7 +311,7 @@ def run_cusum_signals(disc: pd.DataFrame) -> pd.DataFrame:
         else:
             cusum_spread.append(pd.Series(False, index=veh.index))
 
-        # cycle_soh — downward shift is bad (same polarity as soh_smooth)
+        # cycle_soh — downward shift is bad
         if "cycle_soh" in veh.columns:
             csoh = veh["cycle_soh"].fillna(veh["cycle_soh"].median())
             cusum_cycle_soh.append(cusum_per_vehicle(csoh))
@@ -290,12 +319,14 @@ def run_cusum_signals(disc: pd.DataFrame) -> pd.DataFrame:
             cusum_cycle_soh.append(pd.Series(False, index=veh.index))
 
     disc["cusum_soh_alarm"]        = pd.concat(cusum_soh).reindex(disc.index).fillna(False)
+    disc["cusum_ekf_soh_alarm"]    = pd.concat(cusum_ekf).reindex(disc.index).fillna(False)
     disc["cusum_epk_alarm"]        = pd.concat(cusum_epk).reindex(disc.index).fillna(False)
     disc["cusum_heat_alarm"]       = pd.concat(cusum_heat).reindex(disc.index).fillna(False)
     disc["cusum_spread_alarm"]     = pd.concat(cusum_spread).reindex(disc.index).fillna(False)
     disc["cusum_cycle_soh_alarm"]  = pd.concat(cusum_cycle_soh).reindex(disc.index).fillna(False)
     disc["cusum_alarm"] = (
         disc["cusum_soh_alarm"]       |
+        disc["cusum_ekf_soh_alarm"]   |
         disc["cusum_epk_alarm"]       |
         disc["cusum_heat_alarm"]      |
         disc["cusum_spread_alarm"]    |
@@ -580,11 +611,17 @@ def run_umap_hdbscan(cycles: pd.DataFrame) -> pd.DataFrame | None:
     df["cluster_label"] = labels
 
     # Identify the dominant "healthy" cluster as the one with the highest
-    # mean capacity_soh (or largest cluster if capacity_soh not available)
-    if "capacity_soh" in df.columns and df["capacity_soh"].notna().any():
+    # mean EKF SoH (preferred: continuous, physics-grounded).
+    # Falls back to capacity_soh, then largest cluster.
+    health_col = None
+    for candidate in ("ekf_soh", "capacity_soh"):
+        if candidate in df.columns and df[candidate].notna().any():
+            health_col = candidate
+            break
+    if health_col is not None:
         cluster_soh = (
             df[df["cluster_label"] >= 0]
-            .groupby("cluster_label")["capacity_soh"].mean()
+            .groupby("cluster_label")[health_col].mean()
         )
         healthy_cluster = int(cluster_soh.idxmax()) if len(cluster_soh) else 0
     else:
@@ -617,12 +654,13 @@ def run_umap_hdbscan(cycles: pd.DataFrame) -> pd.DataFrame | None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 COMPOSITE_WEIGHTS_CUSUM = {
-    "soh_smooth":             0.25,
-    "cycle_soh":              0.10,  # per-cycle SoH — downward shift = degradation
-    "ir_ohm_mean_ewm10":      0.20,
-    "cell_spread_mean_ewm10": 0.18,
-    "vsag_rate_per_hr_ewm10": 0.13,
-    "temp_rise_rate_ewm10":   0.14,
+    "ekf_soh":                0.30,  # primary: EKF physics-grounded SoH (replaces soh_smooth)
+                                     # forward-filled from charging sessions into discharge sessions
+    "cycle_soh":              0.05,  # per-cycle SoH — supplementary signal
+    "ir_ohm_mean_ewm10":      0.22,  # rising IR = primary degradation indicator
+    "cell_spread_mean_ewm10": 0.18,  # rising spread = growing cell imbalance
+    "vsag_rate_per_hr_ewm10": 0.13,  # rising vsag rate = capacity loss
+    "temp_rise_rate_ewm10":   0.12,  # rising thermal = thermal degradation
 }
 
 
@@ -634,7 +672,7 @@ def compute_composite_score(disc: pd.DataFrame) -> pd.Series:
     """
     score = pd.Series(0.0, index=disc.index)
     # Signals where lower = worse (invert so high normalised score = worse)
-    INVERT_COLS = {"soh_smooth", "cycle_soh"}
+    INVERT_COLS = {"soh_smooth", "cycle_soh", "ekf_soh"}
     for col, w in COMPOSITE_WEIGHTS_CUSUM.items():
         if col not in disc.columns:
             continue
@@ -707,6 +745,46 @@ if __name__ == "__main__":
     print(f"Discharge cycles loaded: {len(disc):,} across "
           f"{disc['registration_number'].nunique()} vehicles")
 
+    # ── Merge EKF SoH into discharge sessions ─────────────────────────────────
+    # EKF is updated at charging sessions; discharge sessions have no direct EKF
+    # row. Strategy: merge EKF onto the full session timeline (all session types),
+    # forward-fill per vehicle across all session types, then pull values into disc
+    # by start_time. This ensures each discharge session inherits the most recent
+    # post-charge EKF SoH estimate.
+    # ekf_soh_delta = session-to-session EKF change — sudden drops flag anomalous
+    # sessions even when overall ekf_soh is still high (e.g. 97% fleet average).
+    if os.path.exists(EKF_CSV):
+        ekf_raw = (
+            pd.read_csv(EKF_CSV)
+            [["registration_number", "start_time", "ekf_soh"]]
+            .drop_duplicates(subset=["registration_number", "start_time"])
+        )
+        # Build full session timeline for forward-fill
+        all_sess = (
+            cycles[["registration_number", "start_time"]]
+            .drop_duplicates()
+            .sort_values(["registration_number", "start_time"])
+            .merge(ekf_raw, on=["registration_number", "start_time"], how="left")
+        )
+        all_sess["ekf_soh_ffill"] = (
+            all_sess.groupby("registration_number")["ekf_soh"].ffill()
+        )
+        all_sess["ekf_soh_delta"] = (
+            all_sess.groupby("registration_number")["ekf_soh_ffill"].diff()
+        )
+        ekf_filled = all_sess[["registration_number", "start_time",
+                                "ekf_soh_ffill", "ekf_soh_delta"]]
+        disc = disc.merge(ekf_filled, on=["registration_number", "start_time"], how="left")
+        disc.rename(columns={"ekf_soh_ffill": "ekf_soh"}, inplace=True)
+        n_ekf = disc["ekf_soh"].notna().sum()
+        print(f"EKF SoH merged: {n_ekf:,}/{len(disc):,} discharge sessions "
+              f"({n_ekf/len(disc):.1%}) — Y=ekf_soh active in IF + CUSUM")
+    else:
+        disc["ekf_soh"]       = np.nan
+        disc["ekf_soh_delta"] = np.nan
+        print("WARNING: ekf_soh.csv not found — run ekf_soh.py first. "
+              "Proceeding without EKF features.")
+
     # ── Isolation Forest ──────────────────────────────────────────────────────
     print("\nFitting Isolation Forest ...")
     disc["if_score"], disc["if_reason"] = isolation_forest_scores(disc)
@@ -760,6 +838,7 @@ if __name__ == "__main__":
         cycles             = ("if_score",              "count"),
         if_anomalies       = ("if_anomaly",             "sum"),
         cusum_soh          = ("cusum_soh_alarm",        "sum"),
+        cusum_ekf_soh      = ("cusum_ekf_soh_alarm",    "sum"),
         cusum_energy       = ("cusum_epk_alarm",        "sum"),
         cusum_heating      = ("cusum_heat_alarm",       "sum"),
         cusum_spread       = ("cusum_spread_alarm",     "sum"),
@@ -781,12 +860,14 @@ if __name__ == "__main__":
         vdf        = disc[(disc["registration_number"] == v) & disc["cusum_alarm"]]
         first_date = pd.to_datetime(vdf["start_time"].min(), unit="ms").date()
         soh_f       = disc[(disc["registration_number"] == v) & disc["cusum_soh_alarm"]].shape[0]
+        ekf_f       = disc[(disc["registration_number"] == v) & disc["cusum_ekf_soh_alarm"]].shape[0]
         epk_f       = disc[(disc["registration_number"] == v) & disc["cusum_epk_alarm"]].shape[0]
         heat_f      = disc[(disc["registration_number"] == v) & disc["cusum_heat_alarm"]].shape[0]
         spread_f    = disc[(disc["registration_number"] == v) & disc["cusum_spread_alarm"]].shape[0]
         csoh_f      = disc[(disc["registration_number"] == v) & disc["cusum_cycle_soh_alarm"]].shape[0]
         print(f"  {v}: first alarm {first_date} | "
-              f"SoH={soh_f}  CycleSoH={csoh_f}  Energy={epk_f}  Heating={heat_f}  Spread={spread_f} cycles flagged")
+              f"BMS-SoH={soh_f}  EKF-SoH={ekf_f}  CycleSoH={csoh_f}  "
+              f"Energy={epk_f}  Heating={heat_f}  Spread={spread_f} cycles flagged")
 
     # ── Fleet-flag summary (from data_prep flags already in cycles.csv) ────────
     print("\n" + "=" * 75)
