@@ -864,3 +864,161 @@ This confirms the EKF now produces a physically meaningful, monotonically declin
 - **RUL estimates** (median 1,280 days / ~3.5 years) are consistent with a 95-day-old fleet far from EOL@80%. These will sharpen significantly after 6+ months of data.
 - **For supervised model training** (LightGBM SoH regression): `ekf_soh` is now a reliable feature — it differentiates vehicles by real operating patterns rather than Coulomb-count noise artefacts.
 
+---
+
+## Session 2026-04-03 — Y = EKF SoH; Physical-Only Features in BayesianRidge
+
+### Motivation
+
+In the previous session, `soh_rul.py` used:
+- **OLS Y** = `soh_smooth` (BMS SoH, integer-stepped, 54/66 vehicles had ≤ 2 unique values) — slope effectively noise
+- **BayesianRidge Y** = `bms_soh`; **X** included `cycle_soh` — both are SoH estimates, creating philosophical circularity
+
+With EKF SoH now validated as continuous (94.97–98.56%, std=0.47%, monotonically declining), it is the correct target for all degradation models.
+
+---
+
+### Changes to `code/soh_rul.py`
+
+#### Change 1 — Early EKF load with charging-feature join
+
+EKF data is loaded once at the top of the vehicle loop and enriched with physical features from charging sessions:
+
+```python
+ekf_full = pd.read_csv(EKF_CSV).sort_values(["registration_number", "days_since_first_session"])
+chg_feats = cycles[cycles["session_type"] == "charging"][[
+    "registration_number", "start_time",
+    "ir_ohm_mean", "cell_spread_mean", "temp_rise_rate",
+    "ir_ohm_mean_ewm10", "cell_spread_mean_ewm10",
+    "vsag_rate_per_hr", "dod_stress", "c_rate_chg", "thermal_stress",
+    "weak_subsystem_consistency", "subsystem_voltage_std",
+]].copy()
+ekf_full = ekf_full.merge(chg_feats, on=["registration_number", "start_time"], how="left")
+```
+
+This eliminates the duplicate EKF CSV read that previously occurred in the composite score section.
+
+#### Change 2 — OLS Y = EKF SoH (replaces BMS SoH)
+
+Per vehicle, if `ekf_full` has ≥ `MIN_CYCLES_FOR_FIT` rows:
+- `ekf_days_arr` and `ekf_soh_arr` are extracted from `ekf_full`
+- `fit_degradation()` is called on the continuous EKF signal
+- The `MIN_UNIQUE_SOH_FOR_OLS` gate (previously needed for integer BMS SoH) is no longer required
+- BMS SoH (`soh_smooth`) remains as a fallback only for vehicles with no EKF data
+
+#### Change 3 — BayesianRidge Y = EKF SoH, X = physical features only
+
+**Y:** `ekf_soh` (continuous, physics-grounded)
+
+**X features (16 total):**
+| Feature | Description |
+|---|---|
+| `cum_efc` | Cumulative equivalent full cycles |
+| `days_since_first` | Calendar age (days) |
+| `cum_efc × days_since_first` | Interaction: cycle + calendar stress |
+| `ir_ohm_mean` | Internal resistance (Ohm) — primary aging indicator |
+| `cell_spread_mean` | Max − min cell voltage (V) — imbalance indicator |
+| `temp_rise_rate` | Temperature rise during charge (°C/hr) |
+| `ir_ohm_mean_ewm10` | EWM-smoothed IR (span=10) |
+| `cell_spread_mean_ewm10` | EWM-smoothed cell spread |
+| `vsag_rate_per_hr` | Voltage sag events per hour |
+| `dod_stress` | Depth-of-discharge stress proxy |
+| `c_rate_chg` | Charge C-rate |
+| `thermal_stress` | Composite thermal aging proxy |
+| `weak_subsystem_consistency` | Cross-subsystem health consistency flag |
+| `subsystem_voltage_std` | Subsystem voltage standard deviation |
+| `current_mean_discharge` | Mean discharge current (A) |
+| `is_loaded` | Vehicle loading flag |
+
+**Removed from X:** `cycle_soh`, `soh`, `bms_soh`, `capacity_soh*` — all are SoH estimates that would be circular predictors of an SoH target.
+
+#### Change 4 — EFC-based RUL uses EKF SoH vs. cum_efc
+
+Previously used BMS `soh_smooth` vs. `cum_efc`. Now uses `veh_ekf["ekf_soh"]` and `veh_ekf["cum_efc"]` — consistent with the OLS and BayesianRidge target.
+
+---
+
+### Results
+
+#### OLS Trend Reliability
+
+| Metric | Before (Y=BMS SoH) | After (Y=EKF SoH) |
+|---|---|---|
+| `reliable` (R² ≥ 0.4) | ~3/66 | **58/66** |
+| `low_r2` | ~3/66 | **8/66** |
+| `insufficient_data` | **60/66** | **0/66** |
+| Fleet mean degradation | meaningless | **−0.030 %SoH/day** |
+| Fleet mean OLS RUL | meaningless | **591 days (~1.6 years)** |
+
+Switching to EKF SoH reduced `insufficient_data` from 91% to 0%. The continuous EKF signal gives OLS a real trend to fit.
+
+#### BayesianRidge Predictions
+
+- `bayes_soh_pred` produced for **~50 vehicles** (requires ≥ 5 EKF rows with physical features available after merge)
+- Prediction std: typically **0.06–0.33%** — tight for data-rich vehicles, wider for sparse/charging-pattern-limited ones
+- Predictions closely track EKF SoH (within ~0.2% for most vehicles)
+
+#### Fleet Degradation Ranking (top 10 worst, by composite score)
+
+| Rank | Vehicle | EKF SoH | OLS slope (%/day) | OLS RUL (days) | Composite |
+|---|---|---|---|---|---|
+| 1 | MH18BZ3028 | 94.97% | −0.0166 | 903 | 0.658 |
+| 2 | MH18BZ3392 | 97.40% | −0.0622 | 280 | 0.565 |
+| 3 | MH18BZ3341 | 97.35% | −0.0288 | 602 | 0.514 |
+| 4 | MH18BZ2648 | 96.75% | −0.0110 | 1529 | 0.479 |
+| 5 | MH18BZ2689 | 96.81% | −0.0152 | 1103 | 0.473 |
+| 6 | MH18BZ3198 | 97.18% | −0.0441 | 390 | 0.472 |
+| 7 | MH18BZ2958 | 97.05% | −0.0203 | 842 | 0.464 |
+| 8 | MH18BZ3344 | 97.70% | −0.1579 | 112 | 0.454 |
+| 9 | MH18BZ2647 | 97.01% | −0.0100 | 1698 | 0.452 |
+| 10 | MH18BZ2871 | 97.30% | −0.0184 | 941 | 0.444 |
+
+**Healthiest vehicles:**
+
+| Vehicle | EKF SoH | OLS RUL (days) | Composite |
+|---|---|---|---|
+| MH18BZ3201 | 98.56% | 622 | 0.364 |
+| MH18BZ3372 | 98.17% | 726 | 0.365 |
+| MH18BZ3382 | 98.11% | N/A (low_r2) | 0.364 |
+
+---
+
+### Business Interpretation
+
+**1. Fleet health is good — but differentiated**
+
+EKF SoH ranges 94.97–98.56% across 66 vehicles. At the fleet mean degradation rate of −0.030%/day, the average vehicle reaches EOL (80% SoH) in roughly **591 days (~1.6 years from now)**. In calendar terms, given the fleet is ~95 days old, total expected pack life is ~700 days (~2 years), consistent with typical urban EV fleet duty cycles.
+
+**2. MH18BZ3028 is the only vehicle requiring near-term attention**
+
+- EKF SoH = **94.97%** — 3.6 percentage points below fleet median
+- 441 high-IR events (highest in fleet) — indicates elevated internal resistance, possibly a weak cell group
+- OLS RUL = 903 days, but the EKF SoH is already the lowest measured; recommend physical cell balance check
+- BayesianRidge predicts 95.37% — broadly consistent with EKF, confirming degradation is not a modelling artefact
+
+**3. MH18BZ3344 has the most urgent near-term RUL signal**
+
+- OLS slope = −0.158 %/day (steepest in fleet by 3×)
+- OLS RUL = **112 days** if slope holds
+- However: only 99 cycles, short data span — slope is likely noisy. Flag for monitoring; re-evaluate after next 60 days.
+
+**4. The EFC vs. calendar split explains which vehicles need what intervention**
+
+- Vehicles whose `dual_dominant_path = "cycle"` are degrading primarily due to charge/discharge throughput — reduce charge C-rate or avoid deep DoD
+- Vehicles whose `dual_dominant_path = "calendar"` are degrading primarily from time/temperature — prioritise thermal management and parking SOC management
+
+**5. RUL estimates at 95 days are directional, not precise**
+
+The OLS fit now works (58/66 reliable), but a 95-day trend projected over 600+ days carries wide confidence intervals. The composite score and anomaly flags are more actionable at this stage than the absolute RUL number. Plan to rerun after 6 months for production-grade RUL.
+
+---
+
+### Model Summary Table
+
+| Model | Y | X | Purpose |
+|---|---|---|---|
+| OLS | `ekf_soh` | `days_since_first_session` | Simple linear degradation rate and days-to-EOL |
+| BayesianRidge | `ekf_soh` | 16 physical features (IR, spread, temp, stress, usage) | Physics-informed RUL with uncertainty; no SoH circularity |
+| EFC RUL | `ekf_soh` | `cum_efc` | Cycle-throughput RUL path |
+| EKF | — | cycle_soh (quality-gated), bms_soh, IR, spread, temp | State estimation (produces `ekf_soh`) |
+

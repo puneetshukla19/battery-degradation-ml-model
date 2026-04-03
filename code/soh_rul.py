@@ -236,6 +236,29 @@ def bayesian_rul_vehicle(efc: np.ndarray, days: np.ndarray,
 
 if __name__ == "__main__":
     cycles = pd.read_csv(CYCLES_CSV)
+
+    # ── Load EKF output early — used as Y for OLS + BayesianRidge ────────────
+    # EKF SoH is continuous (not integer-quantised), physics-grounded, and fuses
+    # all available signals. Using it as Y gives the BayesianRidge a meaningful
+    # target with real inter-vehicle variance, unlike integer BMS SoH.
+    ekf_full = pd.DataFrame()
+    if os.path.exists(EKF_CSV):
+        ekf_full = pd.read_csv(EKF_CSV).sort_values(
+            ["registration_number", "days_since_first_session"]
+        )
+        # Join physical session features onto EKF rows (for BayesianRidge X)
+        chg_feats = cycles[cycles["session_type"] == "charging"][[
+            "registration_number", "start_time",
+            "ir_ohm_mean", "cell_spread_mean", "temp_rise_rate",
+            "ir_ohm_mean_ewm10", "cell_spread_mean_ewm10",
+            "vsag_rate_per_hr", "dod_stress", "c_rate_chg", "thermal_stress",
+            "weak_subsystem_consistency", "subsystem_voltage_std",
+        ]].copy()
+        ekf_full = ekf_full.merge(chg_feats, on=["registration_number", "start_time"], how="left")
+        print(f"EKF data loaded: {len(ekf_full):,} sessions, "
+              f"{ekf_full['registration_number'].nunique()} vehicles — Y=ekf_soh")
+    has_ekf_data = not ekf_full.empty
+
     disc   = cycles[
         (cycles["session_type"] == "discharge") & (cycles["current_mean"] > 0)
     ].copy()
@@ -333,52 +356,74 @@ if __name__ == "__main__":
         else:
             veh_fit = veh
 
-        days        = veh_fit["date_days"].values  # filtered — used for SoH OLS only
         days_full   = veh["date_days"].values       # full set — used for secondary signals
-        soh_series  = veh_fit["soh_for_fit"].values
-        current_soh = float(veh["soh_for_fit"].iloc[-1])   # always use latest
         first_date  = veh["date"].iloc[0].date()
         last_date   = veh["date"].iloc[-1].date()
 
-        # ── Reliability gate: skip OLS when BMS SoH has < MIN_UNIQUE values ──
-        # With integer-quantised BMS SoH and only a few weeks of data, OLS
-        # fits noise rather than real degradation. Use fleet-average physical
-        # rate as a conservative placeholder until enough variance accumulates.
-        n_unique_soh = int(np.unique(soh_series).size)
-        use_fleet_avg_ols = (n_unique_soh < MIN_UNIQUE_SOH_FOR_OLS)
+        # ── OLS trend: use EKF SoH (continuous) when available ───────────────
+        # EKF SoH has real inter-vehicle variance and is not integer-quantised,
+        # so per-vehicle OLS slopes are meaningful. BMS SoH fallback kept when
+        # EKF is unavailable.
+        veh_ekf = (ekf_full[ekf_full["registration_number"] == reg]
+                   .sort_values("days_since_first_session")
+                   if has_ekf_data else pd.DataFrame())
 
-        if use_fleet_avg_ols:
-            # Will be filled from fleet_mean_soh_slope after the loop
-            soh_fit      = {"slope": None, "r2": None, "p_value": None}
-            rul_point    = None
-            rul_lo       = None
-            rul_hi       = None
-            rul_reliability = "insufficient_data"
-        else:
-            # SoH trend
-            soh_fit = fit_degradation(days, soh_series)
+        if has_ekf_data and len(veh_ekf) >= MIN_CYCLES_FOR_FIT:
+            # Primary: OLS on EKF SoH vs. days (charging sessions)
+            ekf_days_arr = veh_ekf["days_since_first_session"].values
+            ekf_soh_arr  = veh_ekf["ekf_soh"].values
+            current_soh  = float(ekf_soh_arr[-1])
+            soh_fit      = fit_degradation(ekf_days_arr, ekf_soh_arr)
             fleet_soh_slopes.append(soh_fit["slope"])
             rul_point      = rul_from_fit(current_soh, soh_fit["slope"])
-            rul_lo, rul_hi = bootstrap_rul(days, soh_series, current_soh)
-            # R² reliability gate
-            if soh_fit["r2"] < OLS_R2_THRESHOLD:
-                rul_reliability = "low_r2"
+            rul_lo, rul_hi = bootstrap_rul(ekf_days_arr, ekf_soh_arr, current_soh)
+            n_unique_soh   = int(np.unique(ekf_soh_arr).size)
+            rul_reliability = ("reliable" if soh_fit["r2"] >= OLS_R2_THRESHOLD
+                               else "low_r2")
+            use_fleet_avg_ols = False
+        else:
+            # Fallback: BMS SoH (integer-quantised) — reliability gate unchanged
+            veh_fit      = (veh[veh["soc_range"].abs() >= MIN_SOC_RANGE_FOR_TREND]
+                            if "soc_range" in veh.columns else veh)
+            if len(veh_fit) < MIN_CYCLES_FOR_FIT:
+                veh_fit = veh
+            days         = veh_fit["date_days"].values
+            soh_series   = veh_fit["soh_for_fit"].values
+            current_soh  = float(veh["soh_for_fit"].iloc[-1])
+            n_unique_soh = int(np.unique(soh_series).size)
+            use_fleet_avg_ols = (n_unique_soh < MIN_UNIQUE_SOH_FOR_OLS)
+            if use_fleet_avg_ols:
+                soh_fit      = {"slope": None, "r2": None}
+                rul_point    = rul_lo = rul_hi = None
+                rul_reliability = "insufficient_data"
             else:
-                rul_reliability = "reliable"
+                soh_fit        = fit_degradation(days, soh_series)
+                fleet_soh_slopes.append(soh_fit["slope"])
+                rul_point      = rul_from_fit(current_soh, soh_fit["slope"])
+                rul_lo, rul_hi = bootstrap_rul(days, soh_series, current_soh)
+                rul_reliability = ("reliable" if soh_fit["r2"] >= OLS_R2_THRESHOLD
+                                   else "low_r2")
 
-        # EFC-based RUL
-        veh_disc     = disc[disc["registration_number"] == reg].sort_values("start_time")
-        efc_cum      = veh_disc["efc_cumulative"].values
-        soh_efc_vals = veh_disc["soh_smooth"].values
-        efc_total    = float(efc_cum[-1]) if len(efc_cum) else np.nan
+        # EFC-based RUL — use EKF SoH vs. cum_efc when available (continuous Y)
+        if has_ekf_data and len(veh_ekf) >= MIN_CYCLES_FOR_FIT:
+            efc_cum      = veh_ekf["cum_efc"].values
+            soh_efc_vals = veh_ekf["ekf_soh"].values
+            efc_total    = float(efc_cum[-1]) if len(efc_cum) else np.nan
+            days_span    = float(veh_ekf["days_since_first_session"].iloc[-1]) if len(veh_ekf) else np.nan
+        else:
+            veh_disc     = disc[disc["registration_number"] == reg].sort_values("start_time")
+            efc_cum      = veh_disc["efc_cumulative"].values
+            soh_efc_vals = veh_disc["soh_smooth"].values
+            efc_total    = float(efc_cum[-1]) if len(efc_cum) else np.nan
+            days_span    = float(
+                (veh_disc["start_time"].max() - veh_disc["start_time"].min()) / 86_400_000
+            )
 
         efc_fit        = fit_degradation(efc_cum, soh_efc_vals)
         rul_efc        = rul_from_fit(current_soh, efc_fit["slope"])
 
-        days_span = float(
-            (veh_disc["start_time"].max() - veh_disc["start_time"].min()) / 86_400_000
-        )
-        avg_efc_per_day = (efc_total / days_span) if days_span > 0 else np.nan
+        avg_efc_per_day = (efc_total / days_span) if (
+            np.isfinite(days_span) and days_span > 0) else np.nan
         rul_days_efc    = (rul_efc / avg_efc_per_day
                            if (np.isfinite(rul_efc) and np.isfinite(avg_efc_per_day) and avg_efc_per_day > 0)
                            else np.inf)
@@ -408,18 +453,44 @@ if __name__ == "__main__":
                     "dual_dominant_path":  ("calendar" if dual_rul["rul_cal_days"] <= dual_rul["rul_efc_days"]
                                             else "cycle"),
                 }
-                # Build extra features for BayesianRidge: cycle_soh, ir_ohm_mean,
-                # cell_spread_mean, temp_rise_rate (where available)
-                extra_cols = ["cycle_soh", "ir_ohm_mean", "cell_spread_mean", "temp_rise_rate",
-                              "ir_ohm_mean_ewm10", "cell_spread_mean_ewm10",
-                              "vsag_rate_per_hr", "dod_stress", "c_rate_chg", "thermal_stress",
-                              "weak_subsystem_consistency", "subsystem_voltage_std",
-                              "current_mean_discharge", "is_loaded"]
-                avail_extra = [c for c in extra_cols if c in veh_chg.columns]
-                extra_arr = veh_chg[avail_extra].values if avail_extra else None
-                bayes_row = bayesian_rul_vehicle(chg_efc, chg_days, chg_cap,
-                                                 daily_efc_rate=avg_efc_per_day,
-                                                 extra_features=extra_arr)
+                # ── BayesianRidge: Y = EKF SoH, X = physical signals only ───
+                # EKF SoH is continuous and physics-grounded.
+                # cycle_soh and bms_soh REMOVED from X: they are SoH estimates
+                # — using them as features when Y is also SoH is circular.
+                # X retains only causal/operating features that drive aging.
+                if has_ekf_data and len(veh_ekf) >= 5:
+                    bayes_efc  = veh_ekf["cum_efc"].values
+                    bayes_days = veh_ekf["days_since_first_session"].values
+                    bayes_y    = veh_ekf["ekf_soh"].values
+                    # Extra features already joined onto ekf_full (no SoH columns)
+                    extra_cols_ekf = [
+                        "ir_ohm_mean", "cell_spread_mean", "temp_rise_rate",
+                        "ir_ohm_mean_ewm10", "cell_spread_mean_ewm10",
+                        "vsag_rate_per_hr", "dod_stress", "c_rate_chg",
+                        "thermal_stress", "weak_subsystem_consistency",
+                        "subsystem_voltage_std",
+                        "current_mean_discharge", "is_loaded",
+                    ]
+                    avail_ekf = [c for c in extra_cols_ekf if c in veh_ekf.columns]
+                    extra_arr = veh_ekf[avail_ekf].values if avail_ekf else None
+                    bayes_row = bayesian_rul_vehicle(
+                        bayes_efc, bayes_days, bayes_y,
+                        daily_efc_rate=avg_efc_per_day,
+                        extra_features=extra_arr,
+                    )
+                else:
+                    # Fallback: old capacity_soh path when EKF unavailable
+                    extra_cols_fb = ["ir_ohm_mean", "cell_spread_mean", "temp_rise_rate",
+                                     "ir_ohm_mean_ewm10", "cell_spread_mean_ewm10",
+                                     "vsag_rate_per_hr", "dod_stress", "c_rate_chg",
+                                     "thermal_stress", "weak_subsystem_consistency",
+                                     "subsystem_voltage_std", "current_mean_discharge",
+                                     "is_loaded"]
+                    avail_fb  = [c for c in extra_cols_fb if c in veh_chg.columns]
+                    extra_arr = veh_chg[avail_fb].values if avail_fb else None
+                    bayes_row = bayesian_rul_vehicle(chg_efc, chg_days, chg_cap,
+                                                     daily_efc_rate=avg_efc_per_day,
+                                                     extra_features=extra_arr)
 
         row = {
             "registration_number":  reg,
@@ -590,12 +661,11 @@ if __name__ == "__main__":
         normalised = (rul_df[col] - lo) / (hi - lo)
         return (1 - normalised) if invert else normalised
 
-    # Primary SoH health signal: prefer EKF (physics-filtered) over OLS slope
+    # Primary SoH health signal: EKF (already loaded; used as Y above)
     rul_df["soh_slope_norm"] = norm_col("soh_slope_%per_day", invert=True)  # kept for diagnostics
-    if os.path.exists(EKF_CSV):
-        ekf_df = pd.read_csv(EKF_CSV)
+    if has_ekf_data:
         ekf_last_soh = (
-            ekf_df.groupby("registration_number")["ekf_soh"]
+            ekf_full.groupby("registration_number")["ekf_soh"]
             .last()
             .reset_index()
             .rename(columns={"ekf_soh": "_ekf_soh"})
