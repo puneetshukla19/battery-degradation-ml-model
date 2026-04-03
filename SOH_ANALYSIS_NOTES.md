@@ -1110,3 +1110,123 @@ The composite correctly signals: **MH18BZ3028 needs attention now** (already deg
 
 **Key rule:** Never use RUL alone as a health indicator on a young fleet. A vehicle can have short RUL and look perfectly healthy today (high SoH, steep slope), or long RUL and already be the most degraded vehicle in the fleet (low SoH, shallow slope). Always read RUL alongside current EKF SoH and the composite score.
 
+---
+
+## Session 2026-04-03 (cont.) — anomaly.py: EKF SoH + Extended Features for Session-Level Detection
+
+### Motivation
+
+The previous anomaly.py used BMS SoH (`soh_smooth`) and `cycle_soh` as health signals. Both are problematic:
+- BMS SoH is integer-stepped (97/98%) — CUSUM sees no within-vehicle trend
+- cycle_soh is 55% capped at 100% — saturated signal for most sessions
+
+Goal: detect anomalous sessions even when the fleet-level EKF SoH is high (97–98%), by using:
+1. `ekf_soh` — physics-grounded continuous SoH, forward-filled from charging sessions into discharge sessions
+2. `ekf_soh_delta` — session-to-session EKF change; sudden drops flag anomalous individual sessions
+3. Additional aging/stress context: `thermal_stress`, `dod_stress`, `cum_efc`, `aging_index`, `total_alerts`
+
+### Changes to `code/anomaly.py`
+
+#### 1. EKF SoH merge (forward-fill across full session timeline)
+
+EKF is updated at charging sessions; discharge sessions have no direct EKF row. Fix: merge EKF onto the full session timeline (all session types), forward-fill per vehicle, then pull values into discharge-only `disc` by `start_time`.
+
+```python
+all_sess = cycles[["registration_number", "start_time"]].drop_duplicates()
+all_sess = all_sess.sort_values(["registration_number", "start_time"])
+all_sess = all_sess.merge(ekf_raw, on=..., how="left")
+all_sess["ekf_soh_ffill"] = all_sess.groupby("registration_number")["ekf_soh"].ffill()
+all_sess["ekf_soh_delta"] = all_sess.groupby("registration_number")["ekf_soh_ffill"].diff()
+disc = disc.merge(all_sess[...], on=["registration_number", "start_time"], how="left")
+```
+
+Coverage achieved: **27,941/28,115 discharge sessions (99.4%)**.
+
+#### 2. New Isolation Forest features (44 total)
+
+Added to `IF_FEATURES` and `IF_FEATURE_DIRECTION`:
+
+| Feature | Direction | Rationale |
+|---|---|---|
+| `ekf_soh` | low | Physics-grounded SoH state — low = degraded |
+| `ekf_soh_delta` | low | Negative = sudden SoH drop this session |
+| `capacity_ah_new` | low | Measured capacity deficit (graceful: ignored if absent) |
+| `cum_efc` | high | Aging clock — more cycles = aged battery |
+| `days_since_first_session` | high | Calendar aging clock |
+| `thermal_stress` | high | Composite thermal aging proxy |
+| `dod_stress` | high | Deep discharge stress |
+| `total_alerts` | high | BMS alert count |
+| `aging_index` | high | Combined aging stress metric |
+
+#### 3. New CUSUM channel: `cusum_ekf_soh_alarm`
+
+Added per-vehicle CUSUM on forward-filled `ekf_soh`. Detects sustained EKF SoH decline within a vehicle across its discharge session history — fires even when current EKF SoH is still in the high 90s, if the trend is consistently downward.
+
+#### 4. Updated composite CUSUM weights
+
+| Signal | Old weight | New weight | Change |
+|---|---|---|---|
+| `soh_smooth` (BMS) | 0.25 | removed | replaced by ekf_soh |
+| `ekf_soh` | — | **0.30** | new primary signal |
+| `cycle_soh` | 0.10 | 0.05 | supplementary only |
+| `ir_ohm_mean_ewm10` | 0.20 | **0.22** | slightly upweighted |
+| `cell_spread_mean_ewm10` | 0.18 | 0.18 | unchanged |
+| `vsag_rate_per_hr_ewm10` | 0.13 | 0.13 | unchanged |
+| `temp_rise_rate_ewm10` | 0.14 | 0.12 | slightly downweighted |
+
+#### 5. UMAP healthy-cluster detection
+
+Updated to prefer `ekf_soh` over `capacity_soh` when identifying the healthy cluster (cluster with highest mean health signal).
+
+#### 6. Reason codes
+
+Added `"cusum_ekf_soh_alarm": "EKF-SoH-decline"` to CUSUM channel labels so the reason string distinguishes BMS-SoH-decline from EKF-SoH-decline.
+
+---
+
+### Results
+
+#### Coverage and scale
+- Discharge sessions: 28,115 across 66 vehicles
+- EKF SoH coverage: **27,941/28,115 (99.4%)**
+- IF features used: **44**
+- Composite CUSUM alarms: **7,595** sessions (up from 4,453 — EKF signal now active)
+
+#### Top 5 vehicles by combined anomaly count
+
+| Vehicle | Cycles | EKF-SoH CUSUM | BMS-SoH CUSUM | CycleSoH CUSUM | IF Anomalies | Total |
+|---|---|---|---|---|---|---|
+| MH18BZ3383 | 665 | **455** | 0 | 169 | 57 | 596 |
+| MH18BZ3386 | 585 | 205 | 386 | 117 | 69 | 480 |
+| MH18BZ3374 | 518 | 198 | 340 | 138 | 20 | 476 |
+| MH18BZ2649 | 683 | 12 | 211 | 186 | 75 | 474 |
+| MH18BZ3201 | 532 | **396** | 343 | 130 | 57 | 452 |
+
+#### Key insights
+
+**MH18BZ3383 — EKF catches what BMS misses:**
+455 EKF-SoH CUSUM alarms but 0 BMS-SoH CUSUM alarms. The BMS SoH was flat/integer (no signal at all), but EKF detected a real sustained decline across discharge sessions. This is the primary use-case: identifying anomalous session patterns even when overall fleet SoH appears healthy.
+
+**MH18BZ3201 — fast degrader correctly flagged:**
+396 EKF-SoH CUSUM alarms despite being the healthiest vehicle by current EKF SoH (98.56%). Consistent with its steep OLS slope (-0.030%/day) — the fastest degrader in the fleet. The EKF CUSUM is correctly flagging its rate of deterioration, not its current level.
+
+**MH18BZ3028 — level-based vs. rate-based anomaly:**
+0 EKF-SoH CUSUM alarms despite being the worst vehicle by current EKF SoH (94.97%). Its EKF SoH trend has flattened (OLS slope -0.017%/day, one of the shallowest). The anomaly for MH18BZ3028 is the *level* — flagged by IF (composite score 0.658, highest in fleet) and high-IR events (441), not by CUSUM rate detection.
+
+**Interpretation table:**
+
+| Signal | What it detects | Example vehicle |
+|---|---|---|
+| EKF SoH level (IF feature) | Already degraded state | MH18BZ3028 (94.97%) |
+| EKF-SoH CUSUM | Sustained ongoing decline | MH18BZ3383, MH18BZ3201 |
+| ekf_soh_delta (IF feature) | Sudden one-session drop | Any vehicle with abrupt event |
+| BMS-SoH CUSUM | BMS-visible SoH step-down | MH18BZ3386, MH18BZ3374 |
+| Composite score | Overall risk ranking | All vehicles |
+
+#### LightGBM SoH Regressor (Model A) — unchanged target, updated context
+- Train: 5,217 sessions | Test: 2,276 sessions
+- RMSE: **0.99%** (target <1.5%) 
+- MAE: **0.23%** (target <1.0%)
+- Directional accuracy: **90.9%** (target >65%)
+- Top features: `capacity_soh_chg_new`, `bms_coverage`, `cycle_soh`, `c_rate_chg`, `energy_per_loaded_session`
+
