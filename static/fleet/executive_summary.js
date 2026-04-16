@@ -30,7 +30,7 @@ function rulToYears(days) {
 /* ─── init ───────────────────────────────────────────────────────────────────── */
 async function init() {
   try {
-    const [ov, veh, trend, quint, tiers, scatter, coef, delta] = await Promise.all([
+    const [ov, veh, trend, quint, tiers, scatter, coef, delta, bdTimeline, dists] = await Promise.all([
       fetch("/api/overview/").then(r => r.json()),
       fetch("/api/vehicles/").then(r => r.json()),
       fetch("/api/fleet-trend/").then(r => r.json()),
@@ -39,6 +39,8 @@ async function init() {
       fetch("/api/soh-scatter/").then(r => r.json()),
       fetch("/api/bayes-coef/").then(r => r.json()),
       fetch("/api/soh-delta-trend/").then(r => r.json()),
+      fetch("/api/breakdown-timeline/").then(r => r.json()),
+      fetch("/api/distributions/").then(r => r.json()),
     ]);
 
     _overview  = ov;
@@ -55,6 +57,8 @@ async function init() {
     buildVehicleSlider();
     renderQuintiles();
     renderBayesCoef(coef);
+    renderBreakdownTimeline(bdTimeline);
+    renderDistributions(dists);
     renderAnomalyTiers();
     setupHoverCharts();
     // Initialise Bootstrap tooltips (Popper.js-based — not clipped by overflow containers)
@@ -2489,4 +2493,176 @@ function _animateKpiCounters() {
       el.addEventListener("animationend", () => el.classList.remove("animating"), { once: true });
     });
   });
+}
+
+/* ─── Breakdown Timeline ──────────────────────────────────────────────────────── */
+function renderBreakdownTimeline(data) {
+  if (!data || !data.timeline || !data.timeline.length) return;
+
+  const rows = data.timeline;  // already sorted soonest-first by backend
+
+  const TIER_COLOR = { 1: "#ef4444", 2: "#f59e0b", 3: "#22c55e", 0: "#6366f1" };
+
+  // Convert date strings to ms for CI error calculation
+  const msOf = d => d ? new Date(d).getTime() : null;
+
+  const errHi = rows.map(r => {
+    const pt = msOf(r.eol_date), hi = msOf(r.eol_date_hi);
+    return (pt && hi && hi > pt) ? hi - pt : 0;
+  });
+  const errLo = rows.map(r => {
+    const pt = msOf(r.eol_date), lo = msOf(r.eol_date_lo);
+    return (pt && lo && pt > lo) ? pt - lo : 0;
+  });
+
+  const todayStr = new Date().toISOString().slice(0, 10);
+
+  Plotly.newPlot(
+    document.getElementById("breakdownTimelinePlot"),
+    [{
+      type: "scatter",
+      mode: "markers",
+      x: rows.map(r => r.eol_date || null),
+      y: rows.map(r => r.registration_number),
+      marker: {
+        color: rows.map(r => TIER_COLOR[r.tier] || "#6366f1"),
+        size: 11, symbol: "diamond",
+        line: { color: "#fff", width: 1.5 },
+      },
+      error_x: {
+        type: "data", symmetric: false,
+        array: errHi, arrayminus: errLo,
+        color: "#94a3b8", thickness: 1.5, width: 6, visible: true,
+      },
+      customdata: rows.map(r => [
+        r.rul_days != null ? Math.round(r.rul_days) : null,
+        r.eol_date_lo || "—",
+        r.eol_date_hi || "—",
+        r.ekf_soh != null ? r.ekf_soh.toFixed(2) : "—",
+      ]),
+      hovertemplate:
+        "<b>%{y}</b><br>" +
+        "Projected EoL: <b>%{x}</b><br>" +
+        "RUL: %{customdata[0]} days<br>" +
+        "95% CI: %{customdata[1]} → %{customdata[2]}<br>" +
+        "Current EKF SoH: %{customdata[3]}%<extra></extra>",
+    }],
+    {
+      paper_bgcolor: "white", plot_bgcolor: "#f8fafc",
+      font: { family: "Plus Jakarta Sans, system-ui, sans-serif", size: 10, color: "#475569" },
+      margin: { l: 130, r: 20, t: 16, b: 64 },
+      xaxis: {
+        title: { text: "Projected End-of-Life Date", font: { size: 9.5 } },
+        type: "date", gridcolor: "#e2e8f0", tickfont: { size: 9 }, tickangle: -30,
+      },
+      yaxis: {
+        autorange: "reversed",
+        gridcolor: "#e2e8f0", tickfont: { size: 9 },
+      },
+      shapes: [{
+        type: "line", x0: todayStr, x1: todayStr, y0: 0, y1: 1,
+        xref: "x", yref: "paper",
+        line: { color: "#3b82f6", width: 1.5, dash: "dash" },
+      }],
+      annotations: [{
+        x: todayStr, y: 1.03, xref: "x", yref: "paper",
+        text: "Today", showarrow: false,
+        font: { size: 8.5, color: "#3b82f6", family: "Plus Jakarta Sans" },
+        bgcolor: "rgba(255,255,255,.85)", borderpad: 2,
+      }],
+      showlegend: false,
+    },
+    { displayModeBar: false, responsive: true }
+  );
+
+  // ── Summary table ───────────────────────────────────────────────────────────
+  const TIER_BADGE = {
+    1: `<span style="background:#fef2f2;color:#b91c1c;font-size:.68rem;font-weight:700;padding:1px 7px;border-radius:4px">T1</span>`,
+    2: `<span style="background:#fffbeb;color:#92400e;font-size:.68rem;font-weight:700;padding:1px 7px;border-radius:4px">T2</span>`,
+    3: `<span style="background:#f0fdf4;color:#166534;font-size:.68rem;font-weight:700;padding:1px 7px;border-radius:4px">T3</span>`,
+  };
+
+  document.getElementById("breakdownTableBody").innerHTML = rows.map(r => {
+    const rulStr = r.rul_days != null
+      ? `${Math.round(r.rul_days).toLocaleString()}d (${(r.rul_days / 365.25).toFixed(1)}yr)` : "—";
+    const badge = TIER_BADGE[r.tier] || `<span style="background:#ede9fe;color:#4c1d95;font-size:.68rem;font-weight:700;padding:1px 7px;border-radius:4px">—</span>`;
+    const ci = (r.eol_date_lo && r.eol_date_hi)
+      ? `<span style="font-size:.72rem;color:#64748b">${r.eol_date_lo}<br>→ ${r.eol_date_hi}</span>` : "—";
+    return `<tr style="cursor:pointer" onclick="openVehicleDetail && openVehicleDetail('${r.registration_number}')">
+      <td style="padding:7px 10px">${badge}&nbsp;<strong style="font-size:.8rem">${r.registration_number}</strong></td>
+      <td class="text-end" style="padding:7px 10px;font-size:.8rem">${rulStr}</td>
+      <td class="text-end" style="padding:7px 10px;font-size:.8rem;font-weight:600">${r.eol_date || "—"}</td>
+      <td class="text-end" style="padding:7px 10px">${ci}</td>
+    </tr>`;
+  }).join("");
+}
+
+/* ─── Data Distributions ──────────────────────────────────────────────────────── */
+function renderDistributions(data) {
+  if (!data) return;
+  _renderHistogram(
+    "cycleSohHistPlot",
+    data.cycle_soh || [],
+    "Cycle SoH (%)",
+    `n = ${(data.cycle_soh_n || 0).toLocaleString()} quality-gated observations`,
+    "#3b82f6",
+    1.0,
+    [85, 102]
+  );
+  _renderHistogram(
+    "blockCapHistPlot",
+    data.block_capacity_ah || [],
+    "Block Capacity (Ah)",
+    `n = ${(data.block_cap_n || 0).toLocaleString()} discharge blocks`,
+    "#10b981",
+    8,
+    null
+  );
+}
+
+function _renderHistogram(elId, vals, xLabel, subtitle, color, binSize, xRange) {
+  const el = document.getElementById(elId);
+  if (!el || !vals.length) return;
+
+  const sorted = [...vals].sort((a, b) => a - b);
+  const mu  = vals.reduce((s, v) => s + v, 0) / vals.length;
+  const sig = Math.sqrt(vals.reduce((s, v) => s + (v - mu) ** 2, 0) / vals.length);
+  const med = sorted[Math.floor(sorted.length / 2)];
+
+  Plotly.newPlot(el, [{
+    type: "histogram",
+    x: vals,
+    autobinx: false,
+    xbins: { size: binSize },
+    marker: { color, opacity: 0.78 },
+    hovertemplate: `${xLabel}: %{x}<br>Sessions: %{y}<extra></extra>`,
+  }], {
+    paper_bgcolor: "white", plot_bgcolor: "#f8fafc",
+    font: { family: "Plus Jakarta Sans, system-ui, sans-serif", size: 10, color: "#475569" },
+    margin: { l: 48, r: 14, t: 38, b: 52 },
+    title: {
+      text: `${subtitle}  ·  µ = ${mu.toFixed(1)}  σ = ${sig.toFixed(1)}  median = ${med.toFixed(1)}`,
+      font: { size: 10, color: "#475569" }, x: 0.02, xanchor: "left",
+    },
+    xaxis: {
+      title: { text: xLabel, font: { size: 9.5 } },
+      range: xRange || undefined,
+      gridcolor: "#e2e8f0", tickfont: { size: 9 },
+    },
+    yaxis: {
+      title: { text: "Sessions", font: { size: 9.5 } },
+      gridcolor: "#e2e8f0", tickfont: { size: 9 },
+    },
+    shapes: [{
+      type: "line", x0: med, x1: med, y0: 0, y1: 1,
+      xref: "x", yref: "paper",
+      line: { color: "#1e293b", width: 1.5, dash: "dash" },
+    }],
+    annotations: [{
+      x: med, y: 0.96, xref: "x", yref: "paper",
+      text: `median = ${med.toFixed(1)}`, showarrow: false,
+      font: { size: 8.5, color: "#1e293b", family: "Plus Jakarta Sans" },
+      bgcolor: "rgba(255,255,255,.85)", borderpad: 2,
+    }],
+  }, { displayModeBar: false, responsive: true });
 }

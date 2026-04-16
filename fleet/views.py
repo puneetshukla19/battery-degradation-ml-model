@@ -656,3 +656,86 @@ def api_telemetry(request, reg, session_id):
         "session_type": str(df["session_type"].iloc[0]) if "session_type" in df.columns else None,
         "rows": _df_to_records(df),
     })
+
+
+# ── Breakdown Timeline ─────────────────────────────────────────────────────────
+@require_GET
+def api_breakdown_timeline(request):
+    ekf = _load_ekf()
+
+    # Reference date = last session date in EKF data
+    ref_ts = pd.to_datetime(ekf["start_time"], unit="ms").max()
+    ref_date_str = ref_ts.strftime("%Y-%m-%d")
+
+    ekf_sorted = ekf.sort_values("start_time")
+    last = ekf_sorted.groupby("registration_number").last().reset_index()
+
+    def _add_days(base_ts, days):
+        if days is None or not math.isfinite(float(days)):
+            return None
+        return (base_ts + pd.Timedelta(days=float(days))).strftime("%Y-%m-%d")
+
+    rows = []
+    for _, r in last.iterrows():
+        reg      = r["registration_number"]
+        rul      = r.get("ekf_rul_days")
+        rul_lo   = r.get("ekf_rul_days_lo")
+        rul_hi   = r.get("ekf_rul_days_hi")
+        ekf_soh  = r.get("ekf_soh")
+        ekf_std  = r.get("ekf_soh_std")
+
+        rul_f    = float(rul)  if (rul  is not None and pd.notna(rul))  else None
+        rul_lo_f = float(rul_lo) if (rul_lo is not None and pd.notna(rul_lo)) else None
+        rul_hi_f = float(rul_hi) if (rul_hi is not None and pd.notna(rul_hi)) else None
+
+        tier = 1 if reg in TIER1 else (2 if reg in TIER2 else (3 if reg in TIER3 else 0))
+
+        rows.append({
+            "registration_number": reg,
+            "ekf_soh":    round(float(ekf_soh), 2) if ekf_soh is not None and pd.notna(ekf_soh) else None,
+            "ekf_soh_std": round(float(ekf_std), 4) if ekf_std is not None and pd.notna(ekf_std) else None,
+            "rul_days":    round(rul_f, 1) if rul_f is not None else None,
+            "rul_days_lo": round(rul_lo_f, 1) if rul_lo_f is not None else None,
+            "rul_days_hi": round(rul_hi_f, 1) if rul_hi_f is not None else None,
+            "eol_date":    _add_days(ref_ts, rul_f),
+            "eol_date_lo": _add_days(ref_ts, rul_lo_f),
+            "eol_date_hi": _add_days(ref_ts, rul_hi_f),
+            "tier":        tier,
+            "ref_date":    ref_date_str,
+        })
+
+    # Sort soonest-first (None / inf last)
+    rows.sort(key=lambda x: (x["rul_days"] is None, x["rul_days"] or float("inf")))
+
+    return _safe_json({"timeline": rows, "ref_date": ref_date_str})
+
+
+# ── Data Distributions ─────────────────────────────────────────────────────────
+@require_GET
+def api_distributions(request):
+    anom = _load_anom()
+
+    csoh_vals  = []
+    block_vals = []
+
+    if "cycle_soh" in anom.columns:
+        mask = anom["cycle_soh"].notna() & (anom["cycle_soh"] < 99.5)
+        if "block_soc_diff" in anom.columns:
+            mask = mask & (anom["block_soc_diff"].abs() >= 20)
+        csoh_vals = anom.loc[mask, "cycle_soh"].round(3).tolist()
+
+    if "block_capacity_ah" in anom.columns:
+        block_vals = (
+            anom["block_capacity_ah"]
+            .dropna()
+            .loc[lambda s: s > 0]
+            .round(2)
+            .tolist()
+        )
+
+    return _safe_json({
+        "cycle_soh":         csoh_vals,
+        "block_capacity_ah": block_vals,
+        "cycle_soh_n":       len(csoh_vals),
+        "block_cap_n":       len(block_vals),
+    })

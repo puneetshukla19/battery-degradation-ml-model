@@ -1429,3 +1429,117 @@ MH18BZ3386, MH18BZ2649, MH18BZ3038, MH18BZ3372, MH18BZ3368 — high cycle counts
 | BMS-SoH CUSUM | BMS-visible integer SoH step-down | MH18BZ3386, MH18BZ3374 |
 | Composite score | Overall weighted risk rank | All vehicles |
 
+---
+
+## Dashboard Enhancement Plan (2026-04-16)
+
+### Summary of Changes Implemented
+
+Four work streams were implemented to make the executive summary dashboard investor-ready and more analytically complete.
+
+---
+
+### Work Stream 1 — Projected Breakdown Timeline (new section ⑤)
+
+**New API:** `GET /api/breakdown-timeline/`
+- Reads latest EKF state per vehicle from `ekf_soh.csv`
+- Returns `rul_days`, `rul_days_lo`, `rul_days_hi`, `eol_date`, `eol_date_lo`, `eol_date_hi`, and tier for each vehicle
+- Sorted soonest-first (highest urgency at top)
+- Reference date = last session date in EKF data
+
+**Frontend:** New section in `executive_summary.html` between Key Degradation Signals and Anomaly Tiers:
+- Plotly horizontal scatter chart (Gantt-style): x = projected EoL date, y = vehicle registration
+- CI whiskers via `error_x` array mode (ms offsets from point estimate)
+- Today reference line as a dashed shape
+- Companion summary table: Tier badge, RUL in days+years, projected EoL date, 95% CI range
+- Table rows are clickable → opens the existing vehicle detail overlay modal
+
+---
+
+### Work Stream 2 — Appendix: Data Distributions (new section A, above FAQ)
+
+**New API:** `GET /api/distributions/`
+- Returns `cycle_soh` values (quality-gated: block DoD ≥ 20%, cycle_soh < 99.5%)
+- Returns `block_capacity_ah` values (discharge blocks, > 0 Ah)
+- Returns n-counts for both
+
+**Frontend:** New appendix section with two side-by-side histograms:
+- **Cycle SoH histogram**: bin size 1%, x-range 85–102%, median dashed line + annotation, µ/σ in title
+- **Block Capacity (Ah) histogram**: bin size 8 Ah, auto x-range, same statistics overlay
+- Each chart header has an ⓘ Bootstrap tooltip with plain-English definition
+
+**Cycle SoH definition (tooltip):** Per-cycle SoH computed via Coulomb counting: (Ah discharged) ÷ (nominal pack capacity × SoC swing). Quality-gated: block DoD ≥ 20%, cycle_soh < 99.5% (ceiling artefact excluded). Each observation = one complete discharge block.
+
+**Block Capacity definition (tooltip):** Total Amp-hours discharged across a complete drive-to-charge block (all discharge sessions between two charging events). Summed from the hves1_current sensor. A shrinking distribution over time indicates capacity fade. Nominal pack = 436 Ah.
+
+---
+
+### Work Stream 3 — Investor Subtitle + Hero Callout
+
+**Navbar tagline** (under brand): "Real-time battery intelligence · 15 vehicles · predictive maintenance analytics"
+
+**Hero callout box** (dark gradient, between navbar and page body):
+> "This dashboard applies a physics-informed Extended Kalman Filter and Bayesian Ridge degradation model to continuously track battery State of Health across Ultratech's 15-vehicle EV fleet — providing evidence-based replacement forecasts, maintenance prioritisation, and real-time anomaly alerts that reduce unplanned downtime and protect warranty claim eligibility."
+
+Three bullet chips:
+- Automated daily pipeline — no manual data entry
+- Per-vehicle replacement date with confidence intervals
+- Dual anomaly detection: sudden shocks + gradual drift
+
+---
+
+### Work Stream 4 — Layout Improvements
+
+**Section number badges** (`.section-num` CSS class — blue→indigo gradient circle):
+- ① Fleet Health
+- ② Usage Age Bands
+- ③ BMS-Reported vs EKF SoH
+- ④ Key Degradation Signals
+- ⑤ Projected Breakdown Timeline (new)
+- ⑥ Anomaly Tiers
+- A  Appendix — Data Distributions (new)
+- FAQ  Frequently Asked Questions
+
+**"How to Read This Dashboard" guide** (inserted after KPI grid, before section ①):
+- 6-cell responsive grid, each cell: section number + one-liner description
+- Helps first-time viewers (e.g. investors) know what each section tells them before scrolling
+
+---
+
+### Advisory: EKF Without BMS SoH (not yet implemented — run when ready)
+
+**Goal:** Remove BMS SoH from EKF observation model to rely purely on Coulomb-counting (cycle_soh) + physical signals (IR, cell spread, thermal). This gives a more conservative, quantisation-free estimate.
+
+**Changes required in `code/ekf_soh.py`:**
+
+```python
+# Remove BMS SoH row from H (5×4 → 4×4):
+H_ALL = [[1,0,0,0], [0,1,0,0], [0,0,1,0], [0,0,0,1]]
+OBS_COLS = ["cycle_soh", "ir_ohm_mean", "cell_spread_mean", "temp_rise_rate"]
+
+# Remove corresponding R diagonal entry (5→4):
+R_ALL = diag([9.0, 4e-6, 2.5e-5, 0.25])  # was [9.0, 9.0, 4e-6, 2.5e-5, 0.25]
+```
+
+Update `EKF_R_DIAG` in `config.py` to 4 entries. Update the `z` vector construction to drop `float(row["soh"])`.
+
+**Rerun sequence:** `ekf_soh.py` → `soh_rul.py` → `anomaly.py`
+
+**Expected result:** EKF SoH trace becomes smoother (no BMS integer steps). Uncertainty bands (`ekf_soh_std`) widen in sessions where quality `cycle_soh` is unavailable. More physically honest.
+
+---
+
+### Advisory: State-of-the-Art SOH Models
+
+| Model | Core Idea | Feasibility |
+|---|---|---|
+| **Gaussian Process Regression** | Non-parametric Bayesian; Matérn-5/2 kernel on (EFC, days) → cycle_soh | **High** — drop-in for Bayesian Ridge; scikit-learn, ~1,500 training pts |
+| **LSTM / Transformer SoH** | 30-session window → next SoH; soft supervision via cycle_soh | **Medium** — sparse labels; `neural_model.py` baseline exists |
+| **1RC Equivalent Circuit Model** | Extend EKF IR_drift to proper R₀+RC; IR already tracked | **Medium** — needs rest-to-discharge transition isolation |
+| **Particle Filter** | Monte Carlo full posterior; non-Gaussian noise | **Medium (offline)** — better in non-linear regimes |
+| **Physics-Informed Neural Networks** | PDE (Butler-Volmer/SPM) + data residuals | **Low** — needs SPM cell parameters from manufacturer |
+| **Incremental Capacity Analysis (ICA)** | dQ/dV peak shift = stoichiometry change | **Low** — needs slow CC charging + finer current logging |
+| **Federated Learning** | Cross-fleet learning without centralising data | **Low now** — useful when expanding to multi-operator deployments |
+
+**Immediate recommendations:** GPR for RUL projection + EKF without BMS SoH.
+

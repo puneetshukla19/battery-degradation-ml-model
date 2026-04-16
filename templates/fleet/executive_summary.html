@@ -59,6 +59,13 @@
       width: 4px; height: 18px; border-radius: 2px;
       background: linear-gradient(180deg, var(--blue), var(--indigo));
     }
+    .section-num {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 22px; height: 22px; border-radius: 50%;
+      background: linear-gradient(135deg, var(--blue), var(--indigo));
+      color: #fff; font-size: .68rem; font-weight: 700;
+      flex-shrink: 0; letter-spacing: 0; margin-right: 2px;
+    }
 
     /* ── KPI Cards ── */
     .kpi-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px; }
@@ -414,8 +421,41 @@
 
 <!-- ── Navbar ──────────────────────────────────────────────────────────────── -->
 <nav class="top-nav">
-  <span class="brand">Battery Health for <span>Ultratech</span> Fleet — Executive Summary</span>
+  <div>
+    <span class="brand">Battery Health for <span>Ultratech</span> Fleet — Executive Summary</span>
+    <div style="font-size:.68rem;color:#7dd3fc;margin-top:2px;font-weight:400;letter-spacing:.01em">
+      Real-time battery intelligence · 15 vehicles · predictive maintenance analytics
+    </div>
+  </div>
 </nav>
+
+<!-- ── Investor Hero Callout ──────────────────────────────────────────────── -->
+<div style="background:linear-gradient(135deg,#0f172a 0%,#1e3a5f 100%);
+            padding:18px 28px 20px;border-bottom:1px solid #1e3a5f">
+  <div style="max-width:1400px;margin:0 auto">
+    <div style="font-size:.92rem;color:#e2e8f0;font-weight:500;line-height:1.7;max-width:860px">
+      This dashboard applies a <strong style="color:#60a5fa">physics-informed Extended Kalman Filter</strong>
+      and <strong style="color:#60a5fa">Bayesian Ridge degradation model</strong> to continuously
+      track battery State of Health across Ultratech's 15-vehicle EV fleet — providing
+      evidence-based replacement forecasts, maintenance prioritisation, and real-time anomaly
+      alerts that reduce unplanned downtime and protect warranty claim eligibility.
+    </div>
+    <div style="display:flex;gap:24px;margin-top:12px;flex-wrap:wrap">
+      <span style="font-size:.74rem;color:#94a3b8">
+        <span style="color:#22c55e;font-weight:700">●</span>&nbsp;
+        Automated daily pipeline — no manual data entry
+      </span>
+      <span style="font-size:.74rem;color:#94a3b8">
+        <span style="color:#60a5fa;font-weight:700">●</span>&nbsp;
+        Per-vehicle replacement date with confidence intervals
+      </span>
+      <span style="font-size:.74rem;color:#94a3b8">
+        <span style="color:#f59e0b;font-weight:700">●</span>&nbsp;
+        Dual anomaly detection: sudden shocks + gradual drift
+      </span>
+    </div>
+  </div>
+</div>
 
 <div class="page-body">
 
@@ -485,11 +525,45 @@
 
   </div>
 
+  <!-- ── How to Read This Dashboard ───────────────────────────────────────── -->
+  <div class="mt-3 reveal" id="readingGuide"
+       style="background:#fff;border-radius:10px;box-shadow:var(--card-shadow);
+              padding:14px 20px;border-left:4px solid var(--blue)">
+    <div style="font-size:.74rem;font-weight:700;color:#3b82f6;text-transform:uppercase;
+                letter-spacing:.06em;margin-bottom:8px">How to read this dashboard</div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px">
+      <div style="font-size:.78rem;color:#475569;line-height:1.6">
+        <span style="font-weight:600;color:#0f172a">① Fleet Health</span> —
+        Top-level KPIs and overall battery condition summary. Start here for a one-minute read.
+      </div>
+      <div style="font-size:.78rem;color:#475569;line-height:1.6">
+        <span style="font-weight:600;color:#0f172a">② Age Bands</span> —
+        How health evolves as vehicles age. Confirms degradation rate is within expected range.
+      </div>
+      <div style="font-size:.78rem;color:#475569;line-height:1.6">
+        <span style="font-weight:600;color:#0f172a">③ BMS vs EKF</span> —
+        Our model vs the on-board sensor. Divergence means BMS is under/overstating battery health.
+      </div>
+      <div style="font-size:.78rem;color:#475569;line-height:1.6">
+        <span style="font-weight:600;color:#0f172a">④ Degradation Signals</span> —
+        Which physical factors are driving battery wear fastest across the fleet.
+      </div>
+      <div style="font-size:.78rem;color:#475569;line-height:1.6">
+        <span style="font-weight:600;color:#0f172a">⑤ Breakdown Timeline</span> —
+        Which vehicles are projected to need battery replacement and when.
+      </div>
+      <div style="font-size:.78rem;color:#475569;line-height:1.6">
+        <span style="font-weight:600;color:#0f172a">⑥ Anomaly Tiers</span> —
+        Vehicles ranked by urgency of attention needed, with click-through to full detail.
+      </div>
+    </div>
+  </div>
+
   <!-- ── Fleet Health + Usage Age Bands (side by side) ──────────────────── -->
   <div class="row g-3 mt-3 align-items-start reveal">
 
     <div class="col-md-6">
-      <div class="section-hdr">Fleet Health</div>
+      <div class="section-hdr"><span class="section-num">1</span>Fleet Health</div>
       <div class="panel h-100">
         <div class="panel-hdr">Overall Fleet Health — hover a row for detail</div>
         <div class="panel-body">
@@ -540,7 +614,7 @@
     </div>
 
     <div class="col-md-6">
-      <div class="section-hdr">Usage Age Bands (Q1–Q5)</div>
+      <div class="section-hdr"><span class="section-num">2</span>Usage Age Bands (Q1–Q5)</div>
       <div class="panel h-100">
         <div class="panel-hdr">Median SoH by Usage Age — 5 Bands (Q1–Q5)</div>
         <div class="panel-body">
@@ -561,7 +635,7 @@
 
   <!-- ── BMS vs EKF SoH Scatter  +  Delta Time Series (same row) ── -->
   <div class="mt-3 reveal">
-    <div class="section-hdr">BMS-Reported vs EKF State of Health</div>
+    <div class="section-hdr"><span class="section-num">3</span>BMS-Reported vs EKF State of Health</div>
     <!-- Vehicle slider -->
     <div id="vehSliderContainer"></div>
     <div class="row g-3 align-items-stretch">
@@ -587,7 +661,7 @@
   <!-- ── Key Degradation Signals (moved below BMS vs EKF) ── -->
   <div class="row g-3 mt-3 align-items-start reveal">
     <div class="col-12">
-      <div class="section-hdr">Key Degradation Signals</div>
+      <div class="section-hdr"><span class="section-num">4</span>Key Degradation Signals</div>
       <div class="panel">
         <div class="panel-hdr">The model identifies the signals most linked to battery degradation — hover over each bar for a definition</div>
         <div class="panel-body" style="padding:12px">
@@ -598,8 +672,61 @@
     </div>
   </div>
 
+  <!-- ── Section 5: Projected Breakdown Timeline ───────────────────────────── -->
+  <div class="mt-4 reveal" id="breakdownSection">
+    <div class="section-hdr"><span class="section-num">5</span>Projected Breakdown Timeline</div>
+    <div style="font-size:.82rem;color:#475569;margin-bottom:12px;line-height:1.65">
+      Vehicles ranked by projected End-of-Life date (soonest first). Each point is the EKF posterior
+      estimate; error bars show the 95% confidence interval. The dashed line marks today.
+      <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top"
+        data-bs-title="EoL date = last data date + EKF RUL (days). Confidence interval uses the EKF posterior standard deviation propagated through the RUL formula. Assumes current degradation rate is sustained.">ⓘ</span>
+    </div>
+    <div class="row g-3 align-items-start">
+      <div class="col-md-8">
+        <div class="panel">
+          <div class="panel-hdr">Projected End-of-Life Date per Vehicle — point estimate + 95% CI</div>
+          <div class="panel-body" style="padding:12px">
+            <div id="breakdownTimelinePlot" style="height:380px"></div>
+          </div>
+        </div>
+      </div>
+      <div class="col-md-4">
+        <div class="panel">
+          <div class="panel-hdr">Ranked Summary</div>
+          <div class="panel-body" style="padding:0">
+            <div style="max-height:420px;overflow-y:auto">
+              <table class="table table-sm mb-0" id="breakdownTable">
+                <thead style="background:#f8fafc;position:sticky;top:0;z-index:1">
+                  <tr>
+                    <th style="font-size:.72rem;font-weight:600;color:#475569;padding:8px 10px">Vehicle</th>
+                    <th class="text-end" style="font-size:.72rem;font-weight:600;color:#475569;padding:8px 10px">
+                      RUL
+                      <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top"
+                        data-bs-title="Remaining Useful Life in days (EKF point estimate). When this reaches zero, SoH hits 80% — the end-of-life threshold.">ⓘ</span>
+                    </th>
+                    <th class="text-end" style="font-size:.72rem;font-weight:600;color:#475569;padding:8px 10px">
+                      Proj. EoL
+                      <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top"
+                        data-bs-title="Estimated calendar date when battery SoH reaches 80% (end-of-life threshold).">ⓘ</span>
+                    </th>
+                    <th class="text-end" style="font-size:.72rem;font-weight:600;color:#475569;padding:8px 10px">
+                      95% CI
+                      <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top"
+                        data-bs-title="95% confidence interval for the projected EoL date. Pessimistic (earliest) → Optimistic (latest).">ⓘ</span>
+                    </th>
+                  </tr>
+                </thead>
+                <tbody id="breakdownTableBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- ── Anomaly Tiers ──────────────────────────────────────────────────── -->
-  <div class="section-hdr mt-4 reveal">Anomaly Tiers</div>
+  <div class="section-hdr mt-4 reveal"><span class="section-num">6</span>Anomaly Tiers</div>
 
   <!-- Business description -->
   <div style="border-radius:8px;padding:14px 18px;margin-bottom:16px;font-size:.82rem;color:#334155;line-height:1.65;border:1px solid #e2e8f0;background:#fff">
@@ -730,9 +857,44 @@
 
   </div>
 
+  <!-- ── Appendix A: Data Distributions ───────────────────────────────────── -->
+  <div class="mt-4 reveal" id="distributionsSection">
+    <div class="section-hdr"><span class="section-num" style="border-radius:4px;width:auto;padding:0 6px">A</span>Appendix — Data Distributions</div>
+    <div style="font-size:.78rem;color:#94a3b8;margin-bottom:12px;line-height:1.65">
+      Fleet-wide raw measurement distributions used as inputs to the EKF and Bayesian Ridge models.
+      Quality-gated observations only. Hover a bar for session count.
+    </div>
+    <div class="row g-3">
+      <div class="col-md-6">
+        <div class="panel">
+          <div class="panel-hdr">
+            Cycle SoH Distribution
+            <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top"
+              data-bs-title="Cycle SoH is the per-cycle State of Health estimate computed via Coulomb counting: (Ah discharged) ÷ (nominal pack capacity × SoC swing). Only quality-gated observations are shown — sessions with block DoD ≥ 20% and cycle_soh below 99.5% (the Coulomb-counting ceiling artefact). Each observation represents one complete discharge block across the fleet.">ⓘ</span>
+          </div>
+          <div class="panel-body" style="padding:12px">
+            <div id="cycleSohHistPlot" style="height:280px"></div>
+          </div>
+        </div>
+      </div>
+      <div class="col-md-6">
+        <div class="panel">
+          <div class="panel-hdr">
+            Block Capacity (Ah) Distribution
+            <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top"
+              data-bs-title="Block Capacity (Ah) is the total Amp-hours discharged across a complete drive-to-charge block — all discharge sessions between two charging events. Summed from the hves1_current sensor. A shrinking distribution over time indicates capacity fade. The nominal pack capacity is 436 Ah.">ⓘ</span>
+          </div>
+          <div class="panel-body" style="padding:12px">
+            <div id="blockCapHistPlot" style="height:280px"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- ── FAQ Section ──────────────────────────────────────────────────────── -->
   <div class="faq-section reveal">
-    <div class="section-hdr">Frequently Asked Questions</div>
+    <div class="section-hdr"><span class="section-num" style="border-radius:4px;width:auto;padding:0 6px">FAQ</span>Frequently Asked Questions</div>
 
     <div class="faq-item">
       <button class="faq-btn" onclick="toggleFaq(this)">
