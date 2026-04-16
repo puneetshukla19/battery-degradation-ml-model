@@ -661,14 +661,20 @@ def api_telemetry(request, reg, session_id):
 # ── Breakdown Timeline ─────────────────────────────────────────────────────────
 @require_GET
 def api_breakdown_timeline(request):
-    ekf = _load_ekf()
+    rul  = _load_rul()
+    ekf  = _load_ekf()
+    EOL  = 80.0  # end-of-life SoH threshold
 
     # Reference date = last session date in EKF data
     ref_ts = pd.to_datetime(ekf["start_time"], unit="ms").max()
     ref_date_str = ref_ts.strftime("%Y-%m-%d")
 
-    ekf_sorted = ekf.sort_values("start_time")
-    last = ekf_sorted.groupby("registration_number").last().reset_index()
+    # Latest EKF SoH per vehicle (for display)
+    last_ekf = (
+        ekf.sort_values("start_time")
+           .groupby("registration_number")[["ekf_soh", "ekf_soh_std"]]
+           .last()
+    )
 
     def _add_days(base_ts, days):
         if days is None or not math.isfinite(float(days)):
@@ -676,35 +682,38 @@ def api_breakdown_timeline(request):
         return (base_ts + pd.Timedelta(days=float(days))).strftime("%Y-%m-%d")
 
     rows = []
-    for _, r in last.iterrows():
-        reg      = r["registration_number"]
-        rul      = r.get("ekf_rul_days")
-        rul_lo   = r.get("ekf_rul_days_lo")
-        rul_hi   = r.get("ekf_rul_days_hi")
-        ekf_soh  = r.get("ekf_soh")
-        ekf_std  = r.get("ekf_soh_std")
+    for _, r in rul.iterrows():
+        reg        = r["registration_number"]
+        curr_soh   = r.get("current_soh")
+        slope      = r.get("soh_slope_%per_day")
+        composite  = r.get("composite_degradation_score")
 
-        rul_f    = float(rul)  if (rul  is not None and pd.notna(rul))  else None
-        rul_lo_f = float(rul_lo) if (rul_lo is not None and pd.notna(rul_lo)) else None
-        rul_hi_f = float(rul_hi) if (rul_hi is not None and pd.notna(rul_hi)) else None
+        # Slope-based RUL — same formula used in the tier table JS (renderAnomalyTiers)
+        rul_days = None
+        if (curr_soh is not None and pd.notna(curr_soh) and
+                slope is not None and pd.notna(slope) and float(slope) < 0):
+            rul_days = max(0.0, (float(curr_soh) - EOL) / abs(float(slope)))
+
+        ekf_row   = last_ekf.loc[reg] if reg in last_ekf.index else None
+        ekf_soh   = float(ekf_row["ekf_soh"])   if ekf_row is not None and pd.notna(ekf_row["ekf_soh"])   else None
+        ekf_std   = float(ekf_row["ekf_soh_std"]) if ekf_row is not None and pd.notna(ekf_row["ekf_soh_std"]) else None
 
         tier = 1 if reg in TIER1 else (2 if reg in TIER2 else (3 if reg in TIER3 else 0))
 
         rows.append({
             "registration_number": reg,
-            "ekf_soh":    round(float(ekf_soh), 2) if ekf_soh is not None and pd.notna(ekf_soh) else None,
-            "ekf_soh_std": round(float(ekf_std), 4) if ekf_std is not None and pd.notna(ekf_std) else None,
-            "rul_days":    round(rul_f, 1) if rul_f is not None else None,
-            "rul_days_lo": round(rul_lo_f, 1) if rul_lo_f is not None else None,
-            "rul_days_hi": round(rul_hi_f, 1) if rul_hi_f is not None else None,
-            "eol_date":    _add_days(ref_ts, rul_f),
-            "eol_date_lo": _add_days(ref_ts, rul_lo_f),
-            "eol_date_hi": _add_days(ref_ts, rul_hi_f),
+            "current_soh": round(float(curr_soh), 2) if curr_soh is not None and pd.notna(curr_soh) else None,
+            "soh_slope":   round(float(slope), 5)    if slope    is not None and pd.notna(slope)    else None,
+            "ekf_soh":     round(ekf_soh, 2)   if ekf_soh  is not None else None,
+            "ekf_soh_std": round(ekf_std, 4)   if ekf_std  is not None else None,
+            "composite":   round(float(composite), 4) if composite is not None and pd.notna(composite) else None,
+            "rul_days":    round(rul_days, 0)   if rul_days is not None else None,
+            "eol_date":    _add_days(ref_ts, rul_days),
             "tier":        tier,
             "ref_date":    ref_date_str,
         })
 
-    # Sort soonest-first (None / inf last)
+    # Sort soonest-first (None / no-slope vehicles last)
     rows.sort(key=lambda x: (x["rul_days"] is None, x["rul_days"] or float("inf")))
 
     return _safe_json({"timeline": rows, "ref_date": ref_date_str})
@@ -715,27 +724,33 @@ def api_breakdown_timeline(request):
 def api_distributions(request):
     anom = _load_anom()
 
-    csoh_vals  = []
-    block_vals = []
+    csoh_vals      = []
+    block_soh_vals = []
 
     if "cycle_soh" in anom.columns:
+        # Per-session quality gate: block DoD >= 20%, exclude ceiling artefact
         mask = anom["cycle_soh"].notna() & (anom["cycle_soh"] < 99.5)
         if "block_soc_diff" in anom.columns:
             mask = mask & (anom["block_soc_diff"].abs() >= 20)
         csoh_vals = anom.loc[mask, "cycle_soh"].round(3).tolist()
 
-    if "block_capacity_ah" in anom.columns:
-        block_vals = (
-            anom["block_capacity_ah"]
-            .dropna()
-            .loc[lambda s: s > 0]
-            .round(2)
+        # Block SoH: deduplicate to one value per discharge block
+        # Use (registration_number, block_capacity_ah) as a proxy block key —
+        # different blocks have different total Ah, so this gives ~one value per block.
+        dedup_cols = ["registration_number"]
+        if "block_capacity_ah" in anom.columns:
+            dedup_cols.append("block_capacity_ah")
+        block_soh_vals = (
+            anom[mask]
+            .drop_duplicates(subset=dedup_cols)
+            ["cycle_soh"]
+            .round(3)
             .tolist()
         )
 
     return _safe_json({
-        "cycle_soh":         csoh_vals,
-        "block_capacity_ah": block_vals,
-        "cycle_soh_n":       len(csoh_vals),
-        "block_cap_n":       len(block_vals),
+        "cycle_soh":      csoh_vals,
+        "block_soh":      block_soh_vals,
+        "cycle_soh_n":    len(csoh_vals),
+        "block_soh_n":    len(block_soh_vals),
     })

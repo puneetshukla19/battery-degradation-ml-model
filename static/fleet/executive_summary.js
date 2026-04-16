@@ -58,6 +58,7 @@ async function init() {
     buildVehicleSlider();
     renderQuintiles();
     renderBayesCoef(coef);
+    if (bdTimeline && bdTimeline.ref_date) data_refDate = bdTimeline.ref_date;
     renderBreakdownTimeline(bdTimeline);
     renderDistributions(dists);
     renderAnomalyTiers();
@@ -168,6 +169,33 @@ function _drawScatter() {
         name: "Fleet", showlegend: false },
     ];
   }
+  // Compute OLS slope (y on x) from all fleet points
+  const allPts  = _scatterData.points || [];
+  let slopeAnnotation = null;
+  if (allPts.length > 1) {
+    const xs = allPts.map(p => p.soh).filter(v => v != null);
+    const ys = allPts.map((p, i) => p.soh != null ? p.ekf_soh : null).filter(v => v != null);
+    const n  = Math.min(xs.length, ys.length);
+    if (n > 1) {
+      const xArr = xs.slice(0, n), yArr = ys.slice(0, n);
+      const xMu  = xArr.reduce((s, v) => s + v, 0) / n;
+      const yMu  = yArr.reduce((s, v) => s + v, 0) / n;
+      const cov  = xArr.reduce((s, v, i) => s + (v - xMu) * (yArr[i] - yMu), 0);
+      const varX = xArr.reduce((s, v) => s + (v - xMu) ** 2, 0);
+      const slope = varX > 0 ? cov / varX : null;
+      if (slope !== null) {
+        slopeAnnotation = {
+          x: 0.98, y: 0.04, xref: "paper", yref: "paper",
+          text: `OLS slope: <b>${slope.toFixed(3)}</b>  (EKF = ${slope.toFixed(3)} × BMS + c)`,
+          showarrow: false, align: "right",
+          font: { size: 9, color: "#475569", family: "Plus Jakarta Sans" },
+          bgcolor: "rgba(255,255,255,.88)", borderpad: 4,
+          bordercolor: "#e2e8f0", borderwidth: 1,
+        };
+      }
+    }
+  }
+
   // y = x reference line in zoomed range
   traces.push({ type: "scatter", mode: "lines",
     x: [95, 100], y: [95, 100],
@@ -182,6 +210,7 @@ function _drawScatter() {
              range: [100, 95], gridcolor: "#e2e8f0", tickfont: { size: 9 } },
     yaxis: { title: { text: "EKF SoH (%)", font: { size: 9.5 } },
              range: [100, 95], gridcolor: "#e2e8f0", tickfont: { size: 9 } },
+    annotations: slopeAnnotation ? [slopeAnnotation] : [],
     showlegend: _scatterVeh != null,
     legend: { x: 0.02, y: 0.98, font: { size: 8.5 } },
   }, { displayModeBar: false, responsive: true });
@@ -2502,103 +2531,126 @@ function _animateKpiCounters() {
 }
 
 /* ─── Breakdown Timeline ──────────────────────────────────────────────────────── */
+let _breakdownRows = [];
+
 function renderBreakdownTimeline(data) {
   if (!data || !data.timeline || !data.timeline.length) return;
 
-  const rows = data.timeline;  // already sorted soonest-first by backend
+  _breakdownRows = data.timeline;  // store for click-through
+  const eol = (_overview && _overview.eol_threshold) || 80;
+
+  _drawBreakdownChart(_breakdownRows, eol, null);
+  _buildBreakdownTable(_breakdownRows, eol, null);
+}
+
+function _drawBreakdownChart(rows, eol, highlightReg) {
+  const el = document.getElementById("breakdownTimelinePlot");
+  if (!el) return;
 
   const TIER_COLOR = { 1: "#ef4444", 2: "#f59e0b", 3: "#22c55e", 0: "#6366f1" };
+  const todayStr   = new Date().toISOString().slice(0, 10);
 
-  // Convert date strings to ms for CI error calculation
-  const msOf = d => d ? new Date(d).getTime() : null;
-
-  const errHi = rows.map(r => {
-    const pt = msOf(r.eol_date), hi = msOf(r.eol_date_hi);
-    return (pt && hi && hi > pt) ? hi - pt : 0;
+  // Compute RUL + EoL date the same way as renderAnomalyTiers JS
+  const rowsWithRul = rows.map(r => {
+    let rul = r.rul_days;  // already computed server-side with same formula
+    const eolDate = rul != null
+      ? (() => {
+          const d = new Date(data_refDate || r.ref_date);
+          d.setDate(d.getDate() + Math.round(rul));
+          return d.toISOString().slice(0, 10);
+        })()
+      : r.eol_date;
+    return { ...r, rul_computed: rul, eol_computed: eolDate };
   });
-  const errLo = rows.map(r => {
-    const pt = msOf(r.eol_date), lo = msOf(r.eol_date_lo);
-    return (pt && lo && pt > lo) ? pt - lo : 0;
-  });
 
-  const todayStr = new Date().toISOString().slice(0, 10);
-
-  Plotly.newPlot(
-    document.getElementById("breakdownTimelinePlot"),
-    [{
-      type: "scatter",
-      mode: "markers",
-      x: rows.map(r => r.eol_date || null),
-      y: rows.map(r => r.registration_number),
-      marker: {
-        color: rows.map(r => TIER_COLOR[r.tier] || "#6366f1"),
-        size: 11, symbol: "diamond",
-        line: { color: "#fff", width: 1.5 },
-      },
-      error_x: {
-        type: "data", symmetric: false,
-        array: errHi, arrayminus: errLo,
-        color: "#94a3b8", thickness: 1.5, width: 6, visible: true,
-      },
-      customdata: rows.map(r => [
-        r.rul_days != null ? Math.round(r.rul_days) : null,
-        r.eol_date_lo || "—",
-        r.eol_date_hi || "—",
-        r.ekf_soh != null ? r.ekf_soh.toFixed(2) : "—",
-      ]),
-      hovertemplate:
-        "<b>%{y}</b><br>" +
-        "Projected EoL: <b>%{x}</b><br>" +
-        "RUL: %{customdata[0]} days<br>" +
-        "95% CI: %{customdata[1]} → %{customdata[2]}<br>" +
-        "Current EKF SoH: %{customdata[3]}%<extra></extra>",
-    }],
-    {
-      paper_bgcolor: "white", plot_bgcolor: "#f8fafc",
-      font: { family: "Plus Jakarta Sans, system-ui, sans-serif", size: 10, color: "#475569" },
-      margin: { l: 130, r: 20, t: 16, b: 64 },
-      xaxis: {
-        title: { text: "Projected End-of-Life Date", font: { size: 9.5 } },
-        type: "date", gridcolor: "#e2e8f0", tickfont: { size: 9 }, tickangle: -30,
-      },
-      yaxis: {
-        autorange: "reversed",
-        gridcolor: "#e2e8f0", tickfont: { size: 9 },
-      },
-      shapes: [{
-        type: "line", x0: todayStr, x1: todayStr, y0: 0, y1: 1,
-        xref: "x", yref: "paper",
-        line: { color: "#3b82f6", width: 1.5, dash: "dash" },
-      }],
-      annotations: [{
-        x: todayStr, y: 1.03, xref: "x", yref: "paper",
-        text: "Today", showarrow: false,
-        font: { size: 8.5, color: "#3b82f6", family: "Plus Jakarta Sans" },
-        bgcolor: "rgba(255,255,255,.85)", borderpad: 2,
-      }],
-      showlegend: false,
-    },
-    { displayModeBar: false, responsive: true }
+  const colors = rowsWithRul.map(r =>
+    r.registration_number === highlightReg
+      ? "#f59e0b"  // highlighted
+      : TIER_COLOR[r.tier] || "#6366f1"
   );
+  const sizes  = rowsWithRul.map(r => r.registration_number === highlightReg ? 14 : 10);
 
-  // ── Summary table ───────────────────────────────────────────────────────────
+  Plotly.newPlot(el, [{
+    type: "scatter",
+    mode: "markers",
+    x: rowsWithRul.map(r => r.eol_date || null),
+    y: rowsWithRul.map(r => r.registration_number),
+    marker: {
+      color: colors, size: sizes, symbol: "diamond",
+      line: { color: "#fff", width: 1.5 },
+    },
+    customdata: rowsWithRul.map(r => [
+      r.rul_days != null ? Math.round(r.rul_days) : "—",
+      r.current_soh != null ? r.current_soh.toFixed(2) : "—",
+      r.soh_slope != null ? r.soh_slope.toFixed(4) : "—",
+    ]),
+    hovertemplate:
+      "<b>%{y}</b><br>" +
+      "Projected EoL: <b>%{x}</b><br>" +
+      "RUL: %{customdata[0]} days<br>" +
+      "Current SoH: %{customdata[1]}%<br>" +
+      "Daily slope: %{customdata[2]}%/day<extra></extra>",
+  }], {
+    paper_bgcolor: "white", plot_bgcolor: "#f8fafc",
+    font: { family: "Plus Jakarta Sans, system-ui, sans-serif", size: 10, color: "#475569" },
+    margin: { l: 130, r: 20, t: 16, b: 64 },
+    xaxis: {
+      title: { text: "Projected End-of-Life Date", font: { size: 9.5 } },
+      type: "date", gridcolor: "#e2e8f0", tickfont: { size: 9 }, tickangle: -30,
+    },
+    yaxis: { autorange: "reversed", gridcolor: "#e2e8f0", tickfont: { size: 9 } },
+    shapes: [{
+      type: "line", x0: todayStr, x1: todayStr, y0: 0, y1: 1,
+      xref: "x", yref: "paper",
+      line: { color: "#3b82f6", width: 1.5, dash: "dash" },
+    }],
+    annotations: [{
+      x: todayStr, y: 1.03, xref: "x", yref: "paper",
+      text: "Today", showarrow: false,
+      font: { size: 8.5, color: "#3b82f6", family: "Plus Jakarta Sans" },
+      bgcolor: "rgba(255,255,255,.85)", borderpad: 2,
+    }],
+    showlegend: false,
+  }, { displayModeBar: false, responsive: true });
+
+  // Click-through: clicking a point highlights row in table
+  el.on("plotly_click", evt => {
+    const pt  = evt.points[0];
+    const reg = pt && pt.y;
+    if (!reg) return;
+    _buildBreakdownTable(_breakdownRows, eol, reg);
+    // Scroll to the highlighted row
+    const row = document.querySelector(`#breakdownTableBody tr[data-reg="${reg}"]`);
+    if (row) row.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    // Redraw chart with highlight
+    _drawBreakdownChart(_breakdownRows, eol, reg);
+  });
+}
+
+// Store ref_date for EoL re-computation
+let data_refDate = null;
+
+function _buildBreakdownTable(rows, eol, activeReg) {
   const TIER_BADGE = {
-    1: `<span style="background:#fef2f2;color:#b91c1c;font-size:.68rem;font-weight:700;padding:1px 7px;border-radius:4px">T1</span>`,
-    2: `<span style="background:#fffbeb;color:#92400e;font-size:.68rem;font-weight:700;padding:1px 7px;border-radius:4px">T2</span>`,
-    3: `<span style="background:#f0fdf4;color:#166534;font-size:.68rem;font-weight:700;padding:1px 7px;border-radius:4px">T3</span>`,
+    1: `<span style="background:#fef2f2;color:#b91c1c;font-size:.68rem;font-weight:700;padding:1px 6px;border-radius:4px">T1</span>`,
+    2: `<span style="background:#fffbeb;color:#92400e;font-size:.68rem;font-weight:700;padding:1px 6px;border-radius:4px">T2</span>`,
+    3: `<span style="background:#f0fdf4;color:#166534;font-size:.68rem;font-weight:700;padding:1px 6px;border-radius:4px">T3</span>`,
   };
 
   document.getElementById("breakdownTableBody").innerHTML = rows.map(r => {
-    const rulStr = r.rul_days != null
-      ? `${Math.round(r.rul_days).toLocaleString()}d (${(r.rul_days / 365.25).toFixed(1)}yr)` : "—";
-    const badge = TIER_BADGE[r.tier] || `<span style="background:#ede9fe;color:#4c1d95;font-size:.68rem;font-weight:700;padding:1px 7px;border-radius:4px">—</span>`;
-    const ci = (r.eol_date_lo && r.eol_date_hi)
-      ? `<span style="font-size:.72rem;color:#64748b">${r.eol_date_lo}<br>→ ${r.eol_date_hi}</span>` : "—";
-    return `<tr style="cursor:pointer" onclick="openVehicleDetail && openVehicleDetail('${r.registration_number}')">
-      <td style="padding:7px 10px">${badge}&nbsp;<strong style="font-size:.8rem">${r.registration_number}</strong></td>
-      <td class="text-end" style="padding:7px 10px;font-size:.8rem">${rulStr}</td>
-      <td class="text-end" style="padding:7px 10px;font-size:.8rem;font-weight:600">${r.eol_date || "—"}</td>
-      <td class="text-end" style="padding:7px 10px">${ci}</td>
+    const isActive  = r.registration_number === activeReg;
+    const sohStr    = r.current_soh != null ? r.current_soh.toFixed(2) + "%" : "—";
+    const rulStr    = r.rul_days != null
+      ? `${Math.round(r.rul_days).toLocaleString()}d (${(r.rul_days / 365.25).toFixed(1)} yr)` : "—";
+    const badge     = TIER_BADGE[r.tier] || "";
+    const rowStyle  = isActive ? "background:#eff6ff;font-weight:600;" : "";
+    return `<tr data-reg="${r.registration_number}"
+               style="cursor:pointer;${rowStyle}"
+               onclick="openVehicleDetail && openVehicleDetail('${r.registration_number}')">
+      <td>${badge}&nbsp;<span style="font-size:.8rem;font-weight:${isActive?700:400}">${r.registration_number}</span></td>
+      <td class="text-end" style="font-size:.8rem">${sohStr}</td>
+      <td class="text-end" style="font-size:.8rem">${rulStr}</td>
+      <td class="text-end" style="font-size:.8rem;font-weight:600">${r.eol_date || "—"}</td>
     </tr>`;
   }).join("");
 }
@@ -2616,13 +2668,13 @@ function renderDistributions(data) {
     [85, 102]
   );
   _renderHistogram(
-    "blockCapHistPlot",
-    data.block_capacity_ah || [],
-    "Block Capacity (Ah)",
-    `n = ${(data.block_cap_n || 0).toLocaleString()} discharge blocks`,
+    "blockSohHistPlot",
+    data.block_soh || [],
+    "Block SoH (%)",
+    `n = ${(data.block_soh_n || 0).toLocaleString()} discharge blocks (deduplicated)`,
     "#10b981",
-    8,
-    null
+    1.0,
+    [85, 102]
   );
 }
 

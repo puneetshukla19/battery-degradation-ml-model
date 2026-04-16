@@ -135,11 +135,12 @@
       font-size: 0.65rem; color: #93c5fd; margin-left: 4px;
     }
 
-    /* Tier + Quintile tables — light header */
+    /* Tier + Quintile + Breakdown tables — light header */
     #quintileTable thead th,
     #tier1Table thead th,
     #tier2Table thead th,
-    #tier3Table thead th {
+    #tier3Table thead th,
+    #breakdownTable thead th {
       position: static;
       background: #f8fafc;
       color: #475569;
@@ -431,7 +432,8 @@
 
 <!-- ── Investor Hero Callout ──────────────────────────────────────────────── -->
 <div style="background:linear-gradient(135deg,#0f172a 0%,#1e3a5f 100%);
-            padding:18px 28px 20px;border-bottom:1px solid #1e3a5f">
+            padding:18px 28px 20px;border-bottom:1px solid #1e3a5f;
+            font-family:'Plus Jakarta Sans',system-ui,sans-serif">
   <div style="max-width:1400px;margin:0 auto">
     <div style="font-size:.92rem;color:#e2e8f0;font-weight:500;line-height:1.7;max-width:860px">
       This dashboard applies a <strong style="color:#60a5fa">physics-informed Extended Kalman Filter</strong>
@@ -531,7 +533,7 @@
               padding:14px 20px;border-left:4px solid var(--blue)">
     <div style="font-size:.74rem;font-weight:700;color:#3b82f6;text-transform:uppercase;
                 letter-spacing:.06em;margin-bottom:8px">How to read this dashboard</div>
-    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px">
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px">
       <div style="font-size:.78rem;color:#475569;line-height:1.6">
         <span style="font-weight:600;color:#0f172a">① Fleet Health</span> —
         Top-level KPIs and overall battery condition summary. Start here for a one-minute read.
@@ -695,24 +697,24 @@
           <div class="panel-hdr">Ranked Summary</div>
           <div class="panel-body" style="padding:0">
             <div style="max-height:420px;overflow-y:auto">
-              <table class="table table-sm mb-0" id="breakdownTable">
-                <thead style="background:#f8fafc;position:sticky;top:0;z-index:1">
+              <table class="table table-sm table-bordered mb-0 summary-table" id="breakdownTable">
+                <thead>
                   <tr>
-                    <th style="font-size:.72rem;font-weight:600;color:#475569;padding:8px 10px">Vehicle</th>
-                    <th class="text-end" style="font-size:.72rem;font-weight:600;color:#475569;padding:8px 10px">
+                    <th>Vehicle</th>
+                    <th class="text-end">
+                      SoH (%)
+                      <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top"
+                        data-bs-title="Current battery State of Health as % of original capacity. Below 80% = end of life.">ⓘ</span>
+                    </th>
+                    <th class="text-end">
                       RUL
                       <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top"
-                        data-bs-title="Remaining Useful Life in days (EKF point estimate). When this reaches zero, SoH hits 80% — the end-of-life threshold.">ⓘ</span>
+                        data-bs-title="Remaining Useful Life — days until SoH reaches 80% EoL threshold, computed from current SoH ÷ daily decline rate.">ⓘ</span>
                     </th>
-                    <th class="text-end" style="font-size:.72rem;font-weight:600;color:#475569;padding:8px 10px">
+                    <th class="text-end">
                       Proj. EoL
                       <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top"
-                        data-bs-title="Estimated calendar date when battery SoH reaches 80% (end-of-life threshold).">ⓘ</span>
-                    </th>
-                    <th class="text-end" style="font-size:.72rem;font-weight:600;color:#475569;padding:8px 10px">
-                      95% CI
-                      <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top"
-                        data-bs-title="95% confidence interval for the projected EoL date. Pessimistic (earliest) → Optimistic (latest).">ⓘ</span>
+                        data-bs-title="Estimated calendar date when battery SoH reaches 80%.">ⓘ</span>
                     </th>
                   </tr>
                 </thead>
@@ -880,12 +882,12 @@
       <div class="col-md-6">
         <div class="panel">
           <div class="panel-hdr">
-            Block Capacity (Ah) Distribution
+            Block SoH Distribution
             <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top"
-              data-bs-title="Block Capacity (Ah) is the total Amp-hours discharged across a complete drive-to-charge block — all discharge sessions between two charging events. Summed from the hves1_current sensor. A shrinking distribution over time indicates capacity fade. The nominal pack capacity is 436 Ah.">ⓘ</span>
+              data-bs-title="Block SoH is the State of Health computed for each complete discharge block — one value per block (deduplicated). Computed via Coulomb counting: (Ah discharged) ÷ (nominal capacity × SoC swing). Compares directly to Cycle SoH but shows the block-level granularity rather than per-session interpolation.">ⓘ</span>
           </div>
           <div class="panel-body" style="padding:12px">
-            <div id="blockCapHistPlot" style="height:280px"></div>
+            <div id="blockSohHistPlot" style="height:280px"></div>
           </div>
         </div>
       </div>
