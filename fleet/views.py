@@ -71,7 +71,7 @@ TIER1_SIGNALS = {
 }
 TIER2_NOTES = {
     "MH18BZ2648": "Highest flagged session count in fleet (124, 17.9%); degradation risk score 0.479",
-    "MH18BZ3198": "Fastest declining in tier 2 (−0.044%/day); projected replacement in ~1 year; 43 flagged sessions (8.4%)",
+    "MH18BZ3198": "Short data span",
     "MH18BZ2689": "61 flagged sessions (8.1%); degradation risk score 0.473",
     "MH18BZ2958": "36 flagged sessions (6.7%); degradation risk score 0.464",
 }
