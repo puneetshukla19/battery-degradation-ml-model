@@ -30,17 +30,18 @@ function rulToYears(days) {
 /* ─── init ───────────────────────────────────────────────────────────────────── */
 async function init() {
   try {
+    const _j = r => r.ok ? r.json() : Promise.reject(r.status);
     const [ov, veh, trend, quint, tiers, scatter, coef, delta, bdTimeline, dists] = await Promise.all([
-      fetch("/api/overview/").then(r => r.json()),
-      fetch("/api/vehicles/").then(r => r.json()),
-      fetch("/api/fleet-trend/").then(r => r.json()),
-      fetch("/api/quintiles/").then(r => r.json()),
-      fetch("/api/anomaly-tiers/").then(r => r.json()),
-      fetch("/api/soh-scatter/").then(r => r.json()),
-      fetch("/api/bayes-coef/").then(r => r.json()),
-      fetch("/api/soh-delta-trend/").then(r => r.json()),
-      fetch("/api/breakdown-timeline/").then(r => r.json()),
-      fetch("/api/distributions/").then(r => r.json()),
+      fetch("/api/overview/").then(_j),
+      fetch("/api/vehicles/").then(_j),
+      fetch("/api/fleet-trend/").then(_j),
+      fetch("/api/quintiles/").then(_j),
+      fetch("/api/anomaly-tiers/").then(_j),
+      fetch("/api/soh-scatter/").then(_j),
+      fetch("/api/bayes-coef/").then(_j),
+      fetch("/api/soh-delta-trend/").then(_j),
+      fetch("/api/breakdown-timeline/").then(_j).catch(() => null),
+      fetch("/api/distributions/").then(_j).catch(() => null),
     ]);
 
     _overview  = ov;
@@ -81,6 +82,11 @@ function renderKPICards() {
   const o = _overview;
   document.getElementById("kpiPeriod").textContent       = fmtPeriod(o.first_date, o.last_date);
   document.getElementById("kpiVehicles").textContent     = o.n_vehicles;
+  // Update hero callout + navbar vehicle count dynamically
+  const heroVeh = document.getElementById("heroVehicleCount");
+  if (heroVeh && o.n_vehicles != null) heroVeh.textContent = o.n_vehicles;
+  const navVeh = document.getElementById("navVehicleCount");
+  if (navVeh && o.n_vehicles != null) navVeh.textContent = o.n_vehicles;
   document.getElementById("kpiMeanSoh").textContent      = fmtPct(o.fleet_mean_soh);
   document.getElementById("kpiStdSoh").textContent       = fmtPct(o.fleet_std_soh);
   document.getElementById("kpiEkfRul").textContent       = rulToYears(o.median_ekf_rul);
