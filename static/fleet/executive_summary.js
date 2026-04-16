@@ -2547,6 +2547,11 @@ function _drawBreakdownChart(rows, eol, highlightReg) {
   const el = document.getElementById("breakdownTimelinePlot");
   if (!el) return;
 
+  // Exclude vehicles with near-flat slopes whose projected EoL is > 10 years out —
+  // they distort the x-axis scale without adding actionable information.
+  const MAX_RUL_DAYS = 3650;
+  rows = rows.filter(r => r.rul_days != null && r.rul_days <= MAX_RUL_DAYS);
+
   const TIER_COLOR = { 1: "#ef4444", 2: "#f59e0b", 3: "#22c55e", 0: "#6366f1" };
   const todayStr   = new Date().toISOString().slice(0, 10);
 
