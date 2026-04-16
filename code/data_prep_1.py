@@ -1,4 +1,4 @@
-import sys, os, warnings, gc
+import sys, os, warnings, gc, sqlite3
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) if "__file__" in dir() else os.getcwd())
 # Force UTF-8 output on Windows so special chars don't crash the console
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from config import (
-    BMS_FILE, GPS_FILE, VCU_FILE, CYCLES_CSV, SEQ_NPY, SEQ_META, DATA_DIR,
+    BMS_FILE, GPS_FILE, VCU_FILE, CYCLES_CSV, SESSIONS_ROWS_CSV, SEQ_NPY, SEQ_META, DATA_DIR, TELEMETRY_DB,
     VOLTAGE_RANGE, CURRENT_RANGE, CELL_V_RANGE, TEMP_RANGE, SOH_MIN,
     DISCHARGE_A, CHARGE_A, MIN_SESSION_MIN, MIN_BMS_ROWS, MAX_DT_MIN, TRIP_GAP_MIN,
     NUM_BINS, SEQ_FEATURES, SCALAR_FEATURES,
@@ -35,7 +35,7 @@ CELL_SPREAD_WARN = 0.02        # V — spread > this = notable imbalance
 MIN_DEPOT_SPEED_KPH   = 5.0    # kph — below this = candidate depot/idle position
 DEPOT_IDLE_MIN_DETECT = 30     # minutes gap before a stationary cluster counts as depot
 
-# capacity_soh quality gates (same as data_prep.py)
+# capacity_soh quality gates
 MIN_SOC_RANGE_PCT = 10.0
 MIN_REF_SESSIONS  = 5
 BMS_RATE_PER_HR   = 360
@@ -156,7 +156,7 @@ def _point_in_polygon_vec(lats, lons, polygon):
 
 
 def _label_direction_geofence(lats, lons):
-    """
+    """ 
     State-machine trip direction labeling using the fixed loading/unloading geofences.
 
     Outbound = vehicle leaving loading site toward unloading site (truck is loaded).
@@ -167,6 +167,15 @@ def _label_direction_geofence(lats, lons):
     directions : object array  — 'outbound' | 'inbound' | 'at_loading' |
                                  'at_unloading' | 'unknown'
     is_loaded  : bool array    — True while outbound (truck carries load)
+
+    i=0:  in_load=True   → state = "at_loading",  directions[0] = "at_loading"
+    i=1:  neither        → state is "at_loading"  → state = "outbound", directions[1] = "outbound"
+    i=2:  neither        → state is "outbound"    → state = "outbound", directions[2] = "outbound"
+    i=3:  neither        → state is "outbound"    → state = "outbound", directions[3] = "outbound"
+    i=4:  in_unload=True → state = "at_unloading", directions[4] = "at_unloading"
+    i=5:  neither        → state is "at_unloading" → state = "inbound", directions[5] = "inbound"
+    i=6:  neither        → state is "inbound"      → state = "inbound", directions[6] = "inbound"
+    i=7:  in_load=True   → state = "at_loading",  directions[7] = "at_loading"
     """
     lats = np.asarray(lats, dtype=float)
     lons = np.asarray(lons, dtype=float)
@@ -1028,8 +1037,9 @@ def compute_voltage_sag(df: pd.DataFrame, thresholds: dict = None) -> pd.DataFra
 
 def compute_ir_metrics(df: pd.DataFrame, thresholds: dict = None) -> pd.DataFrame:
     """
-    Per-row IR estimate: ir_ohm = |ΔV / ΔI| (valid when |ΔI| ≥ 2A).
-    high_ir_flag = True when ir_ohm > IR_THRESHOLD_MOHM/1000 at high current.
+    Per-row IR estimate: ir_ohm = |ΔV / ΔI| (computed wherever |ΔI| > 0).
+    high_ir_flag = True when ir_ohm > IR_THRESHOLD_MOHM/1000 at high current
+    with a meaningful current step (|ΔI| ≥ 2A).
 
     Session-level ir_ohm_mean, n_high_ir and rate-of-change (d_ir_per_cycle)
     are computed in extract_cycles().
@@ -1048,11 +1058,12 @@ def compute_ir_metrics(df: pd.DataFrame, thresholds: dict = None) -> pd.DataFram
         high_curr_thr = float(disc["current"].quantile(0.75))
         ir_thr_ohm    = IR_THRESHOLD_MOHM / 1000
 
-    _dv       = df.groupby(SK)["voltage"].diff()
-    _di       = df.groupby(SK)["current"].diff()
-    _valid_di = _di.abs() >= 2.0
+    _dv        = df.groupby(SK)["voltage"].diff()
+    _di        = df.groupby(SK)["current"].diff()
+    _nonzero   = _di.abs() > 0
+    _valid_di  = _di.abs() >= 2.0
 
-    df["ir_ohm"]       = np.where(_valid_di, _dv.abs() / _di.abs(), np.nan)
+    df["ir_ohm"]       = np.where(_nonzero, _dv.abs() / _di.abs(), np.nan)
     _hc                = df["current"] > high_curr_thr
     df["high_ir_flag"] = (
         (df["ir_ohm"] > ir_thr_ohm) & _hc & _valid_di
@@ -1289,7 +1300,26 @@ def extract_cycles(df: pd.DataFrame) -> pd.DataFrame:
 
     # ── Derived columns ───────────────────────────────────────────────────────
     agg["duration_hr"]   = (agg["end_time"] - agg["start_time"]) / 3_600_000
-    agg["energy_kwh"]    = agg["capacity_ah"] * agg["voltage_mean"] / 1000
+
+    # Net Ah from hves1_current (discharge_new − regen_new − plugin_new).
+    # Used for energy_kwh so that energy_per_loaded_session and all IF features
+    # that derive from energy_kwh use the accurate hves1 sensor instead of the
+    # legacy BMS current source (which under-reads by ~3×).
+    if (
+        "capacity_ah_discharge_new" in agg.columns
+        and "voltage_mean_new" in agg.columns
+        and agg["capacity_ah_discharge_new"].notna().any()
+    ):
+        agg["capacity_ah_new"] = (
+            agg["capacity_ah_discharge_new"]
+            - agg["capacity_ah_charge_new"].fillna(0)
+            - agg["capacity_ah_plugin_new"].fillna(0)
+        )
+        agg["energy_kwh"] = agg["capacity_ah_new"] * agg["voltage_mean_new"] / 1000
+        print("  energy_kwh: using hves1_current source (capacity_ah_new × voltage_mean_new)")
+    else:
+        agg["energy_kwh"] = agg["capacity_ah"] * agg["voltage_mean"] / 1000
+        print("  energy_kwh: using legacy BMS current source (capacity_ah × voltage_mean)")
 
     # capacity_ah_charge_total: regen + plugin (useful for charging-side SOH)
     agg["capacity_ah_charge_total"] = agg["capacity_ah_charge"] + agg["capacity_ah_plugin"]
@@ -1457,15 +1487,40 @@ def compute_block_linkage(agg: pd.DataFrame) -> pd.DataFrame:
     agg = agg.sort_values(["registration_number", "start_time"]).reset_index(drop=True)
 
     # ── Step 1: identify block boundaries from discharge + charging sessions ──
+    # Prefer hves1_current-derived Ah columns (_new) when available — they come
+    # from a dedicated current sensor and are more accurate than the BMS internal
+    # current used by the plain capacity_ah_discharge / capacity_ah_charge_total.
+    use_new_src = (
+        "capacity_ah_discharge_new"    in agg.columns and
+        "capacity_ah_charge_total_new" in agg.columns and
+        agg["capacity_ah_discharge_new"].notna().any()
+    )
+    disc_ah_col = "capacity_ah_discharge_new" if use_new_src else "capacity_ah_discharge"
+    if use_new_src:
+        print("  Block linkage: using hves1_current source (capacity_ah_discharge_new / "
+              "capacity_ah_charge_total_new) for block_capacity_ah")
+    else:
+        print("  Block linkage: using BMS current source (capacity_ah_discharge) for "
+              "block_capacity_ah — capacity_ah_discharge_new not available")
+
     active_mask = agg["session_type"].isin(["discharge", "charging"])
     active = agg.loc[active_mask, ["registration_number", "session_id",
                                    "session_type", "start_time",
                                    "soc_start", "soc_end",
-                                   "capacity_ah_discharge"]].copy()
-    if "capacity_ah_charge_total" in agg.columns:
+                                   disc_ah_col]].copy()
+    active = active.rename(columns={disc_ah_col: "_disc_ah"})
+
+    if use_new_src:
+        # capacity_ah_charge_total_new = regen + plug-in Ah from hves1_current.
+        # Consistent with capacity_soh_chg_new which also uses this combined total.
+        # For charge blocks (stationary plug-in events) regen ≈ 0, so this is
+        # effectively capacity_ah_plugin_new — the plug-in Ah that matters for SoH.
+        active["_chg_ah"] = agg.loc[active_mask, "capacity_ah_charge_total_new"].values
+    elif "capacity_ah_charge_total" in agg.columns:
         active["_chg_ah"] = agg.loc[active_mask, "capacity_ah_charge_total"].values
     else:
         active["_chg_ah"] = 0.0
+
     if "odometer_km" in agg.columns:
         active["_odo"] = agg.loc[active_mask, "odometer_km"].values
     else:
@@ -1484,13 +1539,13 @@ def compute_block_linkage(agg: pd.DataFrame) -> pd.DataFrame:
     block_agg = (
         active.groupby(["registration_number", "_block_id"], sort=False)
         .agg(
-            block_type        = ("session_type",          "first"),
-            block_soc_start   = ("soc_start",             "first"),
-            block_soc_end     = ("soc_end",               "last"),
-            block_capacity_ah = ("capacity_ah_discharge", "sum"),
-            _block_chg_ah     = ("_chg_ah",               "sum"),
-            block_n_sessions  = ("session_id",            "count"),
-            _block_odo        = ("_odo",                  "sum"),
+            block_type        = ("session_type", "first"),
+            block_soc_start   = ("soc_start",    "first"),
+            block_soc_end     = ("soc_end",       "last"),
+            block_capacity_ah = ("_disc_ah",      "sum"),
+            _block_chg_ah     = ("_chg_ah",       "sum"),
+            block_n_sessions  = ("session_id",    "count"),
+            _block_odo        = ("_odo",           "sum"),
         )
         .reset_index()
     )
@@ -2164,6 +2219,48 @@ if __name__ == "__main__":
     vehicle_bms_rates = []
     vehicle_vcu_rates = []
 
+    # ── Telemetry DB: drop and recreate so a re-run always gives a clean table ──
+    _tel_con = sqlite3.connect(TELEMETRY_DB)
+    _tel_con.execute("DROP TABLE IF EXISTS telemetry")
+    _tel_con.commit()
+    _tel_first_write = True   # first vehicle → create table; rest → append
+
+    # ── sessions_rows.csv: truncate on each run ───────────────────────────────
+    _srows_first_write = True  # first vehicle → write header; rest → append no header
+    if os.path.exists(SESSIONS_ROWS_CSV):
+        os.remove(SESSIONS_ROWS_CSV)
+
+    # Columns saved to sessions_rows.csv — a richer superset of TELEMETRY_COLS
+    # that includes raw measurements useful for analysis.
+    SESSIONS_ROWS_COLS = [
+        # Identity / time
+        "registration_number", "session_id", "session_type", "detailed_type", "gps_time",
+        # Location
+        "latitude", "longitude", "altitude", "speed", "vcu_odometer",
+        # Pack-level electrical
+        "voltage", "current", "soc",
+        "hves1_voltage_level", "hves1_current",
+        # Temperature
+        "temperature_highest", "temperature_lowest",
+        # Cell-level
+        "min_cell_voltage", "max_cell_voltage", "cell_spread",
+        "cell_undervoltage", "cell_overvoltage", "cell_spread_warn",
+        "min_cell_voltage_subsystem_number", "temperature_highest_subsystem_number",
+        # Derived health signals
+        "ir_ohm", "high_ir_flag", "_vsag",
+        # BMS SoH (if present)
+        "soh_bms",
+    ]
+
+    TELEMETRY_COLS = [
+        "registration_number", "session_id", "session_type", "gps_time",
+        "soc", "temperature_highest", "temperature_lowest", "cell_spread",
+        "ir_ohm", "_vsag", "speed",
+        "min_cell_voltage_subsystem_number",
+        "temperature_highest_subsystem_number",
+        "hves1_current", "hves1_voltage_level",
+    ]
+
     for reg in tqdm(vehicles, desc="Vehicles"):
         gps_v = gps_by_veh.get(reg, pd.DataFrame())
         vcu_v = vcu_by_veh.get(reg, pd.DataFrame())
@@ -2229,6 +2326,29 @@ if __name__ == "__main__":
         df_v = compute_voltage_sag(df_v, fleet_thr)
         df_v = compute_ir_metrics(df_v, fleet_thr)
 
+        # Step 6b: save unaggregated row-level data to SQLite (before aggregation)
+        _tel_cols = [c for c in TELEMETRY_COLS if c in df_v.columns]
+        _tel_chunk = df_v[_tel_cols].copy()
+        if not _tel_chunk.empty:
+            _tel_chunk.to_sql(
+                "telemetry", _tel_con,
+                if_exists="replace" if _tel_first_write else "append",
+                index=False,
+            )
+            _tel_first_write = False
+
+        # Step 6c: save unaggregated row-level data to sessions_rows.csv (before aggregation)
+        _srows_cols = [c for c in SESSIONS_ROWS_COLS if c in df_v.columns]
+        _srows_chunk = df_v[_srows_cols].copy()
+        if not _srows_chunk.empty:
+            _srows_chunk.to_csv(
+                SESSIONS_ROWS_CSV,
+                mode="a",
+                header=_srows_first_write,
+                index=False,
+            )
+            _srows_first_write = False
+
         # Step 7: session-level aggregation
         cycles_v = extract_cycles(df_v)
         if cycles_v.empty:
@@ -2285,6 +2405,10 @@ if __name__ == "__main__":
 
         del df_v; gc.collect()  # free per-vehicle RAM immediately
 
+    # Close telemetry DB
+    _tel_con.close()
+    print(f"  Telemetry DB written → {TELEMETRY_DB}")
+
     # Free raw data dicts — no longer needed after vehicle loop
     del bms_by_veh, gps_by_veh, vcu_by_veh, curr_by_veh; gc.collect()
 
@@ -2335,10 +2459,6 @@ if __name__ == "__main__":
 
     # ── Cycle SOH (paired disc+chg block, interpolated to all sessions) ───────
     cycles = add_cycle_soh(cycles)
-
-    # ── Alerts join ───────────────────────────────────────────────────────────
-    alerts_agg = load_alerts(ALERTS_FILE)
-    cycles = join_alerts_onto_cycles(cycles, alerts_agg)
 
     # ── Final sanity report ───────────────────────────────────────────────────
     n_disc = (cycles["session_type"] == "discharge").sum()
@@ -2437,6 +2557,7 @@ if __name__ == "__main__":
         # Capacity / energy — hves1 source (Source B)
         "capacity_ah_discharge_new", "capacity_ah_charge_new",
         "capacity_ah_plugin_new", "capacity_ah_charge_total_new",
+        "capacity_ah_new",
         "energy_kwh", "energy_per_km", "charging_rate_kw",
         # Voltage sag
         "n_vsag", "d_vsag_per_cycle",
@@ -2483,22 +2604,6 @@ if __name__ == "__main__":
         "c_rate_chg", "dod_stress", "thermal_stress", "energy_per_loaded_session",
         # Load direction
         "load_direction_enc",
-        # Alert counts (per-day totals joined from alerts_full_ultratech_intangles.csv)
-        "total_alerts",
-        "motor_total_faults", "motor_temperature_alarm", "mcu_temperature_alarm",
-        "over_current_alarm", "over_voltage_alarm", "under_voltage_alarm",
-        "battery_overcharge_fault", "insulation_fault", "cell_voltage_diff_fault",
-        "battery_mismatch_alarm", "soc_jump_alarm", "soc_over_high_alarm", "soc_over_low_alarm",
-        "cell_over_high_alarm", "cell_over_low_alarm",
-        "battery_over_high_voltage_alarm", "battery_over_low_voltage_alarm",
-        "temperature_over_high_alarm", "temperature_diff_fault_alarm",
-        "hv_connector_level1_fault", "soc_over_low_level1_fault",
-        "recharge_current_over_high_l1", "discharge_current_over_high_l1",
-        "total_voltage_over_high_l1_fault", "total_voltage_over_low_l1_fault",
-        "cell_voltage_over_high_l1_fault", "cell_voltage_over_low_l1_fault",
-        "charge_current_over_high_l1", "battery_insulation_l1_fault",
-        "battery_over_high_temperature_l1_fault",
-        "highest_fault_level", "battery_alarm_level_fault", "hall_sensor_fault", "hv_fault",
     ]
     _existing = [c for c in _col_order if c in cycles.columns]
     _remaining = [c for c in cycles.columns if c not in set(_existing)]
@@ -2519,6 +2624,10 @@ if __name__ == "__main__":
         shutil.move(_tmp, alt)
         print(f"\nPermissionError on {CYCLES_CSV} (open in Excel?).")
         print(f"Saved cycles → {alt}  ({len(cycles):,} sessions)")
+
+    if os.path.exists(SESSIONS_ROWS_CSV):
+        _srows_size = os.path.getsize(SESSIONS_ROWS_CSV) / 1e6
+        print(f"Saved sessions_rows → {SESSIONS_ROWS_CSV}  ({_srows_size:.0f} MB)")
 
     # ── Sequence extraction ───────────────────────────────────────────────────
     print("\nExtracting discharge sequences ...")

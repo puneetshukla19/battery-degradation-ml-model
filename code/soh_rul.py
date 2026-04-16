@@ -165,38 +165,101 @@ def rul_dual_axis(fit: dict, current_soh: float,
 
 # ── Bayesian Ridge per vehicle ─────────────────────────────────────────────────
 
+def select_features_for_vehicle(extra_features: np.ndarray,
+                                feature_names: list,
+                                y: np.ndarray,
+                                nan_thresh: float = 0.5,
+                                corr_thresh: float = 0.85):
+    """
+    Per-vehicle feature selection before BayesianRidge.
+    Steps:
+      1. Drop columns with > nan_thresh fraction of NaN values
+      2. Drop constant columns (std < 1e-6 after imputation)
+      3. Drop one from each highly correlated pair (|r| > corr_thresh)
+         — keep the feature with higher |correlation to y|
+    Returns (filtered_array, filtered_names).
+    """
+    if extra_features is None or len(feature_names) == 0:
+        return extra_features, feature_names
+
+    df = pd.DataFrame(extra_features, columns=feature_names)
+    # Convert all columns to numeric (handles booleans, objects)
+    df = df.apply(pd.to_numeric, errors="coerce")
+    n = len(df)
+
+    # Step 1: drop high-NaN columns
+    keep = [c for c in df.columns if df[c].isna().sum() / n <= nan_thresh]
+    df = df[keep]
+
+    # Step 2: impute with column median, then drop constants
+    df = df.fillna(df.median(numeric_only=True))
+    keep = [c for c in df.columns if df[c].std() > 1e-6]
+    df = df[keep]
+
+    if df.empty:
+        return None, []
+
+    # Step 3: drop correlated pairs — keep better corr to y
+    y_s = pd.Series(y)
+    corr_to_y = {c: abs(df[c].corr(y_s)) for c in df.columns}
+    feat_corr = df.corr().abs()
+    dropped = set()
+    cols = list(df.columns)
+    for i in range(len(cols)):
+        for j in range(i + 1, len(cols)):
+            if cols[i] in dropped or cols[j] in dropped:
+                continue
+            if feat_corr.loc[cols[i], cols[j]] > corr_thresh:
+                if corr_to_y.get(cols[i], 0) >= corr_to_y.get(cols[j], 0):
+                    dropped.add(cols[j])
+                else:
+                    dropped.add(cols[i])
+
+    final_cols = [c for c in cols if c not in dropped]
+    return df[final_cols].values.astype(np.float64), final_cols
+
+
 def bayesian_rul_vehicle(efc: np.ndarray, days: np.ndarray,
                          soh: np.ndarray,
                          eol: float = EOL_SOH,
                          daily_efc_rate: float = np.nan,
-                         extra_features: np.ndarray | None = None) -> dict:
+                         extra_features: np.ndarray | None = None,
+                         feature_names: list | None = None) -> dict:
     """
-    Fit BayesianRidge on [cum_efc, days_since_first, efc*days, ...extra] → capacity_soh.
-    extra_features: optional (n, k) array of additional per-session features
-                    (e.g. cycle_soh, ir_ohm_mean, cell_spread_mean, temp_mean).
-    Returns point-estimate SOH, 1-sigma uncertainty, and RUL estimate.
+    Fit BayesianRidge on [cum_efc, days_since_first, efc*days, ...extra] → ekf_soh.
+    Runs per-vehicle feature selection on extra_features before fitting.
+    Returns point-estimate SOH, 1-sigma uncertainty, RUL estimate, and coefficients.
     """
     n = len(soh)
     empty = {"bayes_soh_pred": np.nan, "bayes_soh_std": np.nan,
-             "bayes_rul_days": np.nan}
+             "bayes_rul_days": np.nan, "bayes_coef": {}, "bayes_features_used": []}
     if n < 5:
         return empty
 
+    # Per-vehicle feature selection
+    if extra_features is not None and feature_names is not None:
+        extra_features, feature_names = select_features_for_vehicle(
+            extra_features, feature_names, soh
+        )
+
     base = np.column_stack([efc, days, efc * days])
-    if extra_features is not None and extra_features.shape[0] == n:
-        # Replace NaN in extra features with column medians before stacking
-        ef = extra_features.copy().astype(float)
-        col_medians = np.nanmedian(ef, axis=0)
-        for c in range(ef.shape[1]):
-            ef[np.isnan(ef[:, c]), c] = col_medians[c]
-        X = np.column_stack([base, ef])
+    if extra_features is not None and hasattr(extra_features, 'shape') and extra_features.shape[0] == n:
+        # Extra features already imputed by select_features_for_vehicle
+        X = np.column_stack([base, extra_features])
     else:
         X = base
+        feature_names = []
+
     model = BayesianRidge(max_iter=500)
     try:
         model.fit(X, soh)
     except Exception:
         return empty
+
+    # Capture coefficients
+    base_names = ["cum_efc", "days_since_first_session", "efc_x_days"]
+    all_feat_names = base_names + (list(feature_names) if feature_names else [])
+    coef_dict = dict(zip(all_feat_names, model.coef_.tolist()))
 
     # Predict at the latest observation point
     X_last = X[[-1]]
@@ -207,14 +270,12 @@ def bayesian_rul_vehicle(efc: np.ndarray, days: np.ndarray,
     if soh_pred <= eol:
         bayes_rul = 0.0
     elif np.isfinite(daily_efc_rate) and daily_efc_rate > 0:
-        # Approximate gradient: d(SoH)/d(day) via finite differences
         efc_last, day_last = float(efc[-1]), float(days[-1])
-        delta = 1.0   # 1 day ahead
+        delta = 1.0
         base_next = [efc_last + daily_efc_rate * delta,
                      day_last + delta,
                      (efc_last + daily_efc_rate * delta) * (day_last + delta)]
-        if extra_features is not None and extra_features.shape[0] == n:
-            # Forward-project extra features by repeating last row
+        if extra_features is not None and hasattr(extra_features, 'shape') and extra_features.shape[0] == n:
             X_next = np.array([base_next + list(X[-1, 3:])])
         else:
             X_next = np.array([base_next])
@@ -228,9 +289,11 @@ def bayesian_rul_vehicle(efc: np.ndarray, days: np.ndarray,
         bayes_rul = np.inf
 
     return {
-        "bayes_soh_pred": round(soh_pred, 3),
-        "bayes_soh_std":  round(soh_std, 3),
-        "bayes_rul_days": _finite(bayes_rul),
+        "bayes_soh_pred":      round(soh_pred, 3),
+        "bayes_soh_std":       round(soh_std, 3),
+        "bayes_rul_days":      _finite(bayes_rul),
+        "bayes_coef":          coef_dict,
+        "bayes_features_used": all_feat_names,
     }
 
 
@@ -331,6 +394,8 @@ if __name__ == "__main__":
     # ── Per-vehicle trend fitting ──────────────────────────────────────────────
     np.random.seed(42)
     vehicle_results = []
+    coef_rows = []
+    BAYES_COEF_FILE = os.path.join(ARTIFACTS_DIR, "bayes_coefficients.csv")
     fleet_soh_slopes, fleet_epk_slopes, fleet_heat_slopes = [], [], []
 
     has_epk        = "energy_per_km"    in disc.columns
@@ -477,6 +542,7 @@ if __name__ == "__main__":
                         bayes_efc, bayes_days, bayes_y,
                         daily_efc_rate=avg_efc_per_day,
                         extra_features=extra_arr,
+                        feature_names=avail_ekf,
                     )
                 else:
                     # Fallback: old capacity_soh path when EKF unavailable
@@ -490,7 +556,17 @@ if __name__ == "__main__":
                     extra_arr = veh_chg[avail_fb].values if avail_fb else None
                     bayes_row = bayesian_rul_vehicle(chg_efc, chg_days, chg_cap,
                                                      daily_efc_rate=avg_efc_per_day,
-                                                     extra_features=extra_arr)
+                                                     extra_features=extra_arr,
+                                                     feature_names=avail_fb)
+
+        # Collect BayesianRidge coefficients for CSV export
+        if bayes_row.get("bayes_coef"):
+            coef_entry = {"registration_number": reg}
+            coef_entry.update(bayes_row["bayes_coef"])
+            coef_rows.append(coef_entry)
+        # Strip non-scalar keys before merging into row dict
+        bayes_row = {k: v for k, v in bayes_row.items()
+                     if k not in ("bayes_coef", "bayes_features_used")}
 
         row = {
             "registration_number":  reg,
@@ -646,6 +722,11 @@ if __name__ == "__main__":
         })
 
     rul_df = pd.DataFrame(vehicle_results)
+
+    # Save BayesianRidge coefficients (per-vehicle, post feature-selection)
+    if coef_rows:
+        pd.DataFrame(coef_rows).to_csv(BAYES_COEF_FILE, index=False)
+        print(f"Saved Bayesian coefficients: {BAYES_COEF_FILE}")
 
     # ── Composite degradation score ───────────────────────────────────────────
     # Each slope is normalised to [0,1] across the fleet (higher = worse):

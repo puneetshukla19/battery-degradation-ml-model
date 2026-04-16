@@ -19,7 +19,9 @@ os.makedirs(PLOTS_DIR, exist_ok=True)
 BMS_FILE   = os.path.join(DATA_DIR, "bms_full_ultratech_intangles_more_cols_full.csv")
 GPS_FILE   = os.path.join(DATA_DIR, "gps_full_ultratech_intangles.csv")
 VCU_FILE   = os.path.join(DATA_DIR, "vcu_full_ultratech_intangles.csv")
-CYCLES_CSV = os.path.join(ARTIFACTS_DIR, "cycles.csv")        # one row per session
+CYCLES_CSV        = os.path.join(ARTIFACTS_DIR, "cycles.csv")         # one row per session
+SESSIONS_ROWS_CSV = os.path.join(ARTIFACTS_DIR, "sessions_rows.csv")  # unaggregated row-level CSV
+TELEMETRY_DB      = os.path.join(ARTIFACTS_DIR, "telemetry.db")       # unaggregated row-level SQLite
 SEQ_NPY    = os.path.join(ARTIFACTS_DIR, "sequences.npy")      # discharge sequences (N, BINS, FEATS)
 SEQ_META   = os.path.join(ARTIFACTS_DIR, "sequence_meta.csv")  # maps seq index → vehicle / cycle
 

@@ -73,7 +73,7 @@ IF_FEATURE_DIRECTION = {
     "energy_per_loaded_session":"high",
     "current_mean_discharge":   "high",
     "current_max":              "high",
-    "capacity_ah_discharge":    "low",
+    "capacity_ah_discharge_new":"low",   # hves1_current discharge Ah (replaces legacy BMS source)
     "insulation_mean":          "low",
     "odometer_km":              "any",
     "speed_mean":               "any",
@@ -87,7 +87,7 @@ IF_FEATURES = [
     "voltage_mean", "voltage_min",
     "cell_spread_mean", "cell_spread_max",
     "temp_max", "temp_mean", "temp_rise_rate", "temp_lowest_mean",
-    "capacity_ah", "capacity_ah_discharge", "capacity_ah_new", "duration_hr",
+    "capacity_ah", "capacity_ah_discharge_new", "capacity_ah_new", "duration_hr",
     # SoC / SoH
     "soc_range", "soc_diff",        # soc_diff negative for discharge; deep discharge = more negative
     "soh",                          # BMS SoH (integer-stepped; kept for continuity)
@@ -128,8 +128,8 @@ IF_FEATURES = [
 ]
 
 # CUSUM parameters
-CUSUM_K = 0.5   # allowance (half the shift size to detect), in std units
-CUSUM_H = 4.0   # decision threshold in std units (lower = more sensitive)
+CUSUM_K = 0.75  # allowance (half the shift size to detect), in std units
+CUSUM_H = 6.0   # decision threshold in std units (lower = more sensitive)
 
 
 def _build_if_reason(X_orig: pd.DataFrame, X_scaled: np.ndarray,
@@ -252,11 +252,15 @@ def cusum_per_vehicle(series: pd.Series, k: float = CUSUM_K,
     mu, sigma = series.mean(), series.std()
     if sigma < 1e-6:
         return pd.Series(False, index=series.index)
-    z     = (series - mu) / sigma
-    cusum = np.zeros(len(z))
+    z      = (series - mu) / sigma
+    alarms = np.zeros(len(z), dtype=bool)
+    c      = 0.0
     for i in range(1, len(z)):
-        cusum[i] = max(0, cusum[i - 1] - z.iloc[i] - k)
-    return pd.Series(cusum > h, index=series.index)
+        c = max(0.0, c - z.iloc[i] - k)
+        if c > h:
+            alarms[i] = True
+            c = 0.0   # reset: each alarm is a fresh detection, not a persistent flag
+    return pd.Series(alarms, index=series.index)
 
 
 def run_cusum_signals(disc: pd.DataFrame) -> pd.DataFrame:
@@ -826,8 +830,67 @@ if __name__ == "__main__":
     disc["cusum_reason"]   = _build_cusum_reason(disc)
     disc["anomaly_reason"] = _build_combined_reason(disc)
 
-    disc.to_csv(ANOMALY_FILE, index=False)
-    print(f"Saved: {ANOMALY_FILE}")
+    # ── Charging sessions: CUSUM only (no Isolation Forest) ─────────────────
+    print("\nProcessing charging sessions for CUSUM anomaly detection ...")
+    chg = cycles[cycles["session_type"] == "charging"].copy()
+    chg = chg.sort_values(["registration_number", "start_time"]).reset_index(drop=True)
+    print(f"Charging sessions loaded: {len(chg):,} across "
+          f"{chg['registration_number'].nunique()} vehicles")
+
+    if os.path.exists(EKF_CSV):
+        # EKF rows are created at charging sessions — direct merge (no forward-fill needed)
+        chg = chg.merge(
+            ekf_raw,
+            on=["registration_number", "start_time"],
+            how="left",
+        )
+        chg["ekf_soh_delta"] = (
+            chg.groupby("registration_number")["ekf_soh"].diff()
+        )
+        n_ekf_chg = chg["ekf_soh"].notna().sum()
+        print(f"EKF SoH merged: {n_ekf_chg:,}/{len(chg):,} charging sessions "
+              f"({n_ekf_chg/len(chg):.1%})")
+    else:
+        chg["ekf_soh"]       = np.nan
+        chg["ekf_soh_delta"] = np.nan
+
+    # IF not applicable to charging sessions
+    chg["if_score"]   = 0.0
+    chg["if_anomaly"] = False
+    chg["if_reason"]  = ""
+
+    # Run CUSUM signals on charging sessions
+    chg = run_cusum_signals(chg)
+
+    # Combined flag for charging: CUSUM only (no IF)
+    chg["anomaly"] = chg["cusum_alarm"]
+
+    # Model C: Enhanced CUSUM on composite score + trend slopes
+    chg = run_cusum_composite(chg)
+
+    # Extend combined flag to include composite CUSUM
+    chg["anomaly"] |= (
+        chg["cusum_composite_alarm"]  |
+        chg["cusum_ir_slope_alarm"]   |
+        chg["cusum_spread_slope_alarm"]
+    )
+
+    # Reason codes
+    chg["cusum_reason"]   = _build_cusum_reason(chg)
+    chg["anomaly_reason"] = _build_combined_reason(chg)
+
+    n_chg_anom = int(chg["anomaly"].sum())
+    print(f"Charging anomalies detected: {n_chg_anom:,} of {len(chg):,} sessions")
+
+    # ── Combine discharge + charging and save ─────────────────────────────────
+    combined = (
+        pd.concat([disc, chg], ignore_index=True)
+        .sort_values(["registration_number", "start_time"])
+        .reset_index(drop=True)
+    )
+    combined.to_csv(ANOMALY_FILE, index=False)
+    print(f"Saved: {ANOMALY_FILE}  ({len(combined):,} total: "
+          f"{len(disc):,} discharge + {len(chg):,} charging)")
 
     # ── Model A: LightGBM SOH Regressor ───────────────────────────────────────
     print("\nRunning Model A: LightGBM SOH Regressor ...")
