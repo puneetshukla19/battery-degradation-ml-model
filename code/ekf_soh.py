@@ -287,9 +287,11 @@ def run_ekf_fleet(cycles: pd.DataFrame) -> pd.DataFrame:
                 r_csoh_override = float(EKF_R_DIAG[0]) * scale  # R_base * scaling factor
 
             # Build observation vector — temp_rise_rate demeaned by fleet baseline
+            # bms_soh (z[1]) excluded: BMS SoH is integer-stepped and biased;
+            # cycle_soh provides a cleaner direct SoH signal.
             z = np.array([
                 csoh_obs,
-                float(row["soh"])        if pd.notna(row.get("soh"))          else np.nan,
+                np.nan,                  # bms_soh excluded
                 float(row["ir_ohm_mean"]) if pd.notna(row.get("ir_ohm_mean")) else np.nan,
                 float(row["cell_spread_mean"]) if pd.notna(row.get("cell_spread_mean")) else np.nan,
                 (float(row["temp_rise_rate"]) - fleet_temp_mu)

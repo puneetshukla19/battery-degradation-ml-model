@@ -440,10 +440,9 @@ function renderAnomalyTiers() {
   const eol = (_overview && _overview.eol_threshold) || 80;
   // Compute RUL the same way as the RUL scatter chart: (SoH headroom) / |daily slope|
   const rulDisplay = (v) => {
-    const slope = v.soh_slope;
-    if (v.current_soh == null || slope == null || slope >= 0) return "—";
-    const days = Math.max(0, Math.round((v.current_soh - eol) / Math.abs(slope)));
-    return `${days.toLocaleString()} d<br><span style="color:#94a3b8;font-size:.75rem">(${(days/365.25).toFixed(1)} yr)</span>`;
+    const days = v.rul_days;  // EKF RUL from server (ekf_rul_days)
+    if (days == null) return "—";
+    return `${Math.round(days).toLocaleString()} d<br><span style="color:#94a3b8;font-size:.75rem">(${(days/365.25).toFixed(1)} yr)</span>`;
   };
 
   const vRow = (v, signal, color) =>

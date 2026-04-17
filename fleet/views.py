@@ -686,10 +686,10 @@ def api_breakdown_timeline(request):
     ref_ts = pd.to_datetime(ekf["start_time"], unit="ms").max()
     ref_date_str = ref_ts.strftime("%Y-%m-%d")
 
-    # Latest EKF SoH per vehicle (for display)
+    # Latest EKF SoH + RUL per vehicle (for display)
     last_ekf = (
         ekf.sort_values("start_time")
-           .groupby("registration_number")[["ekf_soh", "ekf_soh_std"]]
+           .groupby("registration_number")[["ekf_soh", "ekf_soh_std", "ekf_rul_days"]]
            .last()
     )
 
@@ -714,15 +714,11 @@ def api_breakdown_timeline(request):
         slope      = r.get("soh_slope_%per_day")
         composite  = r.get("composite_degradation_score")
 
-        # Slope-based RUL — same formula used in the tier table JS (renderAnomalyTiers)
-        rul_days = None
-        if (curr_soh is not None and pd.notna(curr_soh) and
-                slope is not None and pd.notna(slope) and float(slope) < 0):
-            rul_days = max(0.0, (float(curr_soh) - EOL) / abs(float(slope)))
-
         ekf_row   = last_ekf.loc[reg] if reg in last_ekf.index else None
-        ekf_soh   = float(ekf_row["ekf_soh"])   if ekf_row is not None and pd.notna(ekf_row["ekf_soh"])   else None
+        ekf_soh   = float(ekf_row["ekf_soh"])     if ekf_row is not None and pd.notna(ekf_row["ekf_soh"])     else None
         ekf_std   = float(ekf_row["ekf_soh_std"]) if ekf_row is not None and pd.notna(ekf_row["ekf_soh_std"]) else None
+        # Use EKF RUL (consistent with KPI card and anomaly tiers)
+        rul_days  = float(ekf_row["ekf_rul_days"]) if ekf_row is not None and pd.notna(ekf_row["ekf_rul_days"]) else None
 
         tier = 1 if reg in TIER1 else (2 if reg in TIER2 else (3 if reg in TIER3 else 0))
 
