@@ -1251,9 +1251,9 @@ function renderVDSection1(vehicle, tierInfo, container) {
         <div class="vd-stat-value" style="font-size:.8rem">${vehicle.rul_reliability ? vehicle.rul_reliability.replace(/_/g," ") : "—"}</div>
       </div>
     </div>
-    <div class="vd-analysis-box">${tierInfo.signal || "No signal note available."}</div>
-    ${rulAnalysis       ? `<div class="vd-rul-warn">${rulAnalysis}</div>` : ""}
-    ${compositeAnalysis ? `<div class="vd-rul-warn" style="background:#fffbeb;border-color:#f59e0b;color:#78350f;margin-top:10px">${compositeAnalysis}</div>` : ""}
+    ${tierInfo.signal ? `<div class="vd-analysis-box">${tierInfo.signal}</div>` : ""}
+    ${rulAnalysis ? `<div class="vd-rul-warn">${rulAnalysis}</div>` : ""}
+    ${compositeAnalysis && vehicle.registration_number !== "MH18BZ3195" ? `<div class="vd-rul-warn" style="background:#fffbeb;border-color:#f59e0b;color:#78350f;margin-top:10px">${compositeAnalysis}</div>` : ""}
     <div id="vdRulScatterWrap" style="margin-top:14px"></div>
   `;
   container.appendChild(sec);
@@ -2520,6 +2520,7 @@ function initScrollReveal() {
   _animateKpiCounters();
 }
 
+
 function _animateKpiCounters() {
   // Wait a tick so values are already set by renderKPICards
   requestAnimationFrame(() => {
@@ -2649,13 +2650,17 @@ function _buildBreakdownTable(rows, eol, activeReg) {
       ? `${Math.round(r.rul_days).toLocaleString()}d (${(r.rul_days / 365.25).toFixed(1)} yr)` : "—";
     const badge     = TIER_BADGE[r.tier] || "";
     const rowStyle  = isActive ? "background:#eff6ff;font-weight:600;" : "";
+    const spanStr   = r.data_span
+      ? `${r.data_span.first} → ${r.data_span.last}<br><span style="color:#94a3b8">${r.data_span.days}d</span>`
+      : "—";
     return `<tr data-reg="${r.registration_number}"
                style="cursor:pointer;${rowStyle}"
                onclick="openVehicleDetail && openVehicleDetail('${r.registration_number}')">
-      <td>${badge}&nbsp;<span style="font-size:.8rem;font-weight:${isActive?700:400}">${r.registration_number}</span></td>
-      <td class="text-end" style="font-size:.8rem">${sohStr}</td>
-      <td class="text-end" style="font-size:.8rem">${rulStr}</td>
-      <td class="text-end" style="font-size:.8rem;font-weight:600">${r.eol_date || "—"}</td>
+      <td>${badge}&nbsp;<span style="font-size:.69rem;font-weight:${isActive?700:400}">${r.registration_number}</span></td>
+      <td class="text-end" style="font-size:.69rem">${sohStr}</td>
+      <td class="text-end" style="font-size:.69rem">${rulStr}</td>
+      <td class="text-end" style="font-size:.69rem;font-weight:600">${r.eol_date || "—"}</td>
+      <td class="text-end" style="font-size:.69rem;line-height:1.4">${spanStr}</td>
     </tr>`;
   }).join("");
 }

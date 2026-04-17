@@ -150,6 +150,14 @@
     /* Quintile table: no sticky header (short table, no scroll) */
     #quintileTable thead th { position: static; }
 
+    /* Tier tables: light header (no dark background) */
+    #tier1Table thead th,
+    #tier2Table thead th,
+    #tier3Table thead th {
+      background: #f1f5f9; color: #475569;
+      position: sticky; top: 0; z-index: 2;
+    }
+
     /* ── Coef warning ── */
     .coef-warn { background: #fffbeb; color: #92400e; padding: 8px 12px; font-size: 0.8rem; border-radius: 6px; border: 1px solid #fcd34d; }
 
@@ -325,7 +333,7 @@
           <div class="table-scroll" style="max-height:300px;overflow-y:auto;overflow-x:auto">
             <table class="table table-sm mb-0" id="tier2Table">
               <thead>
-                <tr><th>Vehicle</th><th>Note</th><th class="text-end">SoH (%)</th><th class="text-end">Slope (%/d)</th><th class="text-end">Composite</th><th class="text-end">Anomalies</th></tr>
+                <tr><th>Vehicle</th><th>Reason</th><th class="text-end">SoH (%)</th><th class="text-end">Slope (%/d)</th><th class="text-end">Composite</th><th class="text-end">Anomalies</th></tr>
               </thead>
               <tbody></tbody>
             </table>
@@ -349,7 +357,7 @@
           <div class="table-scroll" style="max-height:300px;overflow-y:auto;overflow-x:auto">
             <table class="table table-sm mb-0" id="tier3Table">
               <thead>
-                <tr><th>Vehicle</th><th>Note</th><th class="text-end">SoH (%)</th><th class="text-end">Slope (%/d)</th><th class="text-end">Composite</th><th class="text-end">Anomalies</th></tr>
+                <tr><th>Vehicle</th><th>Reason</th><th class="text-end">SoH (%)</th><th class="text-end">Slope (%/d)</th><th class="text-end">Composite</th><th class="text-end">Anomalies</th></tr>
               </thead>
               <tbody></tbody>
             </table>
@@ -470,6 +478,6 @@
 </div><!-- /page-body -->
 
 {% load static %}
-<script src="{% static 'fleet/dashboard.js' %}?v=42"></script>
+<script src="{% static 'fleet/dashboard.js' %}?v=43"></script>
 </body>
 </html>

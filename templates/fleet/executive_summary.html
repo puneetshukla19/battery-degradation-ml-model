@@ -135,11 +135,11 @@
       font-size: 0.65rem; color: #93c5fd; margin-left: 4px;
     }
 
-    /* Tier + Quintile + Breakdown tables — light header */
-    #quintileTable thead th,
+    /* Tier + Breakdown tables — light header */
     #tier1Table thead th,
     #tier2Table thead th,
-    #tier3Table thead th,
+    #tier3Table thead th { font-size: 0.69rem; background: #f1f5f9 !important; color: #475569 !important; }
+    #breakdownTable { font-size: 0.69rem; }
     #breakdownTable thead th {
       position: static;
       background: #f8fafc;
@@ -205,6 +205,7 @@
       vertical-align: middle;
     }
     .tooltip { --bs-tooltip-font-size: .71rem; }
+    .tooltip-wide .tooltip-inner { max-width: none; white-space: nowrap; text-align: left; }
 
     /* ── Hover chart panel ── */
     #hoverPanel {
@@ -423,7 +424,7 @@
 <!-- ── Navbar ──────────────────────────────────────────────────────────────── -->
 <nav class="top-nav">
   <div>
-    <span class="brand">Battery Health for <span>Ultratech</span> Fleet — Executive Summary</span>
+    <span class="brand">Battery Health for <span>Ultratech</span> Fleet</span>
     <div style="font-size:.68rem;color:#7dd3fc;margin-top:2px;font-weight:400;letter-spacing:.01em">
       Real-time battery intelligence · <span id="navVehicleCount">—</span> vehicles · predictive maintenance analytics
     </div>
@@ -431,16 +432,19 @@
 </nav>
 
 <!-- ── Investor Hero Callout ──────────────────────────────────────────────── -->
-<div style="background:linear-gradient(135deg,#0f172a 0%,#1e3a5f 100%);
-            padding:18px 28px 20px;border-bottom:1px solid #1e3a5f;
-            font-family:'Plus Jakarta Sans',system-ui,sans-serif">
-  <div style="max-width:1400px;margin:0 auto">
-    <div style="font-size:.92rem;color:#e2e8f0;font-weight:500;line-height:1.7;max-width:860px">
-      This dashboard applies a <strong style="color:#60a5fa">physics-informed Extended Kalman Filter</strong>
-      and <strong style="color:#60a5fa">Bayesian Ridge degradation model</strong> to continuously
-      track battery State of Health across Ultratech's <span id="heroVehicleCount">—</span>-vehicle EV fleet — providing
-      evidence-based replacement forecasts, maintenance prioritisation, and real-time anomaly
-      alerts that reduce unplanned downtime and protect warranty claim eligibility.
+<div style="background:#1e3a5f;
+            padding:18px 0 20px;border-top:1px solid #2d5a8e;border-bottom:1px solid #163354;">
+  <div style="max-width:1400px;margin:0 auto;padding:0 28px">
+    <div style="font-size:.78rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#7dd3fc;margin-bottom:6px">
+      Executive Summary
+    </div>
+    <div style="font-size:.84rem;color:#e2e8f0;font-weight:500;line-height:1.7">
+      This dashboard applies <span data-bs-toggle="tooltip" data-bs-placement="right" data-bs-html="true" data-bs-custom-class="tooltip-wide"
+        data-bs-title="<b>1.</b> Extended Kalman Filter (EKF) — real-time SoH tracking<br><b>2.</b> Bayesian Ridge Regression — degradation trend modelling<br><b>3.</b> Isolation Forest — sudden anomaly detection<br><b>4.</b> CUSUM — gradual drift detection"
+        style="cursor:help;color:#93c5fd;text-decoration:underline dotted;text-underline-offset:3px;text-decoration-color:#93c5fd">four Artificial Intelligence models<sup style="font-size:.65em;line-height:0;vertical-align:super">ⓘ</sup></span>
+      to continuously track battery State of Health across Ultratech's <span id="heroVehicleCount">—</span>-vehicle EV fleet —
+      identifying Remaining Useful Life, evidence-based replacement forecasts, maintenance prioritisation,
+      and real-time anomaly alerts that reduce unplanned downtime and protect warranty claim eligibility.
     </div>
     <div style="display:flex;gap:24px;margin-top:12px;flex-wrap:wrap">
       <span style="font-size:.74rem;color:#94a3b8">
@@ -534,29 +538,29 @@
     <div style="font-size:.74rem;font-weight:700;color:#3b82f6;text-transform:uppercase;
                 letter-spacing:.06em;margin-bottom:8px">How to read this dashboard</div>
     <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px">
-      <div style="font-size:.78rem;color:#475569;line-height:1.6">
-        <span style="font-weight:600;color:#0f172a">① Fleet Health</span> —
-        Top-level KPIs and overall battery condition summary. Start here for a one-minute read.
+      <div style="font-size:.78rem;color:#475569;line-height:1.6;display:flex;gap:8px;align-items:baseline">
+        <span class="section-num" style="flex-shrink:0;margin-top:2px">1</span>
+        <span><span style="font-weight:600;color:#0f172a">Fleet Health</span> — Top-level KPIs and overall battery condition summary. Start here for a one-minute read.</span>
       </div>
-      <div style="font-size:.78rem;color:#475569;line-height:1.6">
-        <span style="font-weight:600;color:#0f172a">② Age Bands</span> —
-        How health evolves as vehicles age. Confirms degradation rate is within expected range.
+      <div style="font-size:.78rem;color:#475569;line-height:1.6;display:flex;gap:8px;align-items:baseline">
+        <span class="section-num" style="flex-shrink:0;margin-top:2px">2</span>
+        <span><span style="font-weight:600;color:#0f172a">Age Bands</span> — How health evolves as vehicles age. Confirms degradation rate is within expected range.</span>
       </div>
-      <div style="font-size:.78rem;color:#475569;line-height:1.6">
-        <span style="font-weight:600;color:#0f172a">③ BMS vs EKF</span> —
-        Our model vs the on-board sensor. Divergence means BMS is under/overstating battery health.
+      <div style="font-size:.78rem;color:#475569;line-height:1.6;display:flex;gap:8px;align-items:baseline">
+        <span class="section-num" style="flex-shrink:0;margin-top:2px">3</span>
+        <span><span style="font-weight:600;color:#0f172a">BMS vs EKF</span> — Our model vs the on-board sensor. Divergence means BMS is under/overstating battery health.</span>
       </div>
-      <div style="font-size:.78rem;color:#475569;line-height:1.6">
-        <span style="font-weight:600;color:#0f172a">④ Degradation Signals</span> —
-        Which physical factors are driving battery wear fastest across the fleet.
+      <div style="font-size:.78rem;color:#475569;line-height:1.6;display:flex;gap:8px;align-items:baseline">
+        <span class="section-num" style="flex-shrink:0;margin-top:2px">4</span>
+        <span><span style="font-weight:600;color:#0f172a">Degradation Signals</span> — Which physical factors are driving battery wear fastest across the fleet.</span>
       </div>
-      <div style="font-size:.78rem;color:#475569;line-height:1.6">
-        <span style="font-weight:600;color:#0f172a">⑤ Breakdown Timeline</span> —
-        Which vehicles are projected to need battery replacement and when.
+      <div style="font-size:.78rem;color:#475569;line-height:1.6;display:flex;gap:8px;align-items:baseline">
+        <span class="section-num" style="flex-shrink:0;margin-top:2px">5</span>
+        <span><span style="font-weight:600;color:#0f172a">Breakdown Timeline</span> — Which vehicles are projected to need battery replacement and when.</span>
       </div>
-      <div style="font-size:.78rem;color:#475569;line-height:1.6">
-        <span style="font-weight:600;color:#0f172a">⑥ Anomaly Tiers</span> —
-        Vehicles ranked by urgency of attention needed, with click-through to full detail.
+      <div style="font-size:.78rem;color:#475569;line-height:1.6;display:flex;gap:8px;align-items:baseline">
+        <span class="section-num" style="flex-shrink:0;margin-top:2px">6</span>
+        <span><span style="font-weight:600;color:#0f172a">Anomaly Tiers</span> — Vehicles ranked by urgency of attention needed, with click-through to full detail and RUL trajectory.</span>
       </div>
     </div>
   </div>
@@ -621,12 +625,6 @@
         <div class="panel-hdr">Median SoH by Usage Age — 5 Bands (Q1–Q5)</div>
         <div class="panel-body">
           <table class="table summary-table" id="quintileTable">
-            <thead>
-              <tr>
-                <th>Age Band (calendar days)</th>
-                <th class="text-end">Median EKF SoH (%)</th>
-              </tr>
-            </thead>
             <tbody></tbody>
           </table>
         </div>
@@ -716,6 +714,11 @@
                       <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top"
                         data-bs-title="Estimated calendar date when battery SoH reaches 80%.">ⓘ</span>
                     </th>
+                    <th class="text-end">
+                      Data Span
+                      <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top"
+                        data-bs-title="Date range of sessions available for this vehicle (first → last), and total number of days covered.">ⓘ</span>
+                    </th>
                   </tr>
                 </thead>
                 <tbody id="breakdownTableBody"></tbody>
@@ -780,7 +783,7 @@
                   <th class="text-end">SoH (%) <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top" data-bs-title="Current battery health as % of original capacity. Below 95% warrants attention.">ⓘ</span></th>
                   <th class="text-end">Slope (%/d) <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top" data-bs-title="Rate of battery health decline per day. More negative = faster degradation.">ⓘ</span></th>
                   <th class="text-end">Degr. Score <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top" data-bs-title="Combined degradation risk score (0–100). Above 50 indicates significant risk. Combines SoH health deficit, IR trend, cell spread, voltage sag rate, temperature rise rate, and energy efficiency.">ⓘ</span></th>
-                  <th class="text-end">RUL <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top" data-bs-title="Remaining Useful Life = (current EKF SoH − 80% EOL) ÷ |daily slope|. Matches the RUL scatter chart in the vehicle detail modal. A fast-declining vehicle with SoH still at 97% can have higher RUL than a slow-declining one already at 91% — tier ranking reflects decay rate and anomaly signals, not RUL alone.">ⓘ</span></th>
+                  <th class="text-end">EKF RUL <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top" data-bs-title="Remaining Useful Life = (current EKF SoH − 80% EOL) ÷ |daily slope|. Matches the RUL scatter chart in the vehicle detail modal. A fast-declining vehicle with SoH still at 97% can have higher RUL than a slow-declining one already at 91% — tier ranking reflects decay rate and anomaly signals, not RUL alone.">ⓘ</span></th>
                   <th class="text-end">Flagged Sessions <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top" data-bs-title="Total number of sessions flagged as anomalous by the monitoring system">ⓘ</span></th>
                 </tr>
               </thead>
@@ -809,7 +812,7 @@
               <thead>
                 <tr>
                   <th>Vehicle <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top" data-bs-title="Vehicle registration number — click to open detail view">ⓘ</span></th>
-                  <th>Note <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top" data-bs-title="Summary of why this vehicle is in Tier 2">ⓘ</span></th>
+                  <th>Reason <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top" data-bs-title="Summary of why this vehicle is in Tier 2">ⓘ</span></th>
                   <th class="text-end">SoH (%) <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top" data-bs-title="Current battery health as % of original capacity.">ⓘ</span></th>
                   <th class="text-end">Slope (%/d) <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top" data-bs-title="Rate of battery health decline per day. More negative = faster degradation.">ⓘ</span></th>
                   <th class="text-end">Degr. Score <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top" data-bs-title="Combined degradation risk score (0–100). Above 40 warrants monitoring.">ⓘ</span></th>
@@ -842,7 +845,7 @@
               <thead>
                 <tr>
                   <th>Vehicle <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top" data-bs-title="Vehicle registration number — click to open detail view">ⓘ</span></th>
-                  <th>Note <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top" data-bs-title="Summary of why this vehicle is in Tier 3">ⓘ</span></th>
+                  <th>Reason <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top" data-bs-title="Summary of why this vehicle is in Tier 3">ⓘ</span></th>
                   <th class="text-end">SoH (%) <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top" data-bs-title="Current battery health as % of original capacity.">ⓘ</span></th>
                   <th class="text-end">Slope (%/d) <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top" data-bs-title="Rate of battery health decline per day. Near-zero = stable.">ⓘ</span></th>
                   <th class="text-end">Degr. Score <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top" data-bs-title="Combined degradation risk score (0–100). Below 45 indicates manageable risk.">ⓘ</span></th>
@@ -857,41 +860,6 @@
       </div>
     </div>
 
-  </div>
-
-  <!-- ── Appendix A: Data Distributions ───────────────────────────────────── -->
-  <div class="mt-4 reveal" id="distributionsSection">
-    <div class="section-hdr"><span class="section-num" style="border-radius:4px;width:auto;padding:0 6px">A</span>Appendix — Data Distributions</div>
-    <div style="font-size:.78rem;color:#94a3b8;margin-bottom:12px;line-height:1.65">
-      Fleet-wide raw measurement distributions used as inputs to the EKF and Bayesian Ridge models.
-      Quality-gated observations only. Hover a bar for session count.
-    </div>
-    <div class="row g-3">
-      <div class="col-md-6">
-        <div class="panel">
-          <div class="panel-hdr">
-            Cycle SoH Distribution
-            <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top"
-              data-bs-title="Cycle SoH is the per-cycle State of Health estimate computed via Coulomb counting: (Ah discharged) ÷ (nominal pack capacity × SoC swing). Only quality-gated observations are shown — sessions with block DoD ≥ 20% and cycle_soh below 99.5% (the Coulomb-counting ceiling artefact). Each observation represents one complete discharge block across the fleet.">ⓘ</span>
-          </div>
-          <div class="panel-body" style="padding:12px">
-            <div id="cycleSohHistPlot" style="height:280px"></div>
-          </div>
-        </div>
-      </div>
-      <div class="col-md-6">
-        <div class="panel">
-          <div class="panel-hdr">
-            Block SoH Distribution
-            <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top"
-              data-bs-title="Block SoH is the State of Health computed for each complete discharge block — one value per block (deduplicated). Computed via Coulomb counting: (Ah discharged) ÷ (nominal capacity × SoC swing). Compares directly to Cycle SoH but shows the block-level granularity rather than per-session interpolation.">ⓘ</span>
-          </div>
-          <div class="panel-body" style="padding:12px">
-            <div id="blockSohHistPlot" style="height:280px"></div>
-          </div>
-        </div>
-      </div>
-    </div>
   </div>
 
   <!-- ── FAQ Section ──────────────────────────────────────────────────────── -->
@@ -988,6 +956,57 @@ thermal_stress = (temp_max − temp_threshold) × duration_above_threshold_hr</p
 
   </div>
 
+  <!-- ── Appendix A: Data Distributions ───────────────────────────────────── -->
+  <div class="mt-4 reveal" id="distributionsSection">
+    <div class="accordion" id="appendixAccordion">
+      <div class="accordion-item">
+        <h2 class="accordion-header">
+          <button class="accordion-button collapsed" type="button"
+            data-bs-toggle="collapse" data-bs-target="#appendixPanel"
+            aria-expanded="false" aria-controls="appendixPanel"
+            style="background:#f1f5f9;color:#0f172a;font-size:.85rem;font-weight:700;letter-spacing:.04em">
+            <span class="section-num" style="border-radius:4px;width:auto;padding:0 6px;margin-right:10px">A</span>
+            Appendix
+          </button>
+        </h2>
+        <div id="appendixPanel" class="accordion-collapse collapse">
+          <div class="accordion-body" style="padding:16px">
+            <div style="font-size:.78rem;color:#94a3b8;margin-bottom:12px;line-height:1.65">
+              Fleet-wide raw measurement distributions used as inputs to the EKF and Bayesian Ridge models.
+              Quality-gated observations only. Hover a bar for session count.
+            </div>
+            <div class="row g-3">
+              <div class="col-md-6">
+                <div class="panel">
+                  <div class="panel-hdr">
+                    Cycle SoH Distribution
+                    <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top"
+                      data-bs-title="Cycle SoH is the per-cycle State of Health estimate computed via Coulomb counting: (Ah discharged) ÷ (nominal pack capacity × SoC swing). Only quality-gated observations are shown — sessions with block DoD ≥ 20% and cycle_soh below 99.5% (the Coulomb-counting ceiling artefact). Each observation represents one complete discharge block across the fleet.">ⓘ</span>
+                  </div>
+                  <div class="panel-body" style="padding:12px">
+                    <div id="cycleSohHistPlot" style="height:280px"></div>
+                  </div>
+                </div>
+              </div>
+              <div class="col-md-6">
+                <div class="panel">
+                  <div class="panel-hdr">
+                    Block SoH Distribution
+                    <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top"
+                      data-bs-title="Block SoH is the State of Health computed for each complete discharge block — one value per block (deduplicated). Computed via Coulomb counting: (Ah discharged) ÷ (nominal capacity × SoC swing). Compares directly to Cycle SoH but shows the block-level granularity rather than per-session interpolation.">ⓘ</span>
+                  </div>
+                  <div class="panel-body" style="padding:12px">
+                    <div id="blockSohHistPlot" style="height:280px"></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
 </div><!-- /page-body -->
 
 <!-- ── Vehicle Detail Overlay ──────────────────────────────────────────────── -->
@@ -1011,7 +1030,7 @@ thermal_stress = (temp_max − temp_threshold) × duration_above_threshold_hr</p
 </div>
 
 {% load static %}
-<script src="{% static 'fleet/executive_summary.js' %}?v=59"></script>
+<script src="{% static 'fleet/executive_summary.js' %}?v=61"></script>
 <script>
 function toggleFaq(btn) {
   const body = btn.nextElementSibling;
@@ -1019,6 +1038,14 @@ function toggleFaq(btn) {
   btn.classList.toggle("open", !isOpen);
   body.classList.toggle("open", !isOpen);
 }
+
+// Resize Plotly charts inside appendix accordion after it finishes opening
+document.getElementById("appendixPanel").addEventListener("shown.bs.collapse", function () {
+  ["cycleSohHistPlot", "blockSohHistPlot"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el && el.layout) Plotly.relayout(el, { autosize: true });
+  });
+});
 </script>
 </body>
 </html>

@@ -71,7 +71,7 @@ TIER1_SIGNALS = {
 }
 TIER2_NOTES = {
     "MH18BZ2648": "Highest flagged session count in fleet (124, 17.9%); degradation risk score 0.479",
-    "MH18BZ3198": "Short data span",
+    "MH18BZ3198": "Fastest declining in tier 2 (−0.044%/day); projected replacement in ~1 year; 43 flagged sessions (8.4%)",
     "MH18BZ2689": "61 flagged sessions (8.1%); degradation risk score 0.473",
     "MH18BZ2958": "36 flagged sessions (6.7%); degradation risk score 0.464",
 }
@@ -658,6 +658,23 @@ def api_telemetry(request, reg, session_id):
     })
 
 
+# ── RUL Timeline (per-vehicle, charging sessions) ─────────────────────────────
+@require_GET
+def api_rul_timeline(request, reg):
+    ekf = _load_ekf()
+    df  = ekf[ekf["registration_number"] == reg].sort_values("start_time").copy()
+    if df.empty:
+        return JsonResponse({"error": f"No EKF data for {reg}"}, status=404)
+
+    cols = ["date", "ekf_rul_days"]
+    if "ekf_rul_days_lo" in df.columns: cols.append("ekf_rul_days_lo")
+    if "ekf_rul_days_hi" in df.columns: cols.append("ekf_rul_days_hi")
+    if "ekf_soh"         in df.columns: cols.append("ekf_soh")
+
+    rows = _df_to_records(df[cols])
+    return _safe_json({"reg": reg, "points": rows})
+
+
 # ── Breakdown Timeline ─────────────────────────────────────────────────────────
 @require_GET
 def api_breakdown_timeline(request):
@@ -675,6 +692,15 @@ def api_breakdown_timeline(request):
            .groupby("registration_number")[["ekf_soh", "ekf_soh_std"]]
            .last()
     )
+
+    # Data span per vehicle: first → last session date
+    ekf_ts = pd.to_datetime(ekf["start_time"], unit="ms")
+    span_df = ekf.copy()
+    span_df["_ts"] = ekf_ts
+    span_grp = span_df.groupby("registration_number")["_ts"].agg(["min", "max"])
+    span_grp["span_days"] = (span_grp["max"] - span_grp["min"]).dt.days
+    span_grp["first_date"] = span_grp["min"].dt.strftime("%Y-%m-%d")
+    span_grp["last_date"]  = span_grp["max"].dt.strftime("%Y-%m-%d")
 
     def _add_days(base_ts, days):
         if days is None or not math.isfinite(float(days)):
@@ -700,6 +726,13 @@ def api_breakdown_timeline(request):
 
         tier = 1 if reg in TIER1 else (2 if reg in TIER2 else (3 if reg in TIER3 else 0))
 
+        span_row = span_grp.loc[reg] if reg in span_grp.index else None
+        data_span = {
+            "first": span_row["first_date"],
+            "last":  span_row["last_date"],
+            "days":  int(span_row["span_days"]),
+        } if span_row is not None else None
+
         rows.append({
             "registration_number": reg,
             "current_soh": round(float(curr_soh), 2) if curr_soh is not None and pd.notna(curr_soh) else None,
@@ -711,6 +744,7 @@ def api_breakdown_timeline(request):
             "eol_date":    _add_days(ref_ts, rul_days),
             "tier":        tier,
             "ref_date":    ref_date_str,
+            "data_span":   data_span,
         })
 
     # Sort soonest-first (None / no-slope vehicles last)

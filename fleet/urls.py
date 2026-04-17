@@ -19,6 +19,7 @@ urlpatterns = [
     path("api/soh-bands/<str:reg>/",            views.api_soh_bands,         name="api-soh-bands"),
     path("api/sessions/<str:reg>/",    views.api_sessions,            name="api-sessions"),
     path("api/telemetry/<str:reg>/<str:session_id>/", views.api_telemetry, name="api-telemetry"),
+    path("api/rul-timeline/<str:reg>/",  views.api_rul_timeline,      name="api-rul-timeline"),
     path("api/breakdown-timeline/", views.api_breakdown_timeline, name="api-breakdown-timeline"),
     path("api/distributions/",      views.api_distributions,      name="api-distributions"),
 ]
