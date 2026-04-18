@@ -159,11 +159,11 @@
       box-shadow: var(--card-shadow); border: none !important;
     }
     .accordion-button { font-size: 0.85rem; font-weight: 700; letter-spacing: .04em; }
-    .tier1-btn { background: #fef2f2 !important; color: #b91c1c !important; }
+    .tier1-btn { background: #fef2f2 !important; color: #475569 !important; font-size: 0.76rem !important; }
     .tier1-btn:not(.collapsed) { background: #fee2e2 !important; }
-    .tier2-btn { background: #fffbeb !important; color: #92400e !important; }
+    .tier2-btn { background: #fffbeb !important; color: #475569 !important; font-size: 0.76rem !important; }
     .tier2-btn:not(.collapsed) { background: #fef3c7 !important; }
-    .tier3-btn { background: #f0fdf4 !important; color: #166534 !important; }
+    .tier3-btn { background: #f0fdf4 !important; color: #475569 !important; font-size: 0.76rem !important; }
     .tier3-btn:not(.collapsed) { background: #dcfce7 !important; }
     .accordion-button::after { filter: none; }
 
@@ -182,9 +182,9 @@
       padding: 8px 12px; margin: 0 12px 8px;
       border-radius: 0 4px 4px 0;
     }
-    .tier-note-1 { color: #dc2626; }
-    .tier-note-2 { color: #d97706; }
-    .tier-note-3 { color: #059669; }
+    .tier-note-1 { color: #475569; }
+    .tier-note-2 { color: #475569; }
+    .tier-note-3 { color: #475569; }
 
     /* ── Business description box ── */
     .biz-desc-box {
@@ -431,20 +431,28 @@
   </div>
 </nav>
 
-<!-- ── Investor Hero Callout ──────────────────────────────────────────────── -->
+<!-- ── Business Objective strip ───────────────────────────────────────────── -->
+<div style="background:#1e3a5f;padding:18px 0 20px;border-bottom:1px solid #163354">
+  <div style="max-width:1400px;margin:0 auto;padding:0 28px">
+    <div style="font-size:.78rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#7dd3fc;margin-bottom:6px">Business Objective</div>
+    <div style="font-size:.84rem;color:#e2e8f0;font-weight:500;line-height:1.7">
+      Spot battery issues early, act before failures happen, and use data to reduce downtime, secure warranty claims, and lower operating costs.
+    </div>
+  </div>
+</div>
+
+<!-- ── Executive Summary Hero Callout ──────────────────────────────────── -->
 <div style="background:#1e3a5f;
-            padding:18px 0 20px;border-top:1px solid #2d5a8e;border-bottom:1px solid #163354;">
+            padding:18px 0 20px;border-bottom:1px solid #163354;">
   <div style="max-width:1400px;margin:0 auto;padding:0 28px">
     <div style="font-size:.78rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#7dd3fc;margin-bottom:6px">
       Executive Summary
     </div>
     <div style="font-size:.84rem;color:#e2e8f0;font-weight:500;line-height:1.7">
-      This dashboard applies <span data-bs-toggle="tooltip" data-bs-placement="right" data-bs-html="true" data-bs-custom-class="tooltip-wide"
+      This dashboard uses <span data-bs-toggle="tooltip" data-bs-placement="right" data-bs-html="true" data-bs-custom-class="tooltip-wide"
         data-bs-title="<b>1.</b> Extended Kalman Filter (EKF) — real-time SoH tracking<br><b>2.</b> Bayesian Ridge Regression — degradation trend modelling<br><b>3.</b> Isolation Forest — sudden anomaly detection<br><b>4.</b> CUSUM — gradual drift detection"
-        style="cursor:help;color:#93c5fd;text-decoration:underline dotted;text-underline-offset:3px;text-decoration-color:#93c5fd">four Artificial Intelligence models<sup style="font-size:.65em;line-height:0;vertical-align:super">ⓘ</sup></span>
-      to continuously track battery State of Health across Ultratech's <span id="heroVehicleCount">—</span>-vehicle EV fleet —
-      identifying Remaining Useful Life, evidence-based replacement forecasts, maintenance prioritisation,
-      and real-time anomaly alerts that reduce unplanned downtime and protect warranty claim eligibility.
+        style="cursor:help;color:#93c5fd;text-decoration:underline dotted;text-underline-offset:3px;text-decoration-color:#93c5fd">four AI models<sup style="font-size:.65em;line-height:0;vertical-align:super">ⓘ</sup></span>
+      to continuously monitor battery health across Ultratech's <span id="heroVehicleCount">—</span>-vehicle EV fleet — predicting remaining life, enabling evidence-based replacements, prioritising maintenance, and detecting anomalies in real time to reduce downtime and protect warranty eligibility.
     </div>
     <div style="display:flex;gap:24px;margin-top:12px;flex-wrap:wrap">
       <span style="font-size:.74rem;color:#94a3b8">
@@ -460,8 +468,71 @@
         Dual anomaly detection: sudden shocks + gradual drift
       </span>
     </div>
+
+    <!-- Battery Intelligence Framework — collapsible -->
+    <div style="margin-top:14px">
+      <button onclick="this.nextElementSibling.classList.toggle('bif-open');this.querySelector('.bif-chevron').classList.toggle('bif-chevron-open');document.querySelectorAll('[data-bs-toggle=tooltip]').forEach(el=>{if(!bootstrap.Tooltip.getInstance(el))new bootstrap.Tooltip(el,{trigger:'hover'})})"
+        style="background:none;border:1px solid #334d6e;border-radius:6px;padding:5px 12px;cursor:pointer;
+               display:inline-flex;align-items:center;gap:8px;
+               font-size:.74rem;font-weight:600;color:#93c5fd;letter-spacing:.03em">
+        <span>Battery Intelligence Framework</span>
+        <span class="bif-chevron" style="font-size:.65rem;transition:transform .2s;display:inline-block">▶</span>
+      </button>
+      <div class="bif-body" style="display:none;margin-top:10px;
+           background:rgba(15,39,68,0.6);border:1px solid #2d5a8e;border-radius:8px;
+           padding:14px 18px;font-size:.80rem;color:#cbd5e1;line-height:1.7">
+
+        <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:12px">
+
+          <!-- Step 1 -->
+          <div style="background:rgba(255,255,255,0.04);border-radius:6px;padding:10px 12px;border-left:3px solid #3b82f6">
+            <div style="font-size:.72rem;font-weight:700;color:#7dd3fc;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">1 · Accurate Capacity Estimation</div>
+            <div style="font-size:.78rem;color:#cbd5e1">Estimate the true usable battery capacity by continuously tracking energy flowing in and out of the battery (energy throughput), enabling a reliable measure of real-world performance.</div>
+          </div>
+
+          <!-- Step 2 -->
+          <div style="background:rgba(255,255,255,0.04);border-radius:6px;padding:10px 12px;border-left:3px solid #6366f1">
+            <div style="font-size:.72rem;font-weight:700;color:#a5b4fc;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">2 · Standardised SoH Assessment</div>
+            <div style="font-size:.78rem;color:#cbd5e1">Quantify State of Health by benchmarking measured capacity against the rated capacity of an equivalent vehicle/battery configuration — ensuring consistent, comparable health metrics across the fleet.</div>
+          </div>
+
+          <!-- Step 3 -->
+          <div style="background:rgba(255,255,255,0.04);border-radius:6px;padding:10px 12px;border-left:3px solid #8b5cf6">
+            <div style="font-size:.72rem;font-weight:700;color:#c4b5fd;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">3 · Predictive SoH Modelling (EKF)</div>
+            <div style="font-size:.78rem;color:#cbd5e1">
+              Extended Kalman Filter dynamically refines SoH by integrating capacity fade, internal resistance evolution, cell-to-cell imbalance, and thermal stress — delivering noise-resilient estimates, early degradation detection, and forward-looking lifespan insights.
+            </div>
+          </div>
+
+          <!-- Step 4 -->
+          <div style="background:rgba(255,255,255,0.04);border-radius:6px;padding:10px 12px;border-left:3px solid #f59e0b">
+            <div style="font-size:.72rem;font-weight:700;color:#fcd34d;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">4 · Anomaly Detection &amp; Risk Scoring</div>
+            <div style="font-size:.78rem;color:#cbd5e1">
+              <b style="color:#e2e8f0">(a)</b> Sudden deviations (voltage sag, rapid heating, fast-charge) detected by Isolation Forest;
+              gradual wear (SoH decline, efficiency fade, IR growth) tracked by CUSUM.<br>
+              <b style="color:#e2e8f0">(b)</b> Each vehicle receives an
+              <span data-bs-toggle="tooltip" data-bs-placement="top" data-bs-html="true"
+                data-bs-title="Based on abnormal event frequency &amp; severity — combines sudden-change detection and gradual wear signals."
+                style="cursor:help;color:#93c5fd;text-decoration:underline dotted;text-underline-offset:2px">Anomaly Score ⓘ</span>
+              and a
+              <span data-bs-toggle="tooltip" data-bs-placement="top" data-bs-html="true"
+                data-bs-title="<b>Transvolt Degradation Score</b> — a composite health index derived from capacity fade, resistance growth, thermal stress exposure, cell imbalance trends, calendar aging, and equivalent full cycles. Reflects the cumulative impact of aging and operating conditions on battery performance."
+                style="cursor:help;color:#93c5fd;text-decoration:underline dotted;text-underline-offset:2px">Degradation Score ⓘ</span>,
+              categorising it as 🔴 High Risk, 🟠 Moderate Risk, or 🟢 Low Risk.
+            </div>
+          </div>
+
+        </div><!-- /grid -->
+      </div><!-- /bif-body -->
+    </div><!-- /collapsible wrapper -->
+
   </div>
 </div>
+
+<style>
+  .bif-body.bif-open { display:block !important; }
+  .bif-chevron-open { transform:rotate(90deg) !important; }
+</style>
 
 <div class="page-body">
 
@@ -477,7 +548,7 @@
       <div class="kpi-value" id="kpiPeriod">—</div>
     </div>
 
-    <div class="kpi-card">
+    <div class="kpi-card" data-kpi-hover="kpi_vehicles" style="cursor:help">
       <div class="kpi-header">
         <i class="bi bi-bus-front kpi-icon"></i>
         <div class="kpi-label">Vehicles</div>
@@ -540,7 +611,7 @@
     <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px">
       <div style="font-size:.78rem;color:#475569;line-height:1.6;display:flex;gap:8px;align-items:baseline">
         <span class="section-num" style="flex-shrink:0;margin-top:2px">1</span>
-        <span><span style="font-weight:600;color:#0f172a">Fleet Health</span> — Top-level KPIs and overall battery condition summary. Start here for a one-minute read.</span>
+        <span><span style="font-weight:600;color:#0f172a">Fleet Health</span> — Top-level KPIs and overall battery condition summary.</span>
       </div>
       <div style="font-size:.78rem;color:#475569;line-height:1.6;display:flex;gap:8px;align-items:baseline">
         <span class="section-num" style="flex-shrink:0;margin-top:2px">2</span>
@@ -602,7 +673,7 @@
                 <td>Median EKF RUL</td>
                 <td id="ht_ekfRul">—</td>
               </tr>
-              <tr>
+              <tr data-hover="ekf_rul_range">
                 <td>
                   EKF RUL Fleet Range (IQR)
                   <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top" data-bs-title="The middle 50% of vehicles fall within this projected lifespan range (25th to 75th percentile). Gives a sense of how spread the fleet's remaining life is.">ⓘ</span>
@@ -956,56 +1027,6 @@ thermal_stress = (temp_max − temp_threshold) × duration_above_threshold_hr</p
 
   </div>
 
-  <!-- ── Appendix A: Data Distributions ───────────────────────────────────── -->
-  <div class="mt-4 reveal" id="distributionsSection">
-    <div class="accordion" id="appendixAccordion">
-      <div class="accordion-item">
-        <h2 class="accordion-header">
-          <button class="accordion-button collapsed" type="button"
-            data-bs-toggle="collapse" data-bs-target="#appendixPanel"
-            aria-expanded="false" aria-controls="appendixPanel"
-            style="background:#f1f5f9;color:#0f172a;font-size:.85rem;font-weight:700;letter-spacing:.04em">
-            <span class="section-num" style="border-radius:4px;width:auto;padding:0 6px;margin-right:10px">A</span>
-            Appendix
-          </button>
-        </h2>
-        <div id="appendixPanel" class="accordion-collapse collapse">
-          <div class="accordion-body" style="padding:16px">
-            <div style="font-size:.78rem;color:#94a3b8;margin-bottom:12px;line-height:1.65">
-              Fleet-wide raw measurement distributions used as inputs to the EKF and Bayesian Ridge models.
-              Quality-gated observations only. Hover a bar for session count.
-            </div>
-            <div class="row g-3">
-              <div class="col-md-6">
-                <div class="panel">
-                  <div class="panel-hdr">
-                    Cycle SoH Distribution
-                    <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top"
-                      data-bs-title="Cycle SoH is the per-cycle State of Health estimate computed via Coulomb counting: (Ah discharged) ÷ (nominal pack capacity × SoC swing). Only quality-gated observations are shown — sessions with block DoD ≥ 20% and cycle_soh below 99.5% (the Coulomb-counting ceiling artefact). Each observation represents one complete discharge block across the fleet.">ⓘ</span>
-                  </div>
-                  <div class="panel-body" style="padding:12px">
-                    <div id="cycleSohHistPlot" style="height:280px"></div>
-                  </div>
-                </div>
-              </div>
-              <div class="col-md-6">
-                <div class="panel">
-                  <div class="panel-hdr">
-                    Block SoH Distribution
-                    <span class="col-info" data-bs-toggle="tooltip" data-bs-placement="top"
-                      data-bs-title="Block SoH is the State of Health computed for each complete discharge block — one value per block (deduplicated). Computed via Coulomb counting: (Ah discharged) ÷ (nominal capacity × SoC swing). Compares directly to Cycle SoH but shows the block-level granularity rather than per-session interpolation.">ⓘ</span>
-                  </div>
-                  <div class="panel-body" style="padding:12px">
-                    <div id="blockSohHistPlot" style="height:280px"></div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
 
 </div><!-- /page-body -->
 
@@ -1030,7 +1051,7 @@ thermal_stress = (temp_max − temp_threshold) × duration_above_threshold_hr</p
 </div>
 
 {% load static %}
-<script src="{% static 'fleet/executive_summary.js' %}?v=62"></script>
+<script src="{% static 'fleet/executive_summary.js' %}?v=91"></script>
 <script>
 function toggleFaq(btn) {
   const body = btn.nextElementSibling;
@@ -1039,13 +1060,7 @@ function toggleFaq(btn) {
   body.classList.toggle("open", !isOpen);
 }
 
-// Resize Plotly charts inside appendix accordion after it finishes opening
-document.getElementById("appendixPanel").addEventListener("shown.bs.collapse", function () {
-  ["cycleSohHistPlot", "blockSohHistPlot"].forEach(id => {
-    const el = document.getElementById(id);
-    if (el && el.layout) Plotly.relayout(el, { autosize: true });
-  });
-});
+
 </script>
 </body>
 </html>

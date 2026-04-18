@@ -89,7 +89,7 @@ function renderKPICards() {
   const navVeh = document.getElementById("navVehicleCount");
   if (navVeh && o.n_vehicles != null) navVeh.textContent = o.n_vehicles;
   document.getElementById("kpiMeanSoh").textContent      = fmtPct(o.fleet_mean_soh);
-  document.getElementById("kpiStdSoh").textContent       = fmtPct(o.fleet_std_soh);
+  document.getElementById("kpiStdSoh").textContent       = fmt(o.fleet_std_soh, 1) + "%";
   document.getElementById("kpiEkfRul").textContent       = rulToYears(o.median_ekf_rul);
   document.getElementById("kpiRemainingEfc").textContent = o.fleet_median_remaining_efc != null
     ? Math.round(o.fleet_median_remaining_efc).toLocaleString() + " EFC" : "—";
@@ -100,9 +100,9 @@ function renderFleetHealth() {
   const o = _overview;
   document.getElementById("ht_span").textContent       = `${o.span_days} days`;
   document.getElementById("ht_meanSoh").textContent    = fmtPct(o.fleet_mean_soh);
-  document.getElementById("ht_stdSoh").textContent     = fmtPct(o.fleet_std_soh);
+  document.getElementById("ht_stdSoh").textContent     = fmt(o.fleet_std_soh, 1) + "%";
   const sign = o.soh_trend_pct >= 0 ? "+" : "";
-  document.getElementById("ht_trend").textContent      = `${sign}${fmt(o.soh_trend_pct, 2)}%`;
+  document.getElementById("ht_trend").textContent      = `${sign}${fmt(o.soh_trend_pct, 1)}%`;
   const total = o.total_sessions;
   document.getElementById("ht_population").textContent = total != null
     ? `${total.toLocaleString()} sessions` : "—";
@@ -137,14 +137,49 @@ function renderSohScatter(data) {
   _drawScatter();
 }
 
+function _ptDate(p) {
+  // Resolve a YYYY-MM-DD string from either `date` or `start_time_ist`
+  if (p.date && p.date !== "NaN" && p.date !== "null") return p.date;
+  if (p.start_time_ist) return String(p.start_time_ist).slice(0, 10);
+  return null;
+}
+
 function _drawScatter() {
   const el = document.getElementById("sohScatterPlot");
   if (!el || !_scatterData || !_scatterData.points || !_scatterData.points.length) return;
-  const pts = _scatterData.points;
+  let pts = _scatterData.points;
+  if (_sec3DateFrom || _sec3DateTo) {
+    pts = pts.filter(p => {
+      const d = _ptDate(p);
+      if (!d) return true;
+      if (_sec3DateFrom && d < _sec3DateFrom) return false;
+      if (_sec3DateTo   && d > _sec3DateTo)   return false;
+      return true;
+    });
+  }
+
+  const allX = pts.map(p => p.soh);
+  const allY = pts.map(p => p.ekf_soh);
+
+  // Density shadow: smooth contour layer rendered under the markers
+  const densityTrace = {
+    type: "histogram2dcontour",
+    x: allX, y: allY,
+    colorscale: [[0,"rgba(0,0,0,0)"], [0.15,"rgba(253,186,116,0.18)"],
+                 [0.45,"rgba(251,146,60,0.38)"],  [0.75,"rgba(251,146,60,0.55)"],
+                 [1,  "rgba(234,88,12,0.72)"]],
+    showscale: false,
+    ncontours: 10,
+    contours: { coloring: "fill", showlines: false },
+    hoverinfo: "skip",
+    name: "density",
+    xbins: { size: 0.12 },
+    ybins: { size: 0.12 },
+  };
 
   let traces;
   if (_scatterVeh) {
-    // Selected vehicle: blue; others: grey
+    // Selected vehicle: blue; others: grey — no density shadow in vehicle view
     const selPts   = pts.filter(p => p.registration_number === _scatterVeh);
     const otherPts = pts.filter(p => p.registration_number !== _scatterVeh);
     traces = [
@@ -154,23 +189,24 @@ function _drawScatter() {
         name: "Other vehicles", hoverinfo: "skip", showlegend: true },
       { type: "scatter", mode: "markers",
         x: selPts.map(p => p.soh), y: selPts.map(p => p.ekf_soh),
-        marker: { color: "#3b82f6", size: 5, opacity: 0.8 },
+        marker: { color: "#fb923c", size: 5, opacity: 0.9 },
         name: _scatterVeh,
         hovertemplate: _scatterVeh + "<br>BMS: %{x:.2f}%<br>EKF: %{y:.2f}%<extra></extra>",
         showlegend: true },
     ];
   } else {
     traces = [
+      densityTrace,
       { type: "scatter", mode: "markers",
-        x: pts.map(p => p.soh), y: pts.map(p => p.ekf_soh),
-        marker: { color: "#3b82f6", size: 3.5, opacity: 0.45 },
+        x: allX, y: allY,
+        marker: { color: "#ea580c", size: 3, opacity: 0.25 },
         hovertemplate: "%{customdata}<br>BMS SoH: %{x:.2f}%<br>EKF SoH: %{y:.2f}%<extra></extra>",
         customdata: pts.map(p => p.registration_number || ""),
         name: "Fleet", showlegend: false },
     ];
   }
-  // Compute OLS slope (y on x) from all fleet points
-  const allPts  = _scatterData.points || [];
+  // Compute OLS slope (y on x) from the same (date-filtered) fleet points
+  const allPts  = pts;
   let slopeAnnotation = null;
   if (allPts.length > 1) {
     const xs = allPts.map(p => p.soh).filter(v => v != null);
@@ -202,7 +238,16 @@ function _drawScatter() {
     line: { color: "#94a3b8", width: 1.5, dash: "dash" },
     name: "y = x", hoverinfo: "skip" });
 
-  Plotly.react(el, traces, {
+  const countAnnotation = {
+    x: 0.02, y: 0.04, xref: "paper", yref: "paper",
+    text: `${pts.length} sessions`,
+    showarrow: false, align: "left",
+    font: { size: 8.5, color: "#94a3b8", family: "Plus Jakarta Sans" },
+    bgcolor: "rgba(255,255,255,.7)", borderpad: 3,
+  };
+
+  Plotly.purge(el);
+  Plotly.newPlot(el, traces, {
     paper_bgcolor: "white", plot_bgcolor: "#f8fafc",
     font: { family: "Plus Jakarta Sans, system-ui, sans-serif", size: 10, color: "#475569" },
     margin: { l: 52, r: 12, t: 12, b: 52 },
@@ -210,7 +255,7 @@ function _drawScatter() {
              range: [100, 95], gridcolor: "#e2e8f0", tickfont: { size: 9 } },
     yaxis: { title: { text: "EKF SoH (%)", font: { size: 9.5 } },
              range: [100, 95], gridcolor: "#e2e8f0", tickfont: { size: 9 } },
-    annotations: slopeAnnotation ? [slopeAnnotation] : [],
+    annotations: [countAnnotation, ...(slopeAnnotation ? [slopeAnnotation] : [])],
     showlegend: _scatterVeh != null,
     legend: { x: 0.02, y: 0.98, font: { size: 8.5 } },
   }, { displayModeBar: false, responsive: true });
@@ -226,27 +271,36 @@ function _drawDeltaChart() {
   if (!el || !_deltaData) return;
 
   let traces;
+  function _dateInRange(d) {
+    if (!d) return true;
+    if (_sec3DateFrom && d < _sec3DateFrom) return false;
+    if (_sec3DateTo   && d > _sec3DateTo)   return false;
+    return true;
+  }
+
   if (_scatterVeh) {
     // Show only the selected vehicle's per-session delta
-    const pts = (_deltaData.vehicle_points || []).filter(p => p.registration_number === _scatterVeh);
+    let pts = (_deltaData.vehicle_points || [])
+      .filter(p => p.registration_number === _scatterVeh)
+      .filter(p => _dateInRange(p.date));
     pts.sort((a, b) => a.date < b.date ? -1 : 1);
     traces = [{
       type: "scatter", mode: "lines+markers",
       x: pts.map(p => p.date), y: pts.map(p => p.delta),
-      line: { color: "#3b82f6", width: 2 },
-      marker: { size: 4, color: "#3b82f6" },
+      line: { color: "#fb923c", width: 2 },
+      marker: { size: 4, color: "#fb923c" },
       name: _scatterVeh,
       hovertemplate: "%{x}<br>EKF − BMS delta: %{y:.2f}%<extra></extra>",
     }];
   } else {
     // Fleet-wide daily median delta
-    const ft = _deltaData.fleet_trend || [];
+    let ft = (_deltaData.fleet_trend || []).filter(p => _dateInRange(p.date));
     ft.sort((a, b) => a.date < b.date ? -1 : 1);
     traces = [{
       type: "scatter", mode: "lines",
       x: ft.map(p => p.date), y: ft.map(p => p.fleet_median_delta),
-      line: { color: "#6366f1", width: 2 },
-      fill: "tozeroy", fillcolor: "rgba(99,102,241,0.08)",
+      line: { color: "#fb923c", width: 2 },
+      fill: "tozeroy", fillcolor: "rgba(249,115,22,0.08)",
       name: "Fleet median δ",
       hovertemplate: "%{x}<br>Fleet median EKF−BMS: %{y:.2f}%<extra></extra>",
     }];
@@ -261,37 +315,76 @@ function _drawDeltaChart() {
   Plotly.react(el, traces, {
     paper_bgcolor: "white", plot_bgcolor: "#f8fafc",
     font: { family: "Plus Jakarta Sans, system-ui, sans-serif", size: 10, color: "#475569" },
-    margin: { l: 52, r: 12, t: 12, b: 52 },
+    margin: { l: 52, r: 12, t: 30, b: 52 },
     xaxis: { title: { text: "Date", font: { size: 9.5 } }, gridcolor: "#e2e8f0", tickangle: -30, tickfont: { size: 8.5 } },
     yaxis: { title: { text: "EKF SoH − BMS SoH (%)", font: { size: 9.5 } }, gridcolor: "#e2e8f0", tickfont: { size: 9 } },
     showlegend: true,
-    legend: { x: 0.02, y: 0.98, font: { size: 8.5 } },
+    legend: { x: 0.5, y: 1.0, xanchor: "center", yanchor: "bottom", orientation: "h", font: { size: 8.5 } },
   }, { displayModeBar: false, responsive: true });
 }
 
-/* ─── Vehicle slider for scatter + delta charts ──────────────────────────────── */
+/* ─── Vehicle slider + date slider for scatter + delta charts ───────────────────── */
+let _sec3DateFrom = null;
+let _sec3DateTo   = null;
+let _sec3DateList = [];
+
 function buildVehicleSlider() {
   const container = document.getElementById("vehSliderContainer");
   if (!container || !_deltaData) return;
 
-  // Get unique sorted vehicle list
+  // Sorted unique vehicle list
   const allVeh = [...new Set((_deltaData.vehicle_points || []).map(p => p.registration_number))].sort();
   if (!allVeh.length) { container.style.display = "none"; return; }
 
+  // Sorted unique date list from fleet trend + vehicle points
+  _sec3DateList = [...new Set([
+    ...(_deltaData.fleet_trend       || []).map(p => p.date),
+    ...(_deltaData.vehicle_points    || []).map(p => p.date),
+  ].filter(Boolean))].sort();
+  const nd = _sec3DateList.length;
+  _sec3DateFrom = nd ? _sec3DateList[0]      : null;
+  _sec3DateTo   = nd ? _sec3DateList[nd - 1] : null;
+
+  const labelStyle = "font-size:.74rem;font-weight:600;color:#475569;text-transform:uppercase;letter-spacing:.04em;white-space:nowrap";
+
+  // Grid columns: [label] [veh-slider 180px] [veh-name auto] [checkbox+label auto] [right-info 1fr]
+  // Date slider spans cols 2-4 (same pixel span as slider+name+checkbox), Reset sits in col 5.
   container.innerHTML = `
-    <div style="display:flex;align-items:center;gap:12px;background:#f8fafc;border:1px solid #e2e8f0;
-                border-radius:8px;padding:8px 14px;margin-bottom:10px;flex-wrap:wrap">
-      <div style="display:flex;align-items:center;gap:8px;flex:0 0 auto">
-        <label style="font-size:.74rem;font-weight:600;color:#475569;text-transform:uppercase;letter-spacing:.04em;white-space:nowrap">Vehicle</label>
+    <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px 14px;margin-bottom:10px">
+      <div style="display:grid;grid-template-columns:auto 180px auto auto 1fr;align-items:center;row-gap:${nd > 1 ? "18px" : "0"};column-gap:8px">
+
+        <!-- Row 1: vehicle filter -->
+        <label style="${labelStyle}">Vehicle</label>
         <input type="range" id="vehSlider" min="0" max="${allVeh.length - 1}" value="0" step="1"
-          style="width:180px;accent-color:#3b82f6" ${_scatterVeh ? "" : "disabled"}>
-        <span id="vehSliderLabel" style="font-size:.82rem;font-weight:700;color:#3b82f6;min-width:120px">—</span>
+          style="width:100%;accent-color:#fb923c" ${_scatterVeh ? "" : "disabled"}>
+        <span id="vehSliderLabel" style="font-size:.75rem;font-weight:600;color:#fb923c;min-width:120px;padding:0 4px;white-space:nowrap">—</span>
+        <div style="display:flex;align-items:center;gap:6px">
+          <input type="checkbox" id="vehSliderToggle" style="accent-color:#94a3b8;width:14px;height:14px;flex-shrink:0">
+          <label for="vehSliderToggle" style="font-size:.74rem;color:#64748b;cursor:pointer;white-space:nowrap">Enable vehicle filter</label>
+        </div>
+        <div style="font-size:.72rem;color:#94a3b8;white-space:nowrap;text-align:right;padding-left:8px">${allVeh.length} vehicles · sorted alphabetically</div>
+
+        ${nd > 1 ? `
+        <!-- Row 2: date range slider spans cols 2-4, reset in col 5 -->
+        <label style="${labelStyle}">Date Range</label>
+        <div style="grid-column:2/5">
+          <div style="position:relative;height:20px">
+            <div style="position:absolute;height:4px;background:#e2e8f0;top:8px;left:0;right:0;border-radius:2px">
+              <div id="sec3SliderFill" style="position:absolute;height:100%;background:#fb923c;border-radius:2px;left:0%;width:100%"></div>
+            </div>
+            <input type="range" id="sec3SliderFrom" min="0" max="${nd - 1}" value="0" step="1"
+              style="position:absolute;width:100%;height:4px;top:8px;-webkit-appearance:none;appearance:none;background:transparent;accent-color:#fb923c;cursor:pointer">
+            <input type="range" id="sec3SliderTo"   min="0" max="${nd - 1}" value="${nd - 1}" step="1"
+              style="position:absolute;width:100%;height:4px;top:8px;-webkit-appearance:none;appearance:none;background:transparent;accent-color:#fb923c;cursor:pointer">
+          </div>
+          <div style="display:flex;justify-content:space-between;margin-top:4px;font-size:.75rem;color:#475569;font-weight:500">
+            <span id="sec3DateFromLabel">${_sec3DateFrom}</span>
+            <span id="sec3DateToLabel">${_sec3DateTo}</span>
+          </div>
+        </div>
+        <button onclick="_sec3ResetDate()" style="font-size:.7rem;color:#fb923c;background:none;border:none;cursor:pointer;padding:0;text-decoration:underline;white-space:nowrap;text-align:right">Reset</button>
+        ` : ""}
       </div>
-      <div style="display:flex;align-items:center;gap:6px;flex:0 0 auto">
-        <input type="checkbox" id="vehSliderToggle" style="accent-color:#3b82f6;width:14px;height:14px">
-        <label for="vehSliderToggle" style="font-size:.74rem;color:#64748b;cursor:pointer">Enable vehicle filter</label>
-      </div>
-      <div style="font-size:.72rem;color:#94a3b8;flex:1;text-align:right">${allVeh.length} vehicles · sorted alphabetically</div>
     </div>
   `;
 
@@ -308,7 +401,7 @@ function buildVehicleSlider() {
     } else {
       _scatterVeh = allVeh[+slider.value];
       label.textContent = _scatterVeh;
-      label.style.color = "#3b82f6";
+      label.style.color = "#fb923c";
       slider.disabled = false;
     }
     _drawScatter();
@@ -318,6 +411,79 @@ function buildVehicleSlider() {
   toggle.addEventListener("change", updateFromSlider);
   slider.addEventListener("input",  updateFromSlider);
   updateFromSlider();  // initial state = fleet view
+
+  // Date range slider wiring
+  if (nd > 1) {
+    const fromEl  = document.getElementById("sec3SliderFrom");
+    const toEl    = document.getElementById("sec3SliderTo");
+    const fill    = document.getElementById("sec3SliderFill");
+    const fromLbl = document.getElementById("sec3DateFromLabel");
+    const toLbl   = document.getElementById("sec3DateToLabel");
+
+    // Make only the thumb interactive so both handles are always reachable
+    if (!document.getElementById("sec3SliderStyle")) {
+      const s = document.createElement("style");
+      s.id = "sec3SliderStyle";
+      s.textContent = [
+        "#sec3SliderFrom,#sec3SliderTo{pointer-events:none}",
+        "#sec3SliderFrom::-webkit-slider-thumb{pointer-events:all;cursor:grab}",
+        "#sec3SliderTo::-webkit-slider-thumb{pointer-events:all;cursor:grab}",
+        "#sec3SliderFrom::-moz-range-thumb{pointer-events:all;cursor:grab}",
+        "#sec3SliderTo::-moz-range-thumb{pointer-events:all;cursor:grab}",
+        /* vehicle slider: orange thumb + filled track, #e2e8f0 non-selected track */
+        "#vehSlider{accent-color:#fb923c}",
+        "#vehSlider::-webkit-slider-runnable-track{background:#e2e8f0;border-radius:2px;height:4px}",
+        "#vehSlider::-moz-range-track{background:#e2e8f0;border-radius:2px;height:4px}",
+        "#vehSlider::-webkit-slider-thumb{background:#fb923c;border:none;border-radius:50%;width:14px;height:14px;margin-top:-5px;cursor:pointer}",
+        "#vehSlider::-moz-range-thumb{background:#fb923c;border:none;border-radius:50%;width:14px;height:14px;cursor:pointer}",
+      ].join(" ");
+      document.head.appendChild(s);
+    }
+
+    // Keep the thumb that's further left on top so it stays reachable
+    function syncZIndex() {
+      const lo = parseInt(fromEl.value), hi = parseInt(toEl.value);
+      fromEl.style.zIndex = lo >= hi ? "4" : "2";
+      toEl.style.zIndex   = lo >= hi ? "3" : "4";
+    }
+
+    function updateDateSlider() {
+      let lo = parseInt(fromEl.value), hi = parseInt(toEl.value);
+      if (lo > hi) { if (this === fromEl) { fromEl.value = hi; lo = hi; } else { toEl.value = lo; hi = lo; } }
+      _sec3DateFrom = _sec3DateList[lo];
+      _sec3DateTo   = _sec3DateList[hi];
+      fromLbl.textContent = _sec3DateFrom;
+      toLbl.textContent   = _sec3DateTo;
+      fill.style.left  = (lo / (nd - 1) * 100) + "%";
+      fill.style.width = ((hi - lo) / (nd - 1) * 100) + "%";
+      syncZIndex();
+      _drawScatter();
+      _drawDeltaChart();
+    }
+
+    fromEl.addEventListener("input", updateDateSlider);
+    toEl.addEventListener("input",   updateDateSlider);
+    syncZIndex();  // set initial z-index
+  }
+}
+
+function _sec3ResetDate() {
+  const nd = _sec3DateList.length;
+  if (!nd) return;
+  _sec3DateFrom = _sec3DateList[0];
+  _sec3DateTo   = _sec3DateList[nd - 1];
+  const fromEl = document.getElementById("sec3SliderFrom");
+  const toEl   = document.getElementById("sec3SliderTo");
+  if (fromEl) { fromEl.value = 0; }
+  if (toEl)   { toEl.value   = nd - 1; }
+  const fill    = document.getElementById("sec3SliderFill");
+  const fromLbl = document.getElementById("sec3DateFromLabel");
+  const toLbl   = document.getElementById("sec3DateToLabel");
+  if (fill)    { fill.style.left = "0%"; fill.style.width = "100%"; }
+  if (fromLbl) fromLbl.textContent = _sec3DateFrom;
+  if (toLbl)   toLbl.textContent   = _sec3DateTo;
+  _drawScatter();
+  _drawDeltaChart();
 }
 
 /* ─── Key Degradation Signals — plain-English definitions for ⓘ hover ─────────── */
@@ -380,7 +546,7 @@ function renderBayesCoef(data) {
     x: labels,
     y: values,
     customdata: defs,
-    marker: { color: "#ef4444", opacity: 0.8 },
+    marker: { color: "#fb923c", opacity: 0.8 },
     hovertemplate: "<b>%{x}</b><br>Degradation weight: <b>%{y:.5f}</b><br><br><span style='color:white;font-style:italic'>%{customdata}</span><extra></extra>",
   }], {
     paper_bgcolor: "white", plot_bgcolor: "#f8fafc",
@@ -450,12 +616,12 @@ function renderAnomalyTiers() {
          style="cursor:pointer;transition:background .12s"
          onclick="openVehicleDetail('${v.registration_number}');_tierMarkActive(this)">
       <td>
-        <a class="tier-reg-link" style="font-size:.8rem;font-weight:700;color:${color};
+        <a class="tier-reg-link" style="font-size:.8rem;font-weight:700;color:#1e293b;
            text-decoration:underline;text-underline-offset:2px;cursor:pointer;
            display:inline-flex;align-items:center;gap:4px"
            title="Click to open vehicle detail">
           ${v.registration_number}
-          <span style="font-size:.65rem;opacity:.75">↗</span>
+          <span style="font-size:.65rem;opacity:.75;color:#64748b">↗</span>
         </a>
       </td>
       <td class="text-muted">${signal || ""}</td>
@@ -484,6 +650,7 @@ const HOVER_FNS = {
   std_soh:           chartSohStdDev,
   trend:             chartSohTrend,
   ekf_rul:           chartVehicleRul,
+  ekf_rul_range:     chartRulRangeBollinger,
   eol:               chartEolInfo,
   data_span:         chartDataSpan,
   population:        chartPopulation,
@@ -493,6 +660,7 @@ const HOVER_FNS = {
   kpi_rul:           chartRulHistogram,
   kpi_remaining_efc: chartRemainingEfc,
   kpi_period:        chartDataSpan,
+  kpi_vehicles:      showVehicleList,
 };
 
 function setupHoverCharts() {
@@ -547,8 +715,8 @@ function showHoverChart(type, rowEl) {
   const plotEl = document.getElementById("hoverPlot");
   const textEl = document.getElementById("hoverText");
   const rect   = rowEl.getBoundingClientRect();
-  const isText = type === "eol";
-  const panelH = isText ? 180 : 300;
+  const isText = type === "eol" || type === "kpi_vehicles";
+  const panelH = isText ? (type === "kpi_vehicles" ? 340 : 180) : 300;
 
   // Position panel
   const panelW = 480;
@@ -582,31 +750,65 @@ function hideHoverChart() {
   document.getElementById("hoverPanel").style.display = "none";
 }
 
-/* ─── Chart: vehicle SoH bar ─────────────────────────────────────────────────── */
+/* ─── Chart: fleet mean EKF SoH over time ────────────────────────────────────── */
 function chartVehicleSoh(plotEl) {
-  // Sort descending so highest SoH is leftmost
-  const sorted = [..._vehicles]
-    .filter(v => v.current_soh != null)
-    .sort((a, b) => b.current_soh - a.current_soh);
+  if (!_trend || !_trend.length) return;
 
-  const colors = sorted.map(v =>
-    v.current_soh >= 97 ? "#22c55e" :
-    v.current_soh >= 95 ? "#f59e0b" : "#ef4444"
-  );
+  const dates = _trend.map(r => r.date);
+  const sohs  = _trend.map(r => r.median_soh);
+  const minY  = Math.min(...sohs);
+  const maxY  = Math.max(...sohs);
+
+  const sohShapes = [
+    { type: "rect", xref: "paper", yref: "y", x0: 0, x1: 1, y0: 80, y1: 97,
+      fillcolor: "rgba(239,68,68,0.13)",  line: { width: 0 } },
+    { type: "rect", xref: "paper", yref: "y", x0: 0, x1: 1, y0: 97, y1: 98,
+      fillcolor: "rgba(245,158,11,0.13)", line: { width: 0 } },
+    { type: "rect", xref: "paper", yref: "y", x0: 0, x1: 1, y0: 98, y1: 100,
+      fillcolor: "rgba(34,197,94,0.13)",  line: { width: 0 } },
+    // Cutoff lines
+    { type: "line", xref: "paper", yref: "y", x0: 0, x1: 1, y0: 97, y1: 97,
+      line: { color: "rgba(245,158,11,0.65)", width: 1.5, dash: "dot" } },
+    { type: "line", xref: "paper", yref: "y", x0: 0, x1: 1, y0: 98, y1: 98,
+      line: { color: "rgba(34,197,94,0.65)",  width: 1.5, dash: "dot" } },
+  ];
+
+  const sohAnnotations = [
+    // Region labels
+    { xref: "paper", yref: "y", x: 0.02, y: 96.75, xanchor: "left", yanchor: "middle", showarrow: false,
+      text: "Low SoH",
+      font: { size: 8, color: "rgba(220,38,38,0.80)", family: "Plus Jakarta Sans, system-ui, sans-serif" } },
+    { xref: "paper", yref: "y", x: 0.02, y: 97.5,  xanchor: "left", yanchor: "middle", showarrow: false,
+      text: "Watch",
+      font: { size: 8, color: "rgba(161,87,0,0.85)",  family: "Plus Jakarta Sans, system-ui, sans-serif" } },
+    { xref: "paper", yref: "y", x: 0.02, y: 99,    xanchor: "left", yanchor: "middle", showarrow: false,
+      text: "Healthy",
+      font: { size: 8, color: "rgba(22,163,74,0.85)", family: "Plus Jakarta Sans, system-ui, sans-serif" } },
+    // Cutoff value labels
+    { xref: "paper", yref: "y", x: 0.985, y: 97, xanchor: "right", yanchor: "bottom", showarrow: false,
+      text: "97%",
+      font: { size: 8, color: "rgba(161,87,0,0.90)", family: "Plus Jakarta Sans, system-ui, sans-serif" },
+      bgcolor: "rgba(255,255,255,0.75)", borderpad: 2 },
+    { xref: "paper", yref: "y", x: 0.985, y: 98, xanchor: "right", yanchor: "bottom", showarrow: false,
+      text: "98%",
+      font: { size: 8, color: "rgba(22,163,74,0.90)", family: "Plus Jakarta Sans, system-ui, sans-serif" },
+      bgcolor: "rgba(255,255,255,0.75)", borderpad: 2 },
+  ];
 
   Plotly.newPlot(plotEl, [{
-    type: "bar",
-    x: sorted.map(v => v.registration_number),
-    y: sorted.map(v => v.current_soh),
-    marker: { color: colors },
-    hovertemplate: "%{x}<br>SoH: %{y:.2f}%<extra></extra>",
+    type: "scatter", mode: "lines",
+    x: dates, y: sohs,
+    line: { color: "#3b82f6", width: 2, shape: "spline", smoothing: 0.8 },
+    hovertemplate: "%{x}<br>Fleet Mean EKF SoH: %{y:.3f}%<extra></extra>",
   }], {
-    ...baseLayout("EKF SoH per vehicle"),
+    ...baseLayout("Fleet Mean EKF SoH"),
     width: undefined,
     height: 282,
-    xaxis: { tickfont: { size: 7.5, color: "#1e293b" }, tickangle: -40, automargin: true },
-    yaxis: { ...yAx("SoH (%)"), range: [93, 100] },
+    xaxis: { ...xAx(), title: { text: "Time", font: { size: 9 } }, tickangle: -40 },
+    yaxis: { ...yAx("Fleet Mean EKF SoH %"), range: [Math.min(minY - 0.3, 96.5), maxY + 0.3] },
     margin: { t: 34, b: 70, l: 46, r: 14 },
+    shapes: sohShapes,
+    annotations: sohAnnotations,
   }, { displayModeBar: false, responsive: true });
 }
 
@@ -688,62 +890,106 @@ function chartSohTrend(plotEl) {
   const slope  = _overview.soh_trend_pct;
   const sign   = slope >= 0 ? "+" : "";
   const lineColor = last < first ? "#ef4444" : "#3b82f6";
-  const fillColor = last < first ? "rgba(239,68,68,0.08)" : "rgba(59,130,246,0.08)";
+  const fillColor = last < first ? "rgba(239,68,68,0.13)" : "rgba(59,130,246,0.08)";
 
   const minY = Math.min(...sohs);
   const maxY = Math.max(...sohs);
   const pad  = Math.max((maxY - minY) * 0.3, 0.05);
+
+  const sohShapes = [
+    { type: "rect", xref: "paper", yref: "y", x0: 0, x1: 1, y0: 80,  y1: 97,
+      fillcolor: "rgba(239,68,68,0.13)",  line: { width: 0 } },
+    { type: "rect", xref: "paper", yref: "y", x0: 0, x1: 1, y0: 97,  y1: 98,
+      fillcolor: "rgba(245,158,11,0.13)", line: { width: 0 } },
+    { type: "rect", xref: "paper", yref: "y", x0: 0, x1: 1, y0: 98,  y1: 100,
+      fillcolor: "rgba(34,197,94,0.13)",  line: { width: 0 } },
+    // Cutoff lines
+    { type: "line", xref: "paper", yref: "y", x0: 0, x1: 1, y0: 97, y1: 97,
+      line: { color: "rgba(245,158,11,0.65)", width: 1.5, dash: "dot" } },
+    { type: "line", xref: "paper", yref: "y", x0: 0, x1: 1, y0: 98, y1: 98,
+      line: { color: "rgba(34,197,94,0.65)",  width: 1.5, dash: "dot" } },
+  ];
+
+  const sohAnnotations = [
+    // Region labels
+    { xref: "paper", yref: "y", x: 0.02, y: 96.75, xanchor: "left", yanchor: "middle", showarrow: false,
+      text: "Low SoH",
+      font: { size: 8, color: "rgba(220,38,38,0.80)", family: "Plus Jakarta Sans, system-ui, sans-serif" } },
+    { xref: "paper", yref: "y", x: 0.02, y: 97.5,  xanchor: "left", yanchor: "middle", showarrow: false,
+      text: "Watch",
+      font: { size: 8, color: "rgba(161,87,0,0.85)",  family: "Plus Jakarta Sans, system-ui, sans-serif" } },
+    { xref: "paper", yref: "y", x: 0.02, y: 99,    xanchor: "left", yanchor: "middle", showarrow: false,
+      text: "Healthy",
+      font: { size: 8, color: "rgba(22,163,74,0.85)", family: "Plus Jakarta Sans, system-ui, sans-serif" } },
+    // Cutoff value labels
+    { xref: "paper", yref: "y", x: 0.985, y: 97, xanchor: "right", yanchor: "bottom", showarrow: false,
+      text: "97%",
+      font: { size: 8, color: "rgba(161,87,0,0.90)", family: "Plus Jakarta Sans, system-ui, sans-serif" },
+      bgcolor: "rgba(255,255,255,0.75)", borderpad: 2 },
+    { xref: "paper", yref: "y", x: 0.985, y: 98, xanchor: "right", yanchor: "bottom", showarrow: false,
+      text: "98%",
+      font: { size: 8, color: "rgba(22,163,74,0.90)", family: "Plus Jakarta Sans, system-ui, sans-serif" },
+      bgcolor: "rgba(255,255,255,0.75)", borderpad: 2 },
+  ];
 
   Plotly.newPlot(plotEl, [
     {
       type: "scatter", mode: "lines",
       x: dates, y: sohs,
       line: { color: lineColor, width: 2, shape: "spline", smoothing: 0.8 },
-      fill: "tonexty", fillcolor: fillColor,
       hovertemplate: "%{x}<br>Fleet median SoH: %{y:.3f}%<extra></extra>",
       name: "Fleet median SoH",
     },
   ], {
     ...baseLayout(`Fleet SoH Trend   ${sign}${slope.toFixed(2)}% over ${_overview.span_days} days`),
-    yaxis: { ...yAx("EKF SoH (%)"), range: [minY - pad, maxY + pad] },
-    xaxis: { ...xAx() },
+    yaxis: { ...yAx("EKF SoH %"), range: [Math.min(minY - pad, 96.5), maxY + pad] },
+    xaxis: { ...xAx(), title: { text: "Time", font: { size: 9 } } },
+    shapes: sohShapes,
+    annotations: sohAnnotations,
   }, cfg());
 }
 
 /* ─── Chart: vehicle RUL bar ─────────────────────────────────────────────────── */
 function chartVehicleRul(plotEl) {
   const field = v => v.ekf_rul_days != null ? v.ekf_rul_days : v.rul_days;
-  const all = [..._vehicles].filter(v => field(v) != null);
+  const rulYears = _vehicles
+    .filter(v => field(v) != null && field(v) > 0)
+    .map(v => +(field(v) / 365.25).toFixed(2));
 
-  // Outlier removal: exclude values above Q3 + 3×IQR
-  const vals  = all.map(v => field(v)).sort((a, b) => a - b);
-  const q1    = vals[Math.floor(vals.length * 0.25)];
-  const q3    = vals[Math.floor(vals.length * 0.75)];
-  const fence = q3 + 3 * (q3 - q1);
+  if (!rulYears.length) { Plotly.purge(plotEl); return; }
 
-  // Sort descending so longest RUL is leftmost
-  const sorted = all
-    .filter(v => field(v) <= fence)
-    .sort((a, b) => field(b) - field(a));
+  const CAP = 10;
+  const binEdges = Array.from({ length: CAP }, (_, i) => i);
+  const labels = binEdges.map(b => `${b}–${b + 1}`).concat(["10+"]);
+  const counts = binEdges
+    .map(b => rulYears.filter(v => v >= b && v < b + 1).length)
+    .concat([rulYears.filter(v => v >= CAP).length]);
 
-  const colors = sorted.map(v =>
-    field(v) > 730 ? "#22c55e" :
-    field(v) > 365 ? "#f59e0b" : "#ef4444"
-  );
+  const med = _overview.median_ekf_rul != null
+    ? +(_overview.median_ekf_rul / 365.25).toFixed(2) : null;
+
+  const annotations = [];
+  if (med != null) {
+    const medLabel = med >= CAP ? "10+" : `${Math.floor(med)}–${Math.floor(med) + 1}`;
+    annotations.push({ x: medLabel, y: 0.98, xref: "x", yref: "paper",
+      text: `Median ${med.toFixed(2)} yr`, showarrow: true, ax: 0, ay: -20,
+      font: { size: 8.5, color: "#1e293b", family: "Plus Jakarta Sans" },
+      bgcolor: "rgba(255,255,255,0.8)", borderpad: 2 });
+  }
 
   Plotly.newPlot(plotEl, [{
     type: "bar",
-    x: sorted.map(v => v.registration_number),
-    y: sorted.map(v => +(field(v) / 365.25).toFixed(2)),
-    marker: { color: colors },
-    hovertemplate: "%{x}<br>RUL: %{y:.2f} yr<extra></extra>",
+    x: labels, y: counts,
+    marker: { color: "#3b82f6", opacity: 0.75 },
+    hovertemplate: "RUL: %{x} yr<br>Count: %{y}<extra></extra>",
   }], {
-    ...baseLayout("EKF RUL per vehicle"),
+    ...baseLayout("EKF RUL Distribution (years)"),
     width: undefined,
     height: 282,
-    xaxis: { tickfont: { size: 7.5, color: "#1e293b" }, tickangle: -40, automargin: true },
-    yaxis: { ...yAx("RUL (years)") },
+    xaxis: { ...xAx(), title: { text: "RUL (years)", font: { size: 9 } }, tickangle: -40 },
+    yaxis: { ...yAx("Count") },
     margin: { t: 34, b: 70, l: 46, r: 14 },
+    annotations,
   }, { displayModeBar: false, responsive: true });
 }
 
@@ -791,34 +1037,36 @@ function chartRulHistogram(plotEl) {
 
   if (!rulYears.length) { Plotly.purge(plotEl); return; }
 
+  // Build 1-year bins from 0–10, then one "10+" bucket
+  const CAP = 10;
+  const binEdges = Array.from({ length: CAP }, (_, i) => i);  // [0,1,...,9]
+  const labels = binEdges.map(b => `${b}–${b + 1}`).concat(["10+"]);
+  const counts = binEdges
+    .map(b => rulYears.filter(v => v >= b && v < b + 1).length)
+    .concat([rulYears.filter(v => v >= CAP).length]);
+
   const med = _overview.median_ekf_rul != null
     ? +(_overview.median_ekf_rul / 365.25).toFixed(2) : null;
 
-  const shapes = [], annotations = [];
+  const annotations = [];
   if (med != null) {
-    shapes.push({ type: "line", x0: med, x1: med, y0: 0, y1: 1,
-      xref: "x", yref: "paper", line: { color: "#1e293b", width: 1.5, dash: "dash" } });
-    annotations.push({ x: med, y: 0.98, xref: "x", yref: "paper",
-      text: `Median ${med.toFixed(2)} yr`, showarrow: false,
+    // Find which bin label the median falls in
+    const medLabel = med >= CAP ? "10+" : `${Math.floor(med)}–${Math.floor(med) + 1}`;
+    annotations.push({ x: medLabel, y: 0.98, xref: "x", yref: "paper",
+      text: `Median ${med.toFixed(2)} yr`, showarrow: true, ax: 0, ay: -20,
       font: { size: 8.5, color: "#1e293b", family: "Plus Jakarta Sans" },
       bgcolor: "rgba(255,255,255,0.8)", borderpad: 2 });
   }
 
-  const minV = Math.floor(Math.min(...rulYears) * 4) / 4;   // round down to nearest 0.25
-  const maxV = Math.ceil(Math.max(...rulYears)  * 4) / 4;   // round up   to nearest 0.25
-
   Plotly.newPlot(plotEl, [{
-    type: "histogram",
-    x: rulYears,
-    autobinx: false,
-    xbins: { start: minV, end: maxV, size: 0.25 },           // 3-month bins
-    marker: { color: "#8b5cf6", opacity: 0.75 },
-    hovertemplate: "RUL: %{x:.2f}–%{x:.2f} yr<br>Count: %{y}<extra></extra>",
+    type: "bar",
+    x: labels, y: counts,
+    marker: { color: "#3b82f6", opacity: 0.75 },
+    hovertemplate: "RUL: %{x} yr<br>Count: %{y}<extra></extra>",
   }], {
     ...baseLayout("EKF RUL Distribution (years)"),
-    xaxis: { ...xAx(), title: { text: "RUL (years)", font: { size: 9 } }, dtick: 0.5 },
+    xaxis: { ...xAx(), title: { text: "RUL (years)", font: { size: 9 } }, tickangle: -40 },
     yaxis: { ...yAx("Count") },
-    shapes,
     annotations,
   }, cfg());
 }
@@ -865,9 +1113,47 @@ async function chartDataSpan(plotEl, textEl) {
   document.getElementById("hoverPanel").style.height = h + "px";
   plotEl.style.height = h + "px";
 
+  // Background region fills: low (<40) = red, medium (40-80) = orange, high (>80) = green
+  const regionShapes = [
+    { type: "rect", xref: "paper", yref: "y", x0: 0, x1: 1, y0: 0,  y1: 40,
+      fillcolor: "rgba(239,68,68,0.13)",  line: { width: 0 } },
+    { type: "rect", xref: "paper", yref: "y", x0: 0, x1: 1, y0: 40, y1: 80,
+      fillcolor: "rgba(245,158,11,0.13)", line: { width: 0 } },
+    { type: "rect", xref: "paper", yref: "y", x0: 0, x1: 1, y0: 80, y1: 105,
+      fillcolor: "rgba(34,197,94,0.13)",  line: { width: 0 } },
+    // Cutoff lines
+    { type: "line", xref: "paper", yref: "y", x0: 0, x1: 1, y0: 40, y1: 40,
+      line: { color: "rgba(245,158,11,0.65)", width: 1.5, dash: "dot" } },
+    { type: "line", xref: "paper", yref: "y", x0: 0, x1: 1, y0: 80, y1: 80,
+      line: { color: "rgba(34,197,94,0.65)",  width: 1.5, dash: "dot" } },
+  ];
+
+  const regionAnnotations = [
+    // Region labels (centred vertically in each band)
+    { xref: "paper", yref: "y", x: 0.02, y: 20,   xanchor: "left", yanchor: "middle", showarrow: false,
+      text: "Low Coverage",
+      font: { size: 8.5, color: "rgba(220,38,38,0.75)",  family: "Plus Jakarta Sans, system-ui, sans-serif" } },
+    { xref: "paper", yref: "y", x: 0.02, y: 60,   xanchor: "left", yanchor: "middle", showarrow: false,
+      text: "Medium Coverage",
+      font: { size: 8.5, color: "rgba(161,87,0,0.80)",   family: "Plus Jakarta Sans, system-ui, sans-serif" } },
+    { xref: "paper", yref: "y", x: 0.02, y: 92.5, xanchor: "left", yanchor: "middle", showarrow: false,
+      text: "High Coverage",
+      font: { size: 8.5, color: "rgba(22,163,74,0.80)",  family: "Plus Jakarta Sans, system-ui, sans-serif" } },
+    // Cutoff value labels (right edge, just above each line)
+    { xref: "paper", yref: "y", x: 0.985, y: 40, xanchor: "right", yanchor: "bottom", showarrow: false,
+      text: "40%",
+      font: { size: 8, color: "rgba(161,87,0,0.90)",  family: "Plus Jakarta Sans, system-ui, sans-serif" },
+      bgcolor: "rgba(255,255,255,0.75)", borderpad: 2 },
+    { xref: "paper", yref: "y", x: 0.985, y: 80, xanchor: "right", yanchor: "bottom", showarrow: false,
+      text: "80%",
+      font: { size: 8, color: "rgba(22,163,74,0.90)", family: "Plus Jakarta Sans, system-ui, sans-serif" },
+      bgcolor: "rgba(255,255,255,0.75)", borderpad: 2 },
+  ];
+
   Plotly.newPlot(plotEl, [{
-    type: "bar", x: dates, y: pcts,
-    marker: { color: pcts.map(p => p >= 80 ? "#22c55e" : p >= 40 ? "#f59e0b" : "#ef4444") },
+    type: "scatter", mode: "lines", x: dates, y: pcts,
+    line: { color: "#3b82f6", width: 2.5, shape: "spline" },
+    fill: "tozeroy", fillcolor: "rgba(59,130,246,0.10)",
     hovertemplate: "%{x}<br>%{customdata} / " + total + " vehicles (%{y:.1f}%)<extra></extra>",
     customdata: counts,
   }], {
@@ -875,10 +1161,143 @@ async function chartDataSpan(plotEl, textEl) {
     font: { family: "Plus Jakarta Sans, system-ui, sans-serif", size: 9.5, color: "#475569" },
     margin: { l: 44, r: 10, t: 10, b: 70 },
     height: h,
-    xaxis: { gridcolor: "#e2e8f0", tickangle: -40, tickfont: { size: 8.5 } },
-    yaxis: { gridcolor: "#e2e8f0", range: [0, 105], title: { text: "% fleet", font: { size: 9 } } },
+    xaxis: { gridcolor: "#e2e8f0", tickangle: -40, tickfont: { size: 8.5 }, title: { text: "Time", font: { size: 9 } } },
+    yaxis: { gridcolor: "#e2e8f0", range: [0, 105], title: { text: "% Fleet Coverage", font: { size: 9 } } },
+    showlegend: false,
+    shapes: regionShapes,
+    annotations: regionAnnotations,
+  }, { displayModeBar: false, responsive: false });
+}
+
+/* ─── Chart: EKF RUL Fleet Range (IQR) — time series + Bollinger bands ──────── */
+function chartRulRangeBollinger(plotEl) {
+  if (!_trend || !_trend.length || !_vehicles || !_vehicles.length || !_overview) return;
+
+  const eol = _overview.eol_threshold ?? 80;
+
+  // Build per-vehicle projection data.
+  // Key insight: the EKF model's ekf_rul_days is NOT simply (soh − eol)/|slope| —
+  // it encodes non-linear factors. We compute a per-vehicle scale factor so that
+  // the projection is exactly right at the last date, while slope heterogeneity
+  // drives genuine variation across the historical series.
+  const getEkfRul = v => (v.ekf_rul_days != null ? v.ekf_rul_days : v.rul_days);
+
+  const vehData = _vehicles.map(v => {
+    const rul    = getEkfRul(v);
+    const curSoh = v.current_soh;
+    const slope  = v["soh_slope_%per_day"];          // %/day, negative = declining
+
+    if (rul == null || rul <= 0 || curSoh == null) return null;
+
+    if (slope != null && Math.abs(slope) > 1e-5) {
+      // slope-derived RUL at the last date (days)
+      const slopeRul = (curSoh - eol) / Math.abs(slope);
+      if (slopeRul <= 0) return null;
+      // scale factor reconciles EKF RUL with slope-derived RUL; clamp to [0.2, 5]
+      const sf = Math.min(5, Math.max(0.2, rul / slopeRul));
+      return { rul, curSoh, slope, sf };
+    }
+    // No usable slope: use simple time-offset fallback
+    return { rul, curSoh, slope: null, sf: null };
+  }).filter(Boolean);
+
+  if (!vehData.length) return;
+
+  const lastDateStr = _trend[_trend.length - 1].date;
+  const lastMs      = new Date(lastDateStr).getTime();
+  const dates       = _trend.map(r => r.date);
+
+  const medians = [];
+
+  dates.forEach(d => {
+    const deltaDays = (lastMs - new Date(d).getTime()) / 86400000;
+
+    const ruls = vehData.map(v => {
+      if (v.slope != null && v.sf != null) {
+        const sohAtD      = v.curSoh - v.slope * deltaDays;
+        const slopeRulAtD = Math.max(0, (sohAtD - eol) / Math.abs(v.slope));
+        return v.sf * slopeRulAtD / 365.25;
+      }
+      return (v.rul + deltaDays) / 365.25;
+    }).filter(r => r > 0).sort((a, b) => a - b);
+
+    const n = ruls.length;
+    if (!n) { medians.push(null); return; }
+    const mid = Math.floor(n / 2);
+    medians.push(n % 2 === 0 ? (ruls[mid - 1] + ruls[mid]) / 2 : ruls[mid]);
+  });
+
+  // Bollinger bands around the actual trend line:
+  //   half-width = rolling temporal σ of the median series itself (±2σ)
+  //   centre     = actual median[i]  → line is always inside the band
+  const WIN = Math.max(5, Math.min(20, Math.floor(dates.length / 4)));
+  const rollStd = medians.map((_, i) => {
+    const slice = medians.slice(Math.max(0, i - WIN + 1), i + 1).filter(v => v != null);
+    if (slice.length < 2) return 0;
+    const mu = slice.reduce((a, b) => a + b, 0) / slice.length;
+    return Math.sqrt(slice.reduce((s, x) => s + (x - mu) ** 2, 0) / slice.length);
+  });
+  const bbHi = medians.map((m, i) => m != null ? m + 2 * rollStd[i] : null);
+  const bbLo = medians.map((m, i) => m != null ? m - 2 * rollStd[i] : null);
+
+  const panelH = 310;
+  document.getElementById("hoverPanel").style.height = panelH + "px";
+  plotEl.style.height = panelH + "px";
+
+  Plotly.newPlot(plotEl, [
+    // Bollinger band fill — always contains the median line
+    { type: "scatter", mode: "lines", x: dates, y: bbHi,
+      line: { width: 0 }, showlegend: false, hoverinfo: "skip", fill: "none" },
+    { type: "scatter", mode: "lines", x: dates, y: bbLo,
+      line: { width: 0 }, fill: "tonexty",
+      fillcolor: "rgba(99,102,241,0.13)", showlegend: false, hoverinfo: "skip" },
+    // Fleet median RUL
+    { type: "scatter", mode: "lines", x: dates, y: medians,
+      line: { color: "#3b82f6", width: 2.5, shape: "spline", smoothing: 0.6 },
+      name: "Fleet median RUL",
+      hovertemplate: "%{x}<br>Fleet median RUL: %{y:.2f} yr<extra></extra>" },
+  ], {
+    paper_bgcolor: "transparent", plot_bgcolor: "#f8fafc",
+    font: { family: "Plus Jakarta Sans, system-ui, sans-serif", size: 9, color: "#475569" },
+    margin: { l: 46, r: 12, t: 28, b: 60 },
+    height: panelH,
+    title: { text: "EKF RUL Fleet Range — Bollinger Bands",
+      font: { family: "Plus Jakarta Sans, system-ui, sans-serif", size: 10, color: "#0f172a" },
+      x: 0.02, xanchor: "left" },
+    xaxis: { gridcolor: "#e2e8f0", tickangle: -40, tickfont: { size: 8 } },
+    yaxis: { gridcolor: "#e2e8f0", autorange: true,
+             title: { text: "Est. RUL (years)", font: { size: 9 } },
+             tickfont: { size: 8.5 } },
     showlegend: false,
   }, { displayModeBar: false, responsive: false });
+}
+
+/* ─── Hover text: Vehicle list ───────────────────────────────────────────────── */
+function showVehicleList(plotEl, textEl) {
+  if (!_vehicles || !_vehicles.length) {
+    textEl.innerHTML = `<div style="padding:16px;color:#94a3b8;font-size:.82rem">No vehicle data.</div>`;
+    return;
+  }
+  const sorted = [..._vehicles].sort((a, b) =>
+    (a.registration_number || "").localeCompare(b.registration_number || ""));
+
+  const items = sorted.map(v => {
+    const soh = v.current_soh != null ? `${Number(v.current_soh).toFixed(1)}%` : "—";
+    return `<div style="display:flex;justify-content:space-between;align-items:center;
+                        padding:4px 0;border-bottom:1px solid #f1f5f9">
+      <span style="font-size:.78rem;font-weight:600;color:#1e293b">${v.registration_number}</span>
+      <span style="font-size:.75rem;color:#64748b">SoH ${soh}</span>
+    </div>`;
+  }).join("");
+
+  textEl.innerHTML = `
+    <div style="padding:12px 14px">
+      <div style="font-size:.74rem;font-weight:700;color:#3b82f6;text-transform:uppercase;
+                  letter-spacing:.06em;margin-bottom:8px">
+        All Vehicles (${sorted.length})
+      </div>
+      <div style="max-height:280px;overflow-y:auto;padding-right:4px">${items}</div>
+    </div>`;
 }
 
 /* ─── Plotly layout helpers ──────────────────────────────────────────────────── */
@@ -929,7 +1348,7 @@ function chartRemainingEfc(plotEl) {
     type: "histogram",
     x: vals,
     nbinsx: 6,
-    marker: { color: "#10b981", opacity: 0.75 },
+    marker: { color: "#3b82f6", opacity: 0.75 },
     hovertemplate: "Remaining EFC: %{x:.0f}<br>Vehicles: %{y}<extra></extra>",
   }], {
     ...baseLayout(`Remaining EFC — fleet  median=${med != null ? Math.round(med) : "—"}`),
@@ -1441,7 +1860,7 @@ function renderVDSection3(coef, vehicle, container) {
 
   requestAnimationFrame(() => {
     _renderCoefBar(vChartId, coef.vehicle,  "#3b82f6");
-    _renderCoefBar(gChartId, coef.global,   "#6366f1");
+    _renderCoefBar(gChartId, coef.global,   "#f59e0b");
 
     if (hasVeh && hasGlobal) {
       document.getElementById("vdCoefCompare").innerHTML =
@@ -1462,23 +1881,21 @@ function _renderCoefBar(divId, coefObj, color) {
   }
 
   const labels = entries.map(([k]) => formatCoefLabel(k));
-  const values = entries.map(([, v]) => v);   // keep negative; reversed axis makes bars go right
-  const h      = Math.max(220, entries.length * 24 + 70);
+  const values = entries.map(([, v]) => v);
 
-  document.getElementById(divId).style.minHeight = h + "px";
+  document.getElementById(divId).style.minHeight = "280px";
   Plotly.newPlot(divId, [{
-    type: "bar", orientation: "h",
-    y: labels, x: values,
+    type: "bar",
+    x: labels, y: values,
     marker: { color },
-    hovertemplate: "%{y}<br>coef: %{x:.6f}<extra></extra>",
+    hovertemplate: "%{x}<br>coef: %{y:.6f}<extra></extra>",
   }], {
     paper_bgcolor: "transparent", plot_bgcolor: "#f8fafc",
     font: { family: "Plus Jakarta Sans, system-ui, sans-serif", size: 10, color: "#475569" },
-    height: h,
-    margin: { l: 170, r: 16, t: 16, b: 36 },
-    xaxis: { title: "Coefficient value", gridcolor: "#e2e8f0", tickfont: { size: 9 },
-             autorange: "reversed" },   // negative values + reversed → bars extend left→right
-    yaxis: { automargin: true, tickfont: { size: 9.5 } },
+    height: 280,
+    margin: { l: 50, r: 16, t: 16, b: 110 },
+    xaxis: { tickangle: -40, automargin: true, tickfont: { size: 9 }, gridcolor: "#e2e8f0" },
+    yaxis: { title: "Coefficient value", gridcolor: "#e2e8f0", tickfont: { size: 9 }, autorange: "reversed" },
   }, { displayModeBar: false, responsive: true });
 }
 
@@ -1638,6 +2055,118 @@ let _vdSessFilter   = { detector: null, signal: null, sessionType: null };
 let _vdReg          = null;
 let _vdBdCache      = null;   // stored so detector chart can re-render itself on click
 let _vdActiveSessId = null;   // session_id of currently-open telemetry row
+let _vdDateFrom     = null;   // "YYYY-MM-DD" or null
+let _vdDateTo       = null;   // "YYYY-MM-DD" or null
+let _vdDateList     = [];     // sorted unique session dates
+
+// ── Slider CSS injected once ──────────────────────────────────────────────
+function _vdInjectSliderStyles() {
+  if (document.getElementById("vdSliderStyles")) return;
+  const s = document.createElement("style");
+  s.id = "vdSliderStyles";
+  s.textContent = `
+    #vdSliderWrap input[type=range] {
+      position:absolute; width:100%; height:0; top:10px; margin:0;
+      -webkit-appearance:none; appearance:none; background:transparent; pointer-events:none; outline:none;
+    }
+    #vdSliderWrap input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance:none; pointer-events:all; width:16px; height:16px;
+      border-radius:50%; background:#3b82f6; cursor:pointer;
+      border:2px solid #fff; box-shadow:0 1px 4px rgba(0,0,0,.25);
+    }
+    #vdSliderWrap input[type=range]::-moz-range-thumb {
+      pointer-events:all; width:16px; height:16px; border-radius:50%;
+      background:#3b82f6; cursor:pointer; border:2px solid #fff;
+      box-shadow:0 1px 4px rgba(0,0,0,.25); appearance:none;
+    }
+    #vdSliderWrap input#vdSliderFrom { z-index:3; }
+    #vdSliderWrap input#vdSliderTo   { z-index:4; }
+  `;
+  document.head.appendChild(s);
+}
+
+function _vdInitDateSlider(sessions) {
+  _vdDateList = [...new Set(
+    sessions.map(s => (s.start_time_ist || "").slice(0, 10)).filter(Boolean)
+  )].sort();
+  const n = _vdDateList.length;
+  if (n < 2) return;
+
+  _vdDateFrom = _vdDateList[0];
+  _vdDateTo   = _vdDateList[n - 1];
+
+  const fromEl = document.getElementById("vdSliderFrom");
+  const toEl   = document.getElementById("vdSliderTo");
+  if (!fromEl || !toEl) return;
+
+  fromEl.max = n - 1; fromEl.value = 0;
+  toEl.max   = n - 1; toEl.value   = n - 1;
+  _vdUpdateSliderUI();
+
+  async function onSliderChange() {
+    let lo = parseInt(fromEl.value);
+    let hi = parseInt(toEl.value);
+    if (lo > hi) {
+      if (this === fromEl) { fromEl.value = hi; lo = hi; }
+      else                 { toEl.value = lo;   hi = lo; }
+    }
+    _vdDateFrom = _vdDateList[lo];
+    _vdDateTo   = _vdDateList[hi];
+    _vdUpdateSliderUI();
+    _vdRefreshSessions();
+    await _vdRefreshBreakdown();
+  }
+
+  fromEl.addEventListener("input", onSliderChange);
+  toEl.addEventListener("input",   onSliderChange);
+}
+
+function _vdUpdateSliderUI() {
+  const n = _vdDateList.length;
+  if (!n) return;
+  const fromEl = document.getElementById("vdSliderFrom");
+  const toEl   = document.getElementById("vdSliderTo");
+  const fill   = document.getElementById("vdSliderFill");
+  const fromLbl = document.getElementById("vdSliderFromLabel");
+  const toLbl   = document.getElementById("vdSliderToLabel");
+  if (!fromEl || !toEl) return;
+  const lo = parseInt(fromEl.value), hi = parseInt(toEl.value);
+  if (fromLbl) fromLbl.textContent = _vdDateList[lo] || "—";
+  if (toLbl)   toLbl.textContent   = _vdDateList[hi] || "—";
+  if (fill) {
+    fill.style.left  = (lo / (n - 1) * 100) + "%";
+    fill.style.width = ((hi - lo) / (n - 1) * 100) + "%";
+  }
+}
+
+async function _vdResetDateFilter() {
+  const n = _vdDateList.length;
+  if (!n) return;
+  const fromEl = document.getElementById("vdSliderFrom");
+  const toEl   = document.getElementById("vdSliderTo");
+  if (fromEl) fromEl.value = 0;
+  if (toEl)   toEl.value   = n - 1;
+  _vdDateFrom = _vdDateList[0];
+  _vdDateTo   = _vdDateList[n - 1];
+  _vdUpdateSliderUI();
+  _vdRefreshSessions();
+  await _vdRefreshBreakdown();
+}
+
+async function _vdRefreshBreakdown() {
+  const params = new URLSearchParams();
+  if (_vdSessFilter.detector)    params.set("detector",     _vdSessFilter.detector);
+  if (_vdSessFilter.sessionType) params.set("session_type", _vdSessFilter.sessionType);
+  if (_vdDateFrom)               params.set("date_from",    _vdDateFrom);
+  if (_vdDateTo)                 params.set("date_to",      _vdDateTo);
+  const url = `/api/anomaly-breakdown/${_vdReg}/` + (params.toString() ? "?" + params : "");
+  const fd  = await fetch(url).then(r => r.json());
+  await _vdRenderDetectorChart(fd.by_detector);
+  const parts = [];
+  if (_vdSessFilter.detector)    parts.push(_vdSessFilter.detector.toUpperCase());
+  if (_vdSessFilter.sessionType) parts.push(_vdSessFilter.sessionType);
+  await _vdRenderSignalChart(fd.by_signal, parts.length ? parts.join(" · ") : _vdReg);
+}
 
 // ── CUSUM / IF filter maps (mirrors dashboard.js) ─────────────────────────
 const VD_CUSUM_FILTER = {
@@ -2020,8 +2549,6 @@ async function renderVDSection4(sessData, bdData, reg, container) {
   requestAnimationFrame(async () => {
     if (bdData && bdData.by_detector) {
       await _vdRenderDetectorChart(bdData.by_detector);
-
-      // Click handler now lives inside _vdRenderDetectorChart (self-contained)
       await _vdRenderSignalChart(bdData.by_signal, reg);
     }
 
@@ -2135,7 +2662,7 @@ async function vdLoadTelemetry(reg, sessionId, sessionType, startTime) {
     { title:"IR (Ω)",            fields:[{f:"ir_ohm",color:"#8b5cf6",name:"IR"}],                         yLabel:"Ω", connectgaps:true },
     { title:"Speed (km/h)",      fields:[{f:"speed",color:"#10b981",name:"Speed"}],                       yLabel:"km/h" },
     ...(isCharging  ? [{ title:"Charging Power (kW)",  fields:[{f:"_chg_pwr",color:"#0ea5e9",name:"Chg Power"}], yLabel:"kW" }] : []),
-    ...(!isCharging ? [{ title:"Energy / km (kWh/km)", fields:[{f:"_epk",   color:"#f97316",name:"Eff."}],      yLabel:"kWh/km" }] : []),
+    ...(!isCharging ? [{ title:"Energy / km (kWh/km)", fields:[{f:"_epk",   color:"#fb923c",name:"Eff."}],      yLabel:"kWh/km" }] : []),
     { title:"Voltage Sag Flag",  fields:[{f:"_vsag",color:"#ef4444",name:"Sag"}],                         yLabel:"flag", bar:true },
   ];
 
@@ -2585,14 +3112,14 @@ function _drawBreakdownChart(rows, eol, highlightReg) {
       line: { color: "#fff", width: 1.5 },
     },
     customdata: rowsWithRul.map(r => [
-      r.rul_days != null ? Math.round(r.rul_days) : "—",
+      r.rul_days != null ? (r.rul_days / 365.25).toFixed(2) : "—",
       r.current_soh != null ? r.current_soh.toFixed(2) : "—",
       r.soh_slope != null ? r.soh_slope.toFixed(4) : "—",
     ]),
     hovertemplate:
       "<b>%{y}</b><br>" +
       "Projected EoL: <b>%{x}</b><br>" +
-      "RUL: %{customdata[0]} days<br>" +
+      "RUL: %{customdata[0]} yr<br>" +
       "Current SoH: %{customdata[1]}%<br>" +
       "Daily slope: %{customdata[2]}%/day<extra></extra>",
   }], {

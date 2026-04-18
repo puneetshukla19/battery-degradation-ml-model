@@ -128,12 +128,6 @@
     /* ── Accordion (tiers) ── */
     .accordion-item { border-radius: var(--card-radius) !important; margin-bottom: 10px; overflow: hidden; box-shadow: var(--card-shadow); border: none !important; }
     .accordion-button { font-size: 0.85rem; font-weight: 700; letter-spacing: .04em; }
-    .tier1-btn { background: #fef2f2 !important; color: #b91c1c !important; }
-    .tier1-btn:not(.collapsed) { background: #fee2e2 !important; }
-    .tier2-btn { background: #fffbeb !important; color: #92400e !important; }
-    .tier2-btn:not(.collapsed) { background: #fef3c7 !important; }
-    .tier3-btn { background: #f0fdf4 !important; color: #166534 !important; }
-    .tier3-btn:not(.collapsed) { background: #dcfce7 !important; }
     .accordion-button::after { filter: none; }
 
     /* ── Plotly charts ── */
@@ -157,6 +151,10 @@
       background: #f1f5f9; color: #475569;
       position: sticky; top: 0; z-index: 2;
     }
+    /* Tier tables: reduced font size */
+    #tier1Table th, #tier1Table td,
+    #tier2Table th, #tier2Table td,
+    #tier3Table th, #tier3Table td { font-size: 0.75rem !important; }
 
     /* ── Coef warning ── */
     .coef-warn { background: #fffbeb; color: #92400e; padding: 8px 12px; font-size: 0.8rem; border-radius: 6px; border: 1px solid #fcd34d; }
@@ -296,7 +294,7 @@
 
     <div class="accordion-item">
       <h2 class="accordion-header">
-        <button class="accordion-button tier1-btn" type="button"
+        <button class="accordion-button" type="button"
                 data-bs-toggle="collapse" data-bs-target="#tier1Panel">
           🔴&nbsp; TIER 1 — IMMEDIATE ATTENTION (4 vehicles)
         </button>
@@ -320,7 +318,7 @@
 
     <div class="accordion-item">
       <h2 class="accordion-header">
-        <button class="accordion-button collapsed tier2-btn" type="button"
+        <button class="accordion-button collapsed" type="button"
                 data-bs-toggle="collapse" data-bs-target="#tier2Panel">
           🟡&nbsp; TIER 2 — MONITOR CLOSELY (5 vehicles)
         </button>
@@ -344,7 +342,7 @@
 
     <div class="accordion-item">
       <h2 class="accordion-header">
-        <button class="accordion-button collapsed tier3-btn" type="button"
+        <button class="accordion-button collapsed" type="button"
                 data-bs-toggle="collapse" data-bs-target="#tier3Panel">
           🟢&nbsp; TIER 3 — ELEVATED BUT STABLE (5 vehicles)
         </button>
@@ -478,6 +476,6 @@
 </div><!-- /page-body -->
 
 {% load static %}
-<script src="{% static 'fleet/dashboard.js' %}?v=43"></script>
+<script src="{% static 'fleet/dashboard.js' %}?v=44"></script>
 </body>
 </html>

@@ -429,24 +429,24 @@ async function loadBayesCoef(reg) {
     return;
   }
 
-  renderCoefChart("coefGlobalChart", d.global, "Fleet Global (median)", true);
+  renderCoefChart("coefGlobalChart", d.global, "Fleet Global (median)", true, "#f59e0b");
 
   if (reg && Object.keys(d.vehicle).length > 0) {
     document.getElementById("coefVehicleHeader").textContent = reg;
-    renderCoefChart("coefVehicleChart", d.vehicle, reg, true);
+    renderCoefChart("coefVehicleChart", d.vehicle, reg, true, "#3b82f6");
   } else if (reg) {
     document.getElementById("coefVehicleChart").innerHTML =
       `<div class="placeholder-msg"><div class="ico">📭</div><p>No coefficient data for ${reg}</p></div>`;
   }
 }
 
-function renderCoefChart(divId, coefObj, title, negativeOnly = false) {
+function renderCoefChart(divId, coefObj, title, negativeOnly = false, color = "#3b82f6") {
   try {
     let entries = Object.entries(coefObj).sort((a, b) => a[1] - b[1]);
     if (negativeOnly) entries = entries.filter(([, v]) => v < 0);
-    const labels  = entries.map(([k]) => k.replace(/_/g, " "));
-    const values  = entries.map(([, v]) => v);
-    const colors  = values.map(() => "#3b82f6");
+    // Sort ascending (most negative → least negative) for vertical bars
+    const labels = entries.map(([k]) => k.replace(/_/g, " "));
+    const values = entries.map(([, v]) => v);
 
     if (typeof Plotly === "undefined") {
       document.getElementById(divId).innerHTML =
@@ -454,20 +454,19 @@ function renderCoefChart(divId, coefObj, title, negativeOnly = false) {
       return;
     }
 
-    const chartHeight = Math.max(260, entries.length * 26 + 80);
     document.getElementById(divId).innerHTML = "";
-    document.getElementById(divId).style.minHeight = chartHeight + "px";
+    document.getElementById(divId).style.minHeight = "280px";
     Plotly.newPlot(
       divId,
-      [{ type: "bar", orientation: "h", x: values, y: labels,
-         marker: { color: colors }, hovertemplate: "%{y}: %{x:.6f}<extra></extra>" }],
+      [{ type: "bar", x: labels, y: values,
+         marker: { color }, hovertemplate: "%{x}: %{y:.6f}<extra></extra>" }],
       {
         ...PLOTLY_LAYOUT_BASE,
-        height: chartHeight,
-        margin: { l: 175, r: 20, t: 32, b: 45 },
+        height: 280,
+        margin: { l: 50, r: 20, t: 32, b: 120 },
         title:  { text: title, font: { size: 12, color: "#334155" } },
-        xaxis:  { title: "Coefficient", gridcolor: "#e2e8f0", zerolinecolor: "#94a3b8" },
-        yaxis:  { automargin: true, tickfont: { size: 10 } },
+        xaxis:  { tickangle: -40, automargin: true, tickfont: { size: 9 }, gridcolor: "#e2e8f0" },
+        yaxis:  { title: "Coefficient", gridcolor: "#e2e8f0", zerolinecolor: "#94a3b8" },
       },
       PLOTLY_CFG
     );

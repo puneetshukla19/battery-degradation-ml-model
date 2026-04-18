@@ -60,27 +60,28 @@ ANOM_COLS = [
 COEF_HIDE = ["efc_x_days", "ir_ohm_mean", "cell_spread_mean",
              "temp_rise_rate", "vsag_rate_per_hr"]
 
-TIER1 = ["MH18BZ3028", "MH18BZ3392", "MH18BZ3341"]
-TIER2 = ["MH18BZ2648", "MH18BZ3198", "MH18BZ2689", "MH18BZ2958"]
-TIER3 = ["MH18BZ2649", "MH18BZ3163", "MH18BZ3345", "MH18BZ2690", "MH18BZ2647"]
+TIER1 = ["MH18BZ3028", "MH18BZ3341", "MH18BZ3392"]
+TIER2 = ["MH18BZ3369", "MH18BZ3201", "MH18BZ3034", "MH18BZ3163", "MH18BZ3345"]
+TIER3 = ["MH18BZ2874", "MH18BZ3386", "MH18BZ3384", "MH18BZ3160", "MH18BZ3198"]
 
 TIER1_SIGNALS = {
-    "MH18BZ3028": "Lowest battery health in fleet (94.97%); highest degradation risk score (0.658); 12 flagged sessions (13.2% of total)",
-    "MH18BZ3392": "Fastest declining battery in fleet (−0.062%/day); projected replacement in under 1 year; 12 flagged sessions (13.6%)",
-    "MH18BZ3341": "3rd highest degradation risk in fleet (0.514); 87 flagged sessions (14.2%); rate of decline −0.029%/day",
+    "MH18BZ3028": "Lowest EKF SoH in fleet (89.87%) — 5+ pp below median; highest degradation risk score (0.461); 17 flagged sessions (18.7% of total)",
+    "MH18BZ3341": "EKF SoH 95.57%; degradation risk score 0.309; declining at -0.34%/day; EKF RUL 3.5 years; 65 flagged sessions (10.6%)",
+    "MH18BZ3392": "EKF SoH 93.50% — 2nd lowest in fleet; degradation risk score 0.281; 11 flagged sessions (12.5%); SoH baseline significantly reduced",
 }
 TIER2_NOTES = {
-    "MH18BZ2648": "Highest flagged session count in fleet (124, 17.9%); degradation risk score 0.479",
-    "MH18BZ3198": "Fastest declining in tier 2 (−0.044%/day); projected replacement in ~1 year; 43 flagged sessions (8.4%)",
-    "MH18BZ2689": "61 flagged sessions (8.1%); degradation risk score 0.473",
-    "MH18BZ2958": "36 flagged sessions (6.7%); degradation risk score 0.464",
+    "MH18BZ3369": "EKF SoH 93.73%; degradation risk score 0.276; 12 flagged sessions (20.7% flag rate — highest in tier); EKF RUL 15.7 years",
+    "MH18BZ3201": "EKF SoH 95.35%; degradation risk score 0.271; EKF RUL 2.3 years — shortest in tier; 85 flagged sessions (12.2%)",
+    "MH18BZ3034": "EKF SoH 95.39%; degradation risk score 0.239; EKF RUL 3.1 years; 40 flagged sessions (6.5%)",
+    "MH18BZ3163": "EKF SoH 95.61%; degradation risk score 0.238; 62 flagged sessions (9.6%); elevated internal resistance pattern",
+    "MH18BZ3345": "EKF SoH 96.96%; degradation risk score 0.228; 102 flagged sessions (13.7%); EKF RUL 2.5 years",
 }
 TIER3_NOTES = {
-    "MH18BZ2649": "141 flagged sessions (15.8%) but battery health nearly stable (−0.002%/day); long projected lifespan",
-    "MH18BZ3163": "52 flagged sessions (8.1%); degradation risk score 0.440; elevated internal resistance",
-    "MH18BZ3345": "99 flagged sessions (13.3%); near-flat health trajectory (−0.018%/day)",
-    "MH18BZ2690": "84 flagged sessions (11.2%); near-flat health trajectory (−0.012%/day)",
-    "MH18BZ2647": "70 flagged sessions (10.6%); stable long-term trajectory",
+    "MH18BZ2874": "EKF SoH 97.78%; degradation risk score 0.227; 22 flagged sessions (4.3%); EKF RUL 4.4 years",
+    "MH18BZ3386": "EKF SoH 97.05%; degradation risk score 0.227; 105 flagged sessions (13.9%); EKF RUL 2.3 years",
+    "MH18BZ3384": "EKF SoH 96.76%; degradation risk score 0.227; 24 flagged sessions (4.8%); EKF RUL 3.7 years",
+    "MH18BZ3160": "EKF SoH 96.37%; degradation risk score 0.208; 37 flagged sessions (6.6%); recent declining SoH trend",
+    "MH18BZ3198": "EKF SoH 95.57%; degradation risk score 0.207; 51 flagged sessions (10.0%); EKF RUL 3.0 years",
 }
 
 
@@ -332,7 +333,9 @@ def api_soh_scatter(request):
     anom = _load_anom()
     cols = ["registration_number", "soh", "ekf_soh", "start_time_ist"]
     avail = [c for c in cols if c in anom.columns]
-    df = anom[avail].dropna(subset=["soh", "ekf_soh"])
+    df = anom[avail].dropna(subset=["soh", "ekf_soh"]).copy()
+    if "start_time_ist" in df.columns:
+        df["date"] = pd.to_datetime(df["start_time_ist"], errors="coerce").dt.strftime("%Y-%m-%d")
     if len(df) > 3000:
         df = df.sample(3000, random_state=42)
     return _safe_json({"points": _df_to_records(df)})
@@ -512,6 +515,16 @@ def api_anomaly_breakdown(request, reg=None):
     else:
         anom_only = anom
 
+    # Optional: filter by date range
+    date_from = request.GET.get("date_from", None)
+    date_to   = request.GET.get("date_to",   None)
+    if (date_from or date_to) and "start_time_ist" in anom_only.columns:
+        dates = anom_only["start_time_ist"].astype(str).str[:10]
+        if date_from:
+            anom_only = anom_only[dates >= date_from]
+        if date_to:
+            anom_only = anom_only[dates <= date_to]
+
     # Optional: filter by session type ("charging" or "discharge")
     session_type = request.GET.get("session_type", None)
     if session_type and "session_type" in anom_only.columns:
@@ -561,28 +574,29 @@ def api_anomaly_breakdown(request, reg=None):
         "CUSUM": cusum_any,
     }
 
+    IF_MAP = [
+        ("IR Degradation",          ["n_high_ir", "ir_ohm_mean", "d_n_high_ir", "ir_event_rate", "d_ir_ohm"]),
+        ("Voltage Sag",             ["n_vsag", "d_vsag_per_cycle"]),
+        ("Cell Spread / Imbalance", ["cell_spread", "n_cell_spread_warn", "subsystem_voltage_std"]),
+        ("Thermal Stress",          ["temp_lowest_mean", "temp_max", "temp_rise_rate", "thermal_stress"]),
+        ("Efficiency / Capacity",   ["energy_per_loaded_session", "capacity_ah_discharge"]),
+        ("High DoD",                ["dod_stress"]),
+        ("Low SoC / Undervoltage",  ["n_low_soc", "voltage_min"]),
+        ("SoH Decline",             ["capacity_soh_disc_new", "soh_smooth", "ekf_soh_delta", "cycle_soh"]),
+        ("Usage Pattern",           ["odometer_km", "duration_hr"]),
+    ]
+
     # By physical signal — IF uses if_reason text; CUSUM uses alarm columns.
     if detector == "if" and "if_reason" in anom_only.columns:
         reasons = anom_only["if_reason"].fillna("")
-        IF_MAP = [
-            ("IR Degradation",          ["n_high_ir", "ir_ohm_mean", "d_n_high_ir", "ir_event_rate", "d_ir_ohm"]),
-            ("Voltage Sag",             ["n_vsag", "d_vsag_per_cycle"]),
-            ("Cell Spread / Imbalance", ["cell_spread", "n_cell_spread_warn", "subsystem_voltage_std"]),
-            ("Thermal Stress",          ["temp_lowest_mean", "temp_max", "temp_rise_rate", "thermal_stress"]),
-            ("Efficiency / Capacity",   ["energy_per_loaded_session", "capacity_ah_discharge"]),
-            ("High DoD",                ["dod_stress"]),
-            ("Low SoC / Undervoltage",  ["n_low_soc", "voltage_min"]),
-            ("SoH Decline",             ["capacity_soh_disc_new", "soh_smooth", "ekf_soh_delta", "cycle_soh"]),
-            ("Usage Pattern",           ["odometer_km", "duration_hr"]),
-        ]
         by_signal = {}
         for label, keywords in IF_MAP:
             pattern = "|".join(keywords)
             n = int(reasons.str.contains(pattern, case=False, na=False).sum())
             if n > 0:
                 by_signal[label] = n
-    else:
-        # CUSUM-based breakdown — each category uses OR logic, counts per session
+    elif detector == "cusum":
+        # Pure CUSUM-based breakdown
         by_signal = {k: v for k, v in {
             "EKF SoH Decline": cnt("cusum_ekf_soh_alarm"),
             "BMS SoH Decline": cnt("cusum_soh_alarm"),
@@ -593,6 +607,33 @@ def api_anomaly_breakdown(request, reg=None):
             "Efficiency Loss": cnt("cusum_epk_alarm"),
             "Voltage Sag":     cnt("n_vsag"),
         }.items() if v > 0}
+    else:
+        # Default (no detector filter): merge IF + CUSUM signal counts
+        cusum_signals = {
+            "EKF SoH Decline": cnt("cusum_ekf_soh_alarm"),
+            "BMS SoH Decline": cnt("cusum_soh_alarm"),
+            "Cycle SoH Drop":  cnt("cusum_cycle_soh_alarm"),
+            "IR Degradation":  cnt_any("cusum_ir_slope_alarm", "n_high_ir"),
+            "Cell Spread":     cnt_any("cusum_spread_alarm", "cusum_spread_slope_alarm"),
+            "Thermal Stress":  cnt("cusum_heat_alarm"),
+            "Efficiency Loss": cnt("cusum_epk_alarm"),
+            "Voltage Sag":     cnt("n_vsag"),
+        }
+        if_signals = {}
+        if "if_reason" in anom_only.columns:
+            if_mask = anom_only["if_anomaly"].fillna(False).astype(bool) if "if_anomaly" in anom_only.columns else pd.Series(False, index=anom_only.index)
+            if_rows = anom_only[if_mask]
+            reasons = if_rows["if_reason"].fillna("")
+            for label, keywords in IF_MAP:
+                pattern = "|".join(keywords)
+                n = int(reasons.str.contains(pattern, case=False, na=False).sum())
+                if n > 0:
+                    if_signals[label] = n
+        # Merge: sum counts for overlapping labels
+        merged = dict(cusum_signals)
+        for label, n in if_signals.items():
+            merged[label] = merged.get(label, 0) + n
+        by_signal = {k: v for k, v in merged.items() if v > 0}
 
     return JsonResponse({"by_detector": by_detector, "by_signal": by_signal})
 
