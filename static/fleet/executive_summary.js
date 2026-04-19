@@ -165,9 +165,9 @@ function _drawScatter() {
   const densityTrace = {
     type: "histogram2dcontour",
     x: allX, y: allY,
-    colorscale: [[0,"rgba(0,0,0,0)"], [0.15,"rgba(253,186,116,0.18)"],
-                 [0.45,"rgba(251,146,60,0.38)"],  [0.75,"rgba(251,146,60,0.55)"],
-                 [1,  "rgba(234,88,12,0.72)"]],
+    colorscale: [[0,"rgba(0,0,0,0)"], [0.15,"rgba(216,180,254,0.18)"],
+                 [0.45,"rgba(168,85,247,0.38)"],  [0.75,"rgba(168,85,247,0.55)"],
+                 [1,  "rgba(109,40,217,0.72)"]],
     showscale: false,
     ncontours: 10,
     contours: { coloring: "fill", showlines: false },
@@ -189,7 +189,7 @@ function _drawScatter() {
         name: "Other vehicles", hoverinfo: "skip", showlegend: true },
       { type: "scatter", mode: "markers",
         x: selPts.map(p => p.soh), y: selPts.map(p => p.ekf_soh),
-        marker: { color: "#fb923c", size: 5, opacity: 0.9 },
+        marker: { color: "#a855f7", size: 5, opacity: 0.9 },
         name: _scatterVeh,
         hovertemplate: _scatterVeh + "<br>BMS: %{x:.2f}%<br>EKF: %{y:.2f}%<extra></extra>",
         showlegend: true },
@@ -199,7 +199,7 @@ function _drawScatter() {
       densityTrace,
       { type: "scatter", mode: "markers",
         x: allX, y: allY,
-        marker: { color: "#ea580c", size: 3, opacity: 0.25 },
+        marker: { color: "#a855f7", size: 3, opacity: 0.25 },
         hovertemplate: "%{customdata}<br>BMS SoH: %{x:.2f}%<br>EKF SoH: %{y:.2f}%<extra></extra>",
         customdata: pts.map(p => p.registration_number || ""),
         name: "Fleet", showlegend: false },
@@ -287,8 +287,8 @@ function _drawDeltaChart() {
     traces = [{
       type: "scatter", mode: "lines+markers",
       x: pts.map(p => p.date), y: pts.map(p => p.delta),
-      line: { color: "#fb923c", width: 2 },
-      marker: { size: 4, color: "#fb923c" },
+      line: { color: "#a855f7", width: 2 },
+      marker: { size: 4, color: "#a855f7" },
       name: _scatterVeh,
       hovertemplate: "%{x}<br>EKF − BMS delta: %{y:.2f}%<extra></extra>",
     }];
@@ -299,8 +299,8 @@ function _drawDeltaChart() {
     traces = [{
       type: "scatter", mode: "lines",
       x: ft.map(p => p.date), y: ft.map(p => p.fleet_median_delta),
-      line: { color: "#fb923c", width: 2 },
-      fill: "tozeroy", fillcolor: "rgba(249,115,22,0.08)",
+      line: { color: "#a855f7", width: 2 },
+      fill: "tozeroy", fillcolor: "rgba(168,85,247,0.08)",
       name: "Fleet median δ",
       hovertemplate: "%{x}<br>Fleet median EKF−BMS: %{y:.2f}%<extra></extra>",
     }];
@@ -356,8 +356,8 @@ function buildVehicleSlider() {
         <!-- Row 1: vehicle filter -->
         <label style="${labelStyle}">Vehicle</label>
         <input type="range" id="vehSlider" min="0" max="${allVeh.length - 1}" value="0" step="1"
-          style="width:100%;accent-color:#fb923c" ${_scatterVeh ? "" : "disabled"}>
-        <span id="vehSliderLabel" style="font-size:.75rem;font-weight:600;color:#fb923c;min-width:120px;padding:0 4px;white-space:nowrap">—</span>
+          style="width:100%;accent-color:#a855f7" ${_scatterVeh ? "" : "disabled"}>
+        <span id="vehSliderLabel" style="font-size:.75rem;font-weight:600;color:#a855f7;min-width:120px;padding:0 4px;white-space:nowrap">—</span>
         <div style="display:flex;align-items:center;gap:6px">
           <input type="checkbox" id="vehSliderToggle" style="accent-color:#94a3b8;width:14px;height:14px;flex-shrink:0">
           <label for="vehSliderToggle" style="font-size:.74rem;color:#64748b;cursor:pointer;white-space:nowrap">Enable vehicle filter</label>
@@ -370,19 +370,19 @@ function buildVehicleSlider() {
         <div style="grid-column:2/5">
           <div style="position:relative;height:20px">
             <div style="position:absolute;height:4px;background:#e2e8f0;top:8px;left:0;right:0;border-radius:2px">
-              <div id="sec3SliderFill" style="position:absolute;height:100%;background:#fb923c;border-radius:2px;left:0%;width:100%"></div>
+              <div id="sec3SliderFill" style="position:absolute;height:100%;background:#a855f7;border-radius:2px;left:0%;width:100%"></div>
             </div>
             <input type="range" id="sec3SliderFrom" min="0" max="${nd - 1}" value="0" step="1"
-              style="position:absolute;width:100%;height:4px;top:8px;-webkit-appearance:none;appearance:none;background:transparent;accent-color:#fb923c;cursor:pointer">
+              style="position:absolute;width:100%;height:4px;top:8px;-webkit-appearance:none;appearance:none;background:transparent;accent-color:#a855f7;cursor:pointer">
             <input type="range" id="sec3SliderTo"   min="0" max="${nd - 1}" value="${nd - 1}" step="1"
-              style="position:absolute;width:100%;height:4px;top:8px;-webkit-appearance:none;appearance:none;background:transparent;accent-color:#fb923c;cursor:pointer">
+              style="position:absolute;width:100%;height:4px;top:8px;-webkit-appearance:none;appearance:none;background:transparent;accent-color:#a855f7;cursor:pointer">
           </div>
           <div style="display:flex;justify-content:space-between;margin-top:4px;font-size:.75rem;color:#475569;font-weight:500">
             <span id="sec3DateFromLabel">${_sec3DateFrom}</span>
             <span id="sec3DateToLabel">${_sec3DateTo}</span>
           </div>
         </div>
-        <button onclick="_sec3ResetDate()" style="font-size:.7rem;color:#fb923c;background:none;border:none;cursor:pointer;padding:0;text-decoration:underline;white-space:nowrap;text-align:right">Reset</button>
+        <button onclick="_sec3ResetDate()" style="font-size:.7rem;color:#a855f7;background:none;border:none;cursor:pointer;padding:0;text-decoration:underline;white-space:nowrap;text-align:right">Reset</button>
         ` : ""}
       </div>
     </div>
@@ -401,7 +401,7 @@ function buildVehicleSlider() {
     } else {
       _scatterVeh = allVeh[+slider.value];
       label.textContent = _scatterVeh;
-      label.style.color = "#fb923c";
+      label.style.color = "#a855f7";
       slider.disabled = false;
     }
     _drawScatter();
@@ -430,12 +430,12 @@ function buildVehicleSlider() {
         "#sec3SliderTo::-webkit-slider-thumb{pointer-events:all;cursor:grab}",
         "#sec3SliderFrom::-moz-range-thumb{pointer-events:all;cursor:grab}",
         "#sec3SliderTo::-moz-range-thumb{pointer-events:all;cursor:grab}",
-        /* vehicle slider: orange thumb + filled track, #e2e8f0 non-selected track */
-        "#vehSlider{accent-color:#fb923c}",
+        /* vehicle slider: purple thumb + filled track, #e2e8f0 non-selected track */
+        "#vehSlider{accent-color:#a855f7}",
         "#vehSlider::-webkit-slider-runnable-track{background:#e2e8f0;border-radius:2px;height:4px}",
         "#vehSlider::-moz-range-track{background:#e2e8f0;border-radius:2px;height:4px}",
-        "#vehSlider::-webkit-slider-thumb{background:#fb923c;border:none;border-radius:50%;width:14px;height:14px;margin-top:-5px;cursor:pointer}",
-        "#vehSlider::-moz-range-thumb{background:#fb923c;border:none;border-radius:50%;width:14px;height:14px;cursor:pointer}",
+        "#vehSlider::-webkit-slider-thumb{background:#a855f7;border:none;border-radius:50%;width:14px;height:14px;margin-top:-5px;cursor:pointer}",
+        "#vehSlider::-moz-range-thumb{background:#a855f7;border:none;border-radius:50%;width:14px;height:14px;cursor:pointer}",
       ].join(" ");
       document.head.appendChild(s);
     }
@@ -546,7 +546,7 @@ function renderBayesCoef(data) {
     x: labels,
     y: values,
     customdata: defs,
-    marker: { color: "#fb923c", opacity: 0.8 },
+    marker: { color: "#a855f7", opacity: 0.8 },
     hovertemplate: "<b>%{x}</b><br>Degradation weight: <b>%{y:.5f}</b><br><br><span style='color:white;font-style:italic'>%{customdata}</span><extra></extra>",
   }], {
     paper_bgcolor: "white", plot_bgcolor: "#f8fafc",
@@ -611,8 +611,15 @@ function renderAnomalyTiers() {
     return `${Math.round(days).toLocaleString()} d<br><span style="color:#94a3b8;font-size:.75rem">(${(days/365.25).toFixed(1)} yr)</span>`;
   };
 
-  const vRow = (v, signal, color) =>
-    `<tr class="tier-vehicle-row" data-reg="${v.registration_number}"
+  const vRow = (v, signal, color) => {
+    // Replace any hardcoded degradation score in the reason text with the live
+    // composite value (0–100 scale) so it always matches the Degr. Score column.
+    const liveScore = v.composite != null ? (v.composite * 100).toFixed(1) : null;
+    const displaySignal = liveScore
+      ? (signal || "").replace(/degradation risk score\s*\(?[0-9.]+\)?/gi,
+                               `degradation risk score (${liveScore})`)
+      : (signal || "");
+    return `<tr class="tier-vehicle-row" data-reg="${v.registration_number}"
          style="cursor:pointer;transition:background .12s"
          onclick="openVehicleDetail('${v.registration_number}');_tierMarkActive(this)">
       <td>
@@ -624,13 +631,14 @@ function renderAnomalyTiers() {
           <span style="font-size:.65rem;opacity:.75;color:#64748b">↗</span>
         </a>
       </td>
-      <td class="text-muted">${signal || ""}</td>
+      <td class="text-muted">${displaySignal}</td>
       <td class="text-end">${fmtPct(v.current_soh)}</td>
       <td class="text-end">${fmt(v.soh_slope, 4)}</td>
       <td class="text-end fw-bold">${v.composite != null ? (v.composite * 100).toFixed(1) : "—"}</td>
       <td class="text-end">${rulDisplay(v)}</td>
       <td class="text-end">${v.n_combined_anom}</td>
     </tr>`;
+  };
 
   document.querySelector("#tier1Table tbody").innerHTML = d.tier1.map(v => vRow(v, v.primary_signal, "#dc2626")).join("");
   document.querySelector("#tier2Table tbody").innerHTML = d.tier2.map(v => vRow(v, v.note,           "#d97706")).join("");
@@ -798,7 +806,7 @@ function chartVehicleSoh(plotEl) {
   Plotly.newPlot(plotEl, [{
     type: "scatter", mode: "lines",
     x: dates, y: sohs,
-    line: { color: "#3b82f6", width: 2, shape: "spline", smoothing: 0.8 },
+    line: { color: "#a855f7", width: 2, shape: "spline", smoothing: 0.8 },
     hovertemplate: "%{x}<br>Fleet Mean EKF SoH: %{y:.3f}%<extra></extra>",
   }], {
     ...baseLayout("Fleet Mean EKF SoH"),
@@ -824,7 +832,7 @@ function chartSohStdDev(plotEl) {
     type: "histogram",
     x: sohVals,
     nbinsx: 6,
-    marker: { color: "#3b82f6", opacity: 0.75 },
+    marker: { color: "#a855f7", opacity: 0.75 },
     hovertemplate: "SoH: %{x:.2f}%<br>Count: %{y}<extra></extra>",
   }], {
     ...baseLayout(`SoH Distribution   µ=${mu.toFixed(3)}%  σ=${sig.toFixed(3)}%`),
@@ -836,7 +844,7 @@ function chartSohStdDev(plotEl) {
         type: "rect",
         x0: lo, x1: hi, y0: 0, y1: 1,
         xref: "x", yref: "paper",
-        fillcolor: "rgba(59,130,246,0.10)",
+        fillcolor: "rgba(168,85,247,0.10)",
         line: { width: 0 },
       },
       {
@@ -889,8 +897,8 @@ function chartSohTrend(plotEl) {
   const last   = sohs[sohs.length - 1];
   const slope  = _overview.soh_trend_pct;
   const sign   = slope >= 0 ? "+" : "";
-  const lineColor = last < first ? "#ef4444" : "#3b82f6";
-  const fillColor = last < first ? "rgba(239,68,68,0.13)" : "rgba(59,130,246,0.08)";
+  const lineColor = "#a855f7";
+  const fillColor = "rgba(168,85,247,0.08)";
 
   const minY = Math.min(...sohs);
   const maxY = Math.max(...sohs);
@@ -980,7 +988,7 @@ function chartVehicleRul(plotEl) {
   Plotly.newPlot(plotEl, [{
     type: "bar",
     x: labels, y: counts,
-    marker: { color: "#3b82f6", opacity: 0.75 },
+    marker: { color: "#a855f7", opacity: 0.75 },
     hovertemplate: "RUL: %{x} yr<br>Count: %{y}<extra></extra>",
   }], {
     ...baseLayout("EKF RUL Distribution (years)"),
@@ -1005,7 +1013,7 @@ function chartSohHistogram(plotEl) {
     type: "histogram",
     x: sohVals,
     nbinsx: 6,
-    marker: { color: "#3b82f6", opacity: 0.75 },
+    marker: { color: "#a855f7", opacity: 0.75 },
     hovertemplate: "SoH: %{x:.2f}%<br>Count: %{y}<extra></extra>",
   }], {
     ...baseLayout(`SoH Distribution   µ=${mu.toFixed(3)}%  σ=${sig.toFixed(3)}%`),
@@ -1013,7 +1021,7 @@ function chartSohHistogram(plotEl) {
     yaxis: { ...yAx("Count") },
     shapes: [
       { type: "rect", x0: lo, x1: hi, y0: 0, y1: 1,
-        xref: "x", yref: "paper", fillcolor: "rgba(59,130,246,0.10)", line: { width: 0 } },
+        xref: "x", yref: "paper", fillcolor: "rgba(168,85,247,0.10)", line: { width: 0 } },
       { type: "line", x0: mu, x1: mu, y0: 0, y1: 1,
         xref: "x", yref: "paper", line: { color: "#1e293b", width: 1.5, dash: "dash" } },
     ],
@@ -1061,7 +1069,7 @@ function chartRulHistogram(plotEl) {
   Plotly.newPlot(plotEl, [{
     type: "bar",
     x: labels, y: counts,
-    marker: { color: "#3b82f6", opacity: 0.75 },
+    marker: { color: "#a855f7", opacity: 0.75 },
     hovertemplate: "RUL: %{x} yr<br>Count: %{y}<extra></extra>",
   }], {
     ...baseLayout("EKF RUL Distribution (years)"),
@@ -1090,8 +1098,8 @@ function chartEolInfo(plotEl, textEl) {
         Below ${eol}%, capacity fade becomes non-linear and range unpredictability increases
         significantly — making the pack unsuitable for commercial EV operation.
       </p>
-      <div style="background:#f0fdf4;border-left:3px solid #16a34a;padding:8px 12px;
-                  border-radius:0 4px 4px 0;font-size:.78rem;color:#166534">
+      <div style="background:#faf5ff;border-left:3px solid #a855f7;padding:8px 12px;
+                  border-radius:0 4px 4px 0;font-size:.78rem;color:#581c87">
         Fleet current mean SoH: <strong>${fmtPct(mu)}</strong> —
         <strong>${headroom}%</strong> of remaining useful capacity before EoL
       </div>
@@ -1152,8 +1160,8 @@ async function chartDataSpan(plotEl, textEl) {
 
   Plotly.newPlot(plotEl, [{
     type: "scatter", mode: "lines", x: dates, y: pcts,
-    line: { color: "#3b82f6", width: 2.5, shape: "spline" },
-    fill: "tozeroy", fillcolor: "rgba(59,130,246,0.10)",
+    line: { color: "#a855f7", width: 2.5, shape: "spline" },
+    fill: "tozeroy", fillcolor: "rgba(168,85,247,0.10)",
     hovertemplate: "%{x}<br>%{customdata} / " + total + " vehicles (%{y:.1f}%)<extra></extra>",
     customdata: counts,
   }], {
@@ -1162,7 +1170,7 @@ async function chartDataSpan(plotEl, textEl) {
     margin: { l: 44, r: 10, t: 10, b: 70 },
     height: h,
     xaxis: { gridcolor: "#e2e8f0", tickangle: -40, tickfont: { size: 8.5 }, title: { text: "Time", font: { size: 9 } } },
-    yaxis: { gridcolor: "#e2e8f0", range: [0, 105], title: { text: "% Fleet Coverage", font: { size: 9 } } },
+    yaxis: { gridcolor: "#e2e8f0", range: [0, 105], title: { text: "% Fleet Coverage by Intangles", font: { size: 9 } } },
     showlegend: false,
     shapes: regionShapes,
     annotations: regionAnnotations,
@@ -1250,10 +1258,10 @@ function chartRulRangeBollinger(plotEl) {
       line: { width: 0 }, showlegend: false, hoverinfo: "skip", fill: "none" },
     { type: "scatter", mode: "lines", x: dates, y: bbLo,
       line: { width: 0 }, fill: "tonexty",
-      fillcolor: "rgba(99,102,241,0.13)", showlegend: false, hoverinfo: "skip" },
+      fillcolor: "rgba(168,85,247,0.13)", showlegend: false, hoverinfo: "skip" },
     // Fleet median RUL
     { type: "scatter", mode: "lines", x: dates, y: medians,
-      line: { color: "#3b82f6", width: 2.5, shape: "spline", smoothing: 0.6 },
+      line: { color: "#a855f7", width: 2.5, shape: "spline", smoothing: 0.6 },
       name: "Fleet median RUL",
       hovertemplate: "%{x}<br>Fleet median RUL: %{y:.2f} yr<extra></extra>" },
   ], {
@@ -1348,7 +1356,7 @@ function chartRemainingEfc(plotEl) {
     type: "histogram",
     x: vals,
     nbinsx: 6,
-    marker: { color: "#3b82f6", opacity: 0.75 },
+    marker: { color: "#a855f7", opacity: 0.75 },
     hovertemplate: "Remaining EFC: %{x:.0f}<br>Vehicles: %{y}<extra></extra>",
   }], {
     ...baseLayout(`Remaining EFC — fleet  median=${med != null ? Math.round(med) : "—"}`),
@@ -1380,7 +1388,7 @@ function chartPopulation(plotEl) {
   Plotly.newPlot(plotEl, [{
     type: "pie", hole: 0.52,
     labels, values,
-    marker: { colors: ["#f59e0b", "#6366f1", "#94a3b8"] },
+    marker: { colors: ["#7c3aed", "#a855f7", "#cbd5e1"] },
     textinfo: "label+percent", textposition: "outside",
     hovertemplate: "%{label}: %{value:,} sessions (%{percent})<extra></extra>",
   }], {

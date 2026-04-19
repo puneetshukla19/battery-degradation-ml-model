@@ -35,7 +35,7 @@
       display: flex; align-items: center; justify-content: space-between;
       box-shadow: 0 2px 8px rgba(0,0,0,.25);
     }
-    .top-nav .brand { font-size: 1.1rem; font-weight: 700; color: #fff; letter-spacing: 0.02em; }
+    .top-nav .brand { font-size: 1.1rem; font-weight: 600; color: #fff; letter-spacing: .05em; text-transform: uppercase; }
     .top-nav .brand span { color: #60a5fa; }
     .top-nav .nav-link-back {
       font-size: 0.78rem; color: #94a3b8; text-decoration: none;
@@ -159,12 +159,9 @@
       box-shadow: var(--card-shadow); border: none !important;
     }
     .accordion-button { font-size: 0.85rem; font-weight: 700; letter-spacing: .04em; }
-    .tier1-btn { background: #fef2f2 !important; color: #475569 !important; font-size: 0.76rem !important; }
-    .tier1-btn:not(.collapsed) { background: #fee2e2 !important; }
-    .tier2-btn { background: #fffbeb !important; color: #475569 !important; font-size: 0.76rem !important; }
-    .tier2-btn:not(.collapsed) { background: #fef3c7 !important; }
-    .tier3-btn { background: #f0fdf4 !important; color: #475569 !important; font-size: 0.76rem !important; }
-    .tier3-btn:not(.collapsed) { background: #dcfce7 !important; }
+    .tier1-btn { color: #475569 !important; font-size: 0.76rem !important; }
+    .tier2-btn { color: #475569 !important; font-size: 0.76rem !important; }
+    .tier3-btn { color: #475569 !important; font-size: 0.76rem !important; }
     .accordion-button::after { filter: none; }
 
     /* ── Tier table row interactions ── */
@@ -425,7 +422,7 @@
 <nav class="top-nav">
   <div>
     <span class="brand">Battery Health for <span>Ultratech</span> Fleet</span>
-    <div style="font-size:.68rem;color:#7dd3fc;margin-top:2px;font-weight:400;letter-spacing:.01em">
+    <div style="font-size:.68rem;color:#7dd3fc;margin-top:2px;font-weight:600;letter-spacing:.05em">
       Real-time battery intelligence · <span id="navVehicleCount">—</span> vehicles · predictive maintenance analytics
     </div>
   </div>
@@ -457,7 +454,7 @@
     <div style="display:flex;gap:24px;margin-top:12px;flex-wrap:wrap">
       <span style="font-size:.74rem;color:#94a3b8">
         <span style="color:#22c55e;font-weight:700">●</span>&nbsp;
-        Automated daily pipeline — no manual data entry
+        Automated daily pipeline
       </span>
       <span style="font-size:.74rem;color:#94a3b8">
         <span style="color:#60a5fa;font-weight:700">●</span>&nbsp;
@@ -474,7 +471,7 @@
       <button onclick="this.nextElementSibling.classList.toggle('bif-open');this.querySelector('.bif-chevron').classList.toggle('bif-chevron-open');document.querySelectorAll('[data-bs-toggle=tooltip]').forEach(el=>{if(!bootstrap.Tooltip.getInstance(el))new bootstrap.Tooltip(el,{trigger:'hover'})})"
         style="background:none;border:1px solid #334d6e;border-radius:6px;padding:5px 12px;cursor:pointer;
                display:inline-flex;align-items:center;gap:8px;
-               font-size:.74rem;font-weight:600;color:#93c5fd;letter-spacing:.03em">
+               font-size:.75rem;font-weight:600;color:#93c5fd;letter-spacing:.03em;text-transform:uppercase">
         <span>Battery Intelligence Framework</span>
         <span class="bif-chevron" style="font-size:.65rem;transition:transform .2s;display:inline-block">▶</span>
       </button>
@@ -535,6 +532,40 @@
 </style>
 
 <div class="page-body">
+
+  <!-- ── How to Read This Dashboard ───────────────────────────────────────── -->
+  <div class="mt-3 reveal" id="readingGuide"
+       style="background:#fff;border-radius:10px;box-shadow:var(--card-shadow);
+              padding:14px 20px;border-left:4px solid var(--blue)">
+    <div style="font-size:.74rem;font-weight:700;color:#3b82f6;text-transform:uppercase;
+                letter-spacing:.06em;margin-bottom:8px">How to read this dashboard</div>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px">
+      <div style="font-size:.78rem;color:#475569;line-height:1.6;display:flex;gap:8px;align-items:baseline">
+        <span class="section-num" style="flex-shrink:0;margin-top:2px">1</span>
+        <span><span style="font-weight:600;color:#0f172a">Fleet Health</span> — Top-level KPIs and overall battery condition.</span>
+      </div>
+      <div style="font-size:.78rem;color:#475569;line-height:1.6;display:flex;gap:8px;align-items:baseline">
+        <span class="section-num" style="flex-shrink:0;margin-top:2px">2</span>
+        <span><span style="font-weight:600;color:#0f172a">Age Bands</span> — How health evolves as vehicles age.</span>
+      </div>
+      <div style="font-size:.78rem;color:#475569;line-height:1.6;display:flex;gap:8px;align-items:baseline">
+        <span class="section-num" style="flex-shrink:0;margin-top:2px">3</span>
+        <span><span style="font-weight:600;color:#0f172a">BMS vs EKF</span> — Our model vs the on-board sensor.</span>
+      </div>
+      <div style="font-size:.78rem;color:#475569;line-height:1.6;display:flex;gap:8px;align-items:baseline">
+        <span class="section-num" style="flex-shrink:0;margin-top:2px">4</span>
+        <span><span style="font-weight:600;color:#0f172a">Degradation Signals</span> — Physical factors driving battery wear.</span>
+      </div>
+      <div style="font-size:.78rem;color:#475569;line-height:1.6;display:flex;gap:8px;align-items:baseline">
+        <span class="section-num" style="flex-shrink:0;margin-top:2px">5</span>
+        <span><span style="font-weight:600;color:#0f172a">Breakdown Timeline</span> — Projected battery replacement based on remaining life.</span>
+      </div>
+      <div style="font-size:.78rem;color:#475569;line-height:1.6;display:flex;gap:8px;align-items:baseline">
+        <span class="section-num" style="flex-shrink:0;margin-top:2px">6</span>
+        <span><span style="font-weight:600;color:#0f172a">Anomaly Tiers</span> — Vehicles ranked by urgency of attention needed.</span>
+      </div>
+    </div>
+  </div>
 
   <!-- ── KPI Cards ───────────────────────────────────────────────────────── -->
   <!-- Order: Analysis Period | Vehicles | Mean EKF SoH | SoH Std Dev | Median EKF RUL | Remaining EFC -->
@@ -602,40 +633,6 @@
 
   </div>
 
-  <!-- ── How to Read This Dashboard ───────────────────────────────────────── -->
-  <div class="mt-3 reveal" id="readingGuide"
-       style="background:#fff;border-radius:10px;box-shadow:var(--card-shadow);
-              padding:14px 20px;border-left:4px solid var(--blue)">
-    <div style="font-size:.74rem;font-weight:700;color:#3b82f6;text-transform:uppercase;
-                letter-spacing:.06em;margin-bottom:8px">How to read this dashboard</div>
-    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px">
-      <div style="font-size:.78rem;color:#475569;line-height:1.6;display:flex;gap:8px;align-items:baseline">
-        <span class="section-num" style="flex-shrink:0;margin-top:2px">1</span>
-        <span><span style="font-weight:600;color:#0f172a">Fleet Health</span> — Top-level KPIs and overall battery condition summary.</span>
-      </div>
-      <div style="font-size:.78rem;color:#475569;line-height:1.6;display:flex;gap:8px;align-items:baseline">
-        <span class="section-num" style="flex-shrink:0;margin-top:2px">2</span>
-        <span><span style="font-weight:600;color:#0f172a">Age Bands</span> — How health evolves as vehicles age. Confirms degradation rate is within expected range.</span>
-      </div>
-      <div style="font-size:.78rem;color:#475569;line-height:1.6;display:flex;gap:8px;align-items:baseline">
-        <span class="section-num" style="flex-shrink:0;margin-top:2px">3</span>
-        <span><span style="font-weight:600;color:#0f172a">BMS vs EKF</span> — Our model vs the on-board sensor. Divergence means BMS is under/overstating battery health.</span>
-      </div>
-      <div style="font-size:.78rem;color:#475569;line-height:1.6;display:flex;gap:8px;align-items:baseline">
-        <span class="section-num" style="flex-shrink:0;margin-top:2px">4</span>
-        <span><span style="font-weight:600;color:#0f172a">Degradation Signals</span> — Which physical factors are driving battery wear fastest across the fleet.</span>
-      </div>
-      <div style="font-size:.78rem;color:#475569;line-height:1.6;display:flex;gap:8px;align-items:baseline">
-        <span class="section-num" style="flex-shrink:0;margin-top:2px">5</span>
-        <span><span style="font-weight:600;color:#0f172a">Breakdown Timeline</span> — Which vehicles are projected to need battery replacement and when.</span>
-      </div>
-      <div style="font-size:.78rem;color:#475569;line-height:1.6;display:flex;gap:8px;align-items:baseline">
-        <span class="section-num" style="flex-shrink:0;margin-top:2px">6</span>
-        <span><span style="font-weight:600;color:#0f172a">Anomaly Tiers</span> — Vehicles ranked by urgency of attention needed, with click-through to full detail and RUL trajectory.</span>
-      </div>
-    </div>
-  </div>
-
   <!-- ── Fleet Health + Usage Age Bands (side by side) ──────────────────── -->
   <div class="row g-3 mt-3 align-items-start reveal">
 
@@ -691,9 +688,9 @@
     </div>
 
     <div class="col-md-6">
-      <div class="section-hdr"><span class="section-num">2</span>Usage Age Bands (Q1–Q5)</div>
+      <div class="section-hdr"><span class="section-num">2</span>Usage Age Bands (Q1–Q8)</div>
       <div class="panel h-100">
-        <div class="panel-hdr">Median SoH by Usage Age — 5 Bands (Q1–Q5)</div>
+        <div class="panel-hdr">Median SoH by Usage Age — 8 Bands (Q1–Q8)</div>
         <div class="panel-body">
           <table class="table summary-table" id="quintileTable">
             <tbody></tbody>
@@ -1051,7 +1048,7 @@ thermal_stress = (temp_max − temp_threshold) × duration_above_threshold_hr</p
 </div>
 
 {% load static %}
-<script src="{% static 'fleet/executive_summary.js' %}?v=91"></script>
+<script src="{% static 'fleet/executive_summary.js' %}?v=98"></script>
 <script>
 function toggleFaq(btn) {
   const body = btn.nextElementSibling;

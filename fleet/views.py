@@ -257,7 +257,7 @@ def api_quintiles(request):
     ekf = _load_ekf()
     ekf = ekf.copy()
     ekf["q"], bins = pd.qcut(
-        ekf["days_since_first_session"], q=5,
+        ekf["days_since_first_session"], q=8,
         labels=False, retbins=True, duplicates="drop"
     )
     labels = [f"Q{i+1} ({bins[i]:.0f}-{bins[i+1]:.0f}d)"
@@ -269,7 +269,7 @@ def api_quintiles(request):
         .reset_index()
         .rename(columns={"ekf_soh": "median_soh"})
     )
-    qt["_q"] = qt["quintile"].str.extract(r"Q(\d)").astype(int)
+    qt["_q"] = qt["quintile"].str.extract(r"Q(\d+)").astype(int)
     qt = qt.sort_values("_q").drop(columns=["_q"])
     return JsonResponse({"quintiles": qt.to_dict(orient="records")})
 
