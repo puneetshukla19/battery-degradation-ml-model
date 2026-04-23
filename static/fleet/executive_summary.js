@@ -31,7 +31,7 @@ function rulToYears(days) {
 async function init() {
   try {
     const _j = r => r.ok ? r.json() : Promise.reject(r.status);
-    const [ov, veh, trend, quint, tiers, scatter, coef, delta, bdTimeline, dists] = await Promise.all([
+    const [ov, veh, trend, quint, tiers, scatter, coef, delta, bdTimeline, dists, efcTrend] = await Promise.all([
       fetch("/api/overview/").then(_j),
       fetch("/api/vehicles/").then(_j),
       fetch("/api/fleet-trend/").then(_j),
@@ -42,6 +42,7 @@ async function init() {
       fetch("/api/soh-delta-trend/").then(_j),
       fetch("/api/breakdown-timeline/").then(_j).catch(() => null),
       fetch("/api/distributions/").then(_j).catch(() => null),
+      fetch("/api/efc-trend/").then(_j).catch(() => null),
     ]);
 
     _overview  = ov;
@@ -50,6 +51,7 @@ async function init() {
     _quintiles = quint.quintiles;
     _tiers     = tiers;
     _deltaData = delta;
+    _efcData   = efcTrend;
 
     renderKPICards();
     renderFleetHealth();
@@ -130,6 +132,7 @@ function renderQuintiles() {
 /* ─── BMS SoH vs EKF SoH scatter ────────────────────────────────────────────── */
 let _scatterData = null;   // raw points cache for slider re-renders
 let _deltaData   = null;   // delta trend cache for slider re-renders
+let _efcData     = null;   // efc-trend cache for EFC charts
 let _scatterVeh  = null;   // currently selected vehicle (null = fleet view)
 
 function renderSohScatter(data) {
@@ -271,18 +274,15 @@ function _drawDeltaChart() {
   if (!el || !_deltaData) return;
 
   let traces;
-  function _dateInRange(d) {
-    if (!d) return true;
-    if (_sec3DateFrom && d < _sec3DateFrom) return false;
-    if (_sec3DateTo   && d > _sec3DateTo)   return false;
-    return true;
-  }
 
   if (_scatterVeh) {
-    // Show only the selected vehicle's per-session delta
     let pts = (_deltaData.vehicle_points || [])
-      .filter(p => p.registration_number === _scatterVeh)
-      .filter(p => _dateInRange(p.date));
+      .filter(p => {
+        if (p.registration_number !== _scatterVeh) return false;
+        if (_sec3DateFrom && p.date < _sec3DateFrom) return false;
+        if (_sec3DateTo   && p.date > _sec3DateTo)   return false;
+        return true;
+      });
     pts.sort((a, b) => a.date < b.date ? -1 : 1);
     traces = [{
       type: "scatter", mode: "lines+markers",
@@ -293,8 +293,12 @@ function _drawDeltaChart() {
       hovertemplate: "%{x}<br>EKF − BMS delta: %{y:.2f}%<extra></extra>",
     }];
   } else {
-    // Fleet-wide daily median delta
-    let ft = (_deltaData.fleet_trend || []).filter(p => _dateInRange(p.date));
+    let ft = [...(_deltaData.fleet_trend || [])];
+    ft = ft.filter(p => {
+      if (_sec3DateFrom && p.date < _sec3DateFrom) return false;
+      if (_sec3DateTo   && p.date > _sec3DateTo)   return false;
+      return true;
+    });
     ft.sort((a, b) => a.date < b.date ? -1 : 1);
     traces = [{
       type: "scatter", mode: "lines",
@@ -312,14 +316,30 @@ function _drawDeltaChart() {
     line: { color: "#94a3b8", width: 1, dash: "dash" },
     name: "Zero line", hoverinfo: "skip", showlegend: false });
 
+  // Shade from Jan 2026 to end of data (high BMS coverage period)
+  const allDates = (traces[0].x || []);
+  const shadeEnd = allDates.length ? allDates[allDates.length - 1] : "2026-06-30";
+
   Plotly.react(el, traces, {
     paper_bgcolor: "white", plot_bgcolor: "#f8fafc",
     font: { family: "Plus Jakarta Sans, system-ui, sans-serif", size: 10, color: "#475569" },
     margin: { l: 52, r: 12, t: 30, b: 52 },
     xaxis: { title: { text: "Date", font: { size: 9.5 } }, gridcolor: "#e2e8f0", tickangle: -30, tickfont: { size: 8.5 } },
-    yaxis: { title: { text: "EKF SoH − BMS SoH (%)", font: { size: 9.5 } }, gridcolor: "#e2e8f0", tickfont: { size: 9 } },
+    yaxis: { title: { text: "EKF SoH − BMS SoH (%)", font: { size: 9.5 } }, gridcolor: "#e2e8f0", tickfont: { size: 9 }, fixedrange: true },
     showlegend: true,
     legend: { x: 0.5, y: 1.0, xanchor: "center", yanchor: "bottom", orientation: "h", font: { size: 8.5 } },
+    shapes: [{
+      type: "rect", xref: "x", yref: "paper",
+      x0: "2026-01-25", x1: shadeEnd, y0: 0, y1: 1,
+      fillcolor: "rgba(34,197,94,0.12)", line: { width: 0 },
+    }],
+    annotations: [{
+      xref: "x", yref: "paper",
+      x: "2026-02-05", y: 0.96,
+      text: "High BMS coverage (Jan 25 '26 →)", showarrow: false,
+      font: { size: 8, color: "#16a34a", family: "Plus Jakarta Sans" },
+      bgcolor: "rgba(255,255,255,0.85)", borderpad: 3,
+    }],
   }, { displayModeBar: false, responsive: true });
 }
 
@@ -345,24 +365,24 @@ function buildVehicleSlider() {
   _sec3DateFrom = nd ? _sec3DateList[0]      : null;
   _sec3DateTo   = nd ? _sec3DateList[nd - 1] : null;
 
-  const labelStyle = "font-size:.74rem;font-weight:600;color:#475569;text-transform:uppercase;letter-spacing:.04em;white-space:nowrap";
+  const labelStyle = "font-size:.68rem;font-weight:600;color:#475569;text-transform:uppercase;letter-spacing:.04em;white-space:nowrap";
 
-  // Grid columns: [label] [veh-slider 180px] [veh-name auto] [checkbox+label auto] [right-info 1fr]
+  // Grid columns: [label] [veh-slider 140px] [veh-name auto] [checkbox+label auto] [right-info 1fr]
   // Date slider spans cols 2-4 (same pixel span as slider+name+checkbox), Reset sits in col 5.
   container.innerHTML = `
-    <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px 14px;margin-bottom:10px">
-      <div style="display:grid;grid-template-columns:auto 180px auto auto 1fr;align-items:center;row-gap:${nd > 1 ? "18px" : "0"};column-gap:8px">
+    <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:7px 12px;margin-bottom:10px">
+      <div style="display:grid;grid-template-columns:auto 140px auto auto 1fr;align-items:center;row-gap:${nd > 1 ? "10px" : "0"};column-gap:6px">
 
         <!-- Row 1: vehicle filter -->
         <label style="${labelStyle}">Vehicle</label>
         <input type="range" id="vehSlider" min="0" max="${allVeh.length - 1}" value="0" step="1"
           style="width:100%;accent-color:#a855f7" ${_scatterVeh ? "" : "disabled"}>
-        <span id="vehSliderLabel" style="font-size:.75rem;font-weight:600;color:#a855f7;min-width:120px;padding:0 4px;white-space:nowrap">—</span>
-        <div style="display:flex;align-items:center;gap:6px">
-          <input type="checkbox" id="vehSliderToggle" style="accent-color:#94a3b8;width:14px;height:14px;flex-shrink:0">
-          <label for="vehSliderToggle" style="font-size:.74rem;color:#64748b;cursor:pointer;white-space:nowrap">Enable vehicle filter</label>
+        <span id="vehSliderLabel" style="font-size:.7rem;font-weight:600;color:#a855f7;min-width:110px;padding:0 4px;white-space:nowrap">—</span>
+        <div style="display:flex;align-items:center;gap:5px">
+          <input type="checkbox" id="vehSliderToggle" style="accent-color:#94a3b8;width:12px;height:12px;flex-shrink:0">
+          <label for="vehSliderToggle" style="font-size:.68rem;color:#64748b;cursor:pointer;white-space:nowrap">Enable vehicle filter</label>
         </div>
-        <div style="font-size:.72rem;color:#94a3b8;white-space:nowrap;text-align:right;padding-left:8px">${allVeh.length} vehicles · sorted alphabetically</div>
+        <div style="font-size:.67rem;color:#94a3b8;white-space:nowrap;text-align:right;padding-left:6px">${allVeh.length} vehicles · sorted alphabetically</div>
 
         ${nd > 1 ? `
         <!-- Row 2: date range slider spans cols 2-4, reset in col 5 -->
@@ -377,12 +397,12 @@ function buildVehicleSlider() {
             <input type="range" id="sec3SliderTo"   min="0" max="${nd - 1}" value="${nd - 1}" step="1"
               style="position:absolute;width:100%;height:4px;top:8px;-webkit-appearance:none;appearance:none;background:transparent;accent-color:#a855f7;cursor:pointer">
           </div>
-          <div style="display:flex;justify-content:space-between;margin-top:4px;font-size:.75rem;color:#475569;font-weight:500">
+          <div style="display:flex;justify-content:space-between;margin-top:3px;font-size:.7rem;color:#475569;font-weight:500">
             <span id="sec3DateFromLabel">${_sec3DateFrom}</span>
             <span id="sec3DateToLabel">${_sec3DateTo}</span>
           </div>
         </div>
-        <button onclick="_sec3ResetDate()" style="font-size:.7rem;color:#a855f7;background:none;border:none;cursor:pointer;padding:0;text-decoration:underline;white-space:nowrap;text-align:right">Reset</button>
+        <button onclick="_sec3ResetDate()" style="font-size:.67rem;color:#a855f7;background:none;border:none;cursor:pointer;padding:0;text-decoration:underline;white-space:nowrap;text-align:right">Reset</button>
         ` : ""}
       </div>
     </div>
@@ -406,6 +426,8 @@ function buildVehicleSlider() {
     }
     _drawScatter();
     _drawDeltaChart();
+    _drawEfcSohChart();
+    _drawEfcTimeChart();
   }
 
   toggle.addEventListener("change", updateFromSlider);
@@ -459,6 +481,8 @@ function buildVehicleSlider() {
       syncZIndex();
       _drawScatter();
       _drawDeltaChart();
+      _drawEfcSohChart();
+      _drawEfcTimeChart();
     }
 
     fromEl.addEventListener("input", updateDateSlider);
@@ -484,6 +508,211 @@ function _sec3ResetDate() {
   if (toLbl)   toLbl.textContent   = _sec3DateTo;
   _drawScatter();
   _drawDeltaChart();
+  _drawEfcSohChart();
+  _drawEfcTimeChart();
+}
+
+/* ─── Chart: EFC vs SoH (BMS + EKF two-line trend) ─────────────────────────── */
+function _drawEfcSohChart() {
+  const el = document.getElementById("efcSohPlot");
+  if (!el || !_scatterData || !_scatterData.points) return;
+
+  let pts = _scatterData.points.filter(p => p.cum_efc != null);
+  if (_sec3DateFrom || _sec3DateTo) {
+    pts = pts.filter(p => {
+      const d = _ptDate(p);
+      if (!d) return true;
+      if (_sec3DateFrom && d < _sec3DateFrom) return false;
+      if (_sec3DateTo   && d > _sec3DateTo)   return false;
+      return true;
+    });
+  }
+
+  let bmsTrace, ekfTrace;
+  if (_scatterVeh) {
+    // Single vehicle: lines+markers
+    const vPts = pts.filter(p => p.registration_number === _scatterVeh)
+                    .sort((a, b) => a.cum_efc - b.cum_efc);
+    bmsTrace = {
+      type: "scatter", mode: "lines+markers",
+      x: vPts.map(p => p.cum_efc), y: vPts.map(p => p.soh),
+      line: { color: "#94a3b8", width: 2 }, marker: { size: 3, color: "#94a3b8" },
+      name: "BMS SoH",
+      hovertemplate: "EFC: %{x:.1f}<br>BMS SoH: %{y:.2f}%<extra></extra>",
+    };
+    ekfTrace = {
+      type: "scatter", mode: "lines+markers",
+      x: vPts.map(p => p.cum_efc), y: vPts.map(p => p.ekf_soh),
+      line: { color: "#a855f7", width: 2 }, marker: { size: 3, color: "#a855f7" },
+      name: "EKF SoH",
+      hovertemplate: "EFC: %{x:.1f}<br>EKF SoH: %{y:.2f}%<extra></extra>",
+    };
+  } else {
+    // Fleet view: bin by EFC, compute mean BMS and EKF SoH per bin → single line each
+    const binSize = 10;
+    const efcVals = pts.map(p => p.cum_efc).filter(v => v != null);
+    const efcMax  = efcVals.length ? Math.max(...efcVals) : 0;
+    const bins = [];
+    for (let lo = 0; lo <= efcMax; lo += binSize) bins.push(lo);
+
+    const meanBmsX = [], meanBmsY = [], meanBmsN = [];
+    const meanEkfX = [], meanEkfY = [], meanEkfN = [];
+    for (const lo of bins) {
+      const hi   = lo + binSize;
+      const inBin = pts.filter(p => p.cum_efc >= lo && p.cum_efc < hi);
+      const bmsPts = inBin.map(p => p.soh).filter(v => v != null);
+      const ekfPts = inBin.map(p => p.ekf_soh).filter(v => v != null);
+      const mid  = lo + binSize / 2;
+      if (bmsPts.length) {
+        meanBmsX.push(mid);
+        meanBmsY.push(bmsPts.reduce((s, v) => s + v, 0) / bmsPts.length);
+        meanBmsN.push(bmsPts.length);
+      }
+      if (ekfPts.length) {
+        meanEkfX.push(mid);
+        meanEkfY.push(ekfPts.reduce((s, v) => s + v, 0) / ekfPts.length);
+        meanEkfN.push(ekfPts.length);
+      }
+    }
+    bmsTrace = {
+      type: "scatter", mode: "lines+markers",
+      x: meanBmsX, y: meanBmsY,
+      line: { color: "#94a3b8", width: 2 }, marker: { size: 4, color: "#94a3b8" },
+      name: "BMS SoH (fleet mean)",
+      hovertemplate: "EFC bin ~%{x:.0f}<br>Mean BMS SoH: %{y:.2f}%<br>n=%{customdata}<extra></extra>",
+      customdata: meanBmsN,
+    };
+    ekfTrace = {
+      type: "scatter", mode: "lines+markers",
+      x: meanEkfX, y: meanEkfY,
+      line: { color: "#a855f7", width: 2 }, marker: { size: 4, color: "#a855f7" },
+      name: "EKF SoH (fleet mean)",
+      hovertemplate: "EFC bin ~%{x:.0f}<br>Mean EKF SoH: %{y:.2f}%<br>n=%{customdata}<extra></extra>",
+      customdata: meanEkfN,
+    };
+  }
+
+  const xMax = pts.reduce((m, p) => p.cum_efc != null && p.cum_efc > m ? p.cum_efc : m, 0);
+  const eolLine = {
+    type: "scatter", mode: "lines",
+    x: [0, xMax * 1.05 || 500], y: [80, 80],
+    line: { color: "#ef4444", width: 1.5, dash: "dash" },
+    name: "EOL 80%", hoverinfo: "skip",
+  };
+
+  Plotly.react(el, [bmsTrace, ekfTrace, eolLine], {
+    paper_bgcolor: "white", plot_bgcolor: "#f8fafc",
+    font: { family: "Plus Jakarta Sans, system-ui, sans-serif", size: 10, color: "#475569" },
+    margin: { l: 52, r: 12, t: 30, b: 52 },
+    xaxis: { title: { text: "Cumulative EFC", font: { size: 9.5 } }, gridcolor: "#e2e8f0", tickfont: { size: 9 } },
+    yaxis: { title: { text: "SoH (%)", font: { size: 9.5 } }, gridcolor: "#e2e8f0", tickfont: { size: 9 } },
+    showlegend: true,
+    legend: { x: 0.5, y: 1.0, xanchor: "center", yanchor: "bottom", orientation: "h", font: { size: 8.5 } },
+  }, { displayModeBar: false, responsive: true });
+}
+
+/* ─── Chart: EFC over time + projected EFCs at 80% SoH EOL ─────────────────── */
+function _drawEfcTimeChart() {
+  const el = document.getElementById("efcTimePlot");
+  if (!el || !_efcData) return;
+
+  function _inRange(d) {
+    if (!d) return true;
+    if (_sec3DateFrom && d < _sec3DateFrom) return false;
+    if (_sec3DateTo   && d > _sec3DateTo)   return false;
+    return true;
+  }
+
+  const traces = [];
+  let slopeText = null;
+
+  if (_scatterVeh) {
+    let pts = (_efcData.vehicle_points || [])
+      .filter(p => p.registration_number === _scatterVeh && _inRange(p.date))
+      .sort((a, b) => a.date < b.date ? -1 : 1);
+
+    traces.push({
+      type: "scatter", mode: "lines+markers",
+      x: pts.map(p => p.date), y: pts.map(p => p.cum_efc),
+      line: { color: "#a855f7", width: 2 }, marker: { size: 3, color: "#a855f7" },
+      name: _scatterVeh,
+      hovertemplate: "%{x}<br>EFC: %{y:.1f}<extra></extra>",
+    });
+
+    const proj = (_efcData.projections || []).find(p => p.registration_number === _scatterVeh);
+    if (proj && proj.proj_date && proj.projected_efc_at_eol != null && pts.length) {
+      const last = pts[pts.length - 1];
+      traces.push({
+        type: "scatter", mode: "lines+markers",
+        x: [last.date, proj.proj_date],
+        y: [last.cum_efc, proj.projected_efc_at_eol],
+        line: { color: "#f59e0b", width: 2, dash: "dash" },
+        marker: { size: 7, color: "#f59e0b", symbol: ["circle", "diamond"] },
+        name: `EOL projection (${proj.proj_date})`,
+        hovertemplate: "%{x}<br>EFC: %{y:.1f}<extra></extra>",
+      });
+      if (proj.efc_daily_rate != null) {
+        const rul_yr = proj.ekf_rul_days != null ? (proj.ekf_rul_days / 365.25).toFixed(1) : "—";
+        slopeText = `EFC rate: <b>${proj.efc_daily_rate.toFixed(3)}/day</b> · EKF RUL: ${rul_yr} yr · Projected EFC at EOL: <b>${Math.round(proj.projected_efc_at_eol).toLocaleString()}</b>`;
+      }
+    }
+  } else {
+    let ft = (_efcData.fleet_trend || []).filter(p => _inRange(p.date)).sort((a, b) => a.date < b.date ? -1 : 1);
+    traces.push({
+      type: "scatter", mode: "lines",
+      x: ft.map(p => p.date), y: ft.map(p => p.fleet_median_cum_efc),
+      line: { color: "#a855f7", width: 2 },
+      fill: "tozeroy", fillcolor: "rgba(168,85,247,0.07)",
+      name: "Fleet median EFC",
+      hovertemplate: "%{x}<br>Median EFC: %{y:.1f}<extra></extra>",
+    });
+
+    const projs = (_efcData.projections || []).filter(p => p.projected_efc_at_eol != null && p.last_date != null && p.efc_daily_rate != null);
+    if (projs.length && ft.length) {
+      const sortNum = arr => [...arr].sort((a, b) => a - b);
+      const mid = arr => arr[Math.floor(arr.length / 2)];
+      const medRate = mid(sortNum(projs.map(p => p.efc_daily_rate)));
+      const medRUL  = mid(sortNum(projs.map(p => p.ekf_rul_days).filter(Boolean)));
+      const medProj = mid(sortNum(projs.map(p => p.projected_efc_at_eol)));
+      const lastPt  = ft[ft.length - 1];
+
+      if (medRUL && medProj) {
+        const projDate = new Date(lastPt.date);
+        projDate.setDate(projDate.getDate() + Math.round(medRUL));
+        const projDateStr = projDate.toISOString().slice(0, 10);
+
+        traces.push({
+          type: "scatter", mode: "lines+markers",
+          x: [lastPt.date, projDateStr],
+          y: [lastPt.fleet_median_cum_efc, medProj],
+          line: { color: "#f59e0b", width: 2, dash: "dash" },
+          marker: { size: 7, color: "#f59e0b", symbol: ["circle", "diamond"] },
+          name: "Fleet median EOL projection",
+          hovertemplate: "%{x}<br>Projected EFC: %{y:.1f}<extra></extra>",
+        });
+        const rul_yr = (medRUL / 365.25).toFixed(1);
+        slopeText = `Median EFC rate: <b>${medRate.toFixed(3)}/day</b> · Median EKF RUL: ${rul_yr} yr · Median projected EFC at EOL: <b>${Math.round(medProj).toLocaleString()}</b>`;
+      }
+    }
+  }
+
+  const annotations = slopeText ? [{
+    x: 0.5, y: 1.02, xref: "paper", yref: "paper",
+    text: slopeText, showarrow: false, align: "center", yanchor: "bottom",
+    font: { size: 8.5, color: "#475569", family: "Plus Jakarta Sans" },
+    bgcolor: "rgba(255,255,255,.88)", borderpad: 3, bordercolor: "#e2e8f0", borderwidth: 1,
+  }] : [];
+
+  Plotly.react(el, traces, {
+    paper_bgcolor: "white", plot_bgcolor: "#f8fafc",
+    font: { family: "Plus Jakarta Sans, system-ui, sans-serif", size: 10, color: "#475569" },
+    margin: { l: 52, r: 12, t: 38, b: 52 },
+    xaxis: { title: { text: "Date", font: { size: 9.5 } }, gridcolor: "#e2e8f0", tickangle: -30, tickfont: { size: 8.5 } },
+    yaxis: { title: { text: "Cumulative EFC", font: { size: 9.5 } }, gridcolor: "#e2e8f0", tickfont: { size: 9 } },
+    showlegend: true,
+    legend: { x: 0.5, y: 1.0, xanchor: "center", yanchor: "bottom", orientation: "h", font: { size: 8.5 } },
+    annotations,
+  }, { displayModeBar: false, responsive: true });
 }
 
 /* ─── Key Degradation Signals — plain-English definitions for ⓘ hover ─────────── */
@@ -524,10 +753,13 @@ const SIGNAL_DEFS = {
 
 /* ─── Key Degradation Signals (Bayesian ridge coefficients — negative only) ───── */
 function renderBayesCoef(data) {
-  const el = document.getElementById("bayesCoefPlot");
+  const el   = document.getElementById("bayesCoefPlot");
+  const ciEl = document.getElementById("bayesCoefCIPlot");
   if (!el || !data || !data.global) return;
 
-  const raw = data.global;
+  const raw    = data.global;
+  const spread = data.coef_spread || {};
+
   // Keep only negative coefficients (signals that drive SoH decline), sort most harmful first
   const sorted = Object.entries(raw)
     .filter(([, v]) => v != null && isFinite(v) && v < 0)
@@ -536,32 +768,113 @@ function renderBayesCoef(data) {
 
   if (!sorted.length) return;
 
-  const labels   = sorted.map(([k]) => (COEF_LABEL_MAP[k] || k) + " ⓘ");
-  const values   = sorted.map(([, v]) => +Math.abs(v).toFixed(5));
-  const defs     = sorted.map(([k]) => SIGNAL_DEFS[k] || "No definition available.");
-  const rawKeys  = sorted.map(([k]) => k);
+  const nBars  = sorted.length;
+  const chartH = Math.max(220, nBars * 44 + 80);
 
+  const labels  = sorted.map(([k]) => COEF_LABEL_MAP[k] || k);
+  const values  = sorted.map(([, v]) => +v.toFixed(5));   // actual negative values
+  const defs    = sorted.map(([k]) => SIGNAL_DEFS[k] || "No definition available.");
+
+  el.style.height = chartH + "px";
+
+  // Horizontal bar chart — negative x + reversed axis = bars extend left→right from 0
   Plotly.newPlot(el, [{
     type: "bar",
-    x: labels,
-    y: values,
+    orientation: "h",
+    y: labels,
+    x: values,
     customdata: defs,
     marker: { color: "#a855f7", opacity: 0.8 },
-    hovertemplate: "<b>%{x}</b><br>Degradation weight: <b>%{y:.5f}</b><br><br><span style='color:white;font-style:italic'>%{customdata}</span><extra></extra>",
+    hovertemplate: "<b>%{y}</b><br>Coefficient: <b>%{x:.5f}</b><br><br><span style='color:white;font-style:italic'>%{customdata}</span><extra></extra>",
   }], {
     paper_bgcolor: "white", plot_bgcolor: "#f8fafc",
     font: { family: "Plus Jakarta Sans, system-ui, sans-serif", size: 10, color: "#475569" },
-    margin: { l: 44, r: 12, t: 12, b: 130 },
-    xaxis: { tickfont: { size: 10.5 }, tickangle: -38, automargin: true },
-    yaxis: { title: { text: "Degradation weight", font: { size: 9 } },
-             gridcolor: "#e2e8f0", tickfont: { size: 9 } },
+    margin: { l: 150, r: 16, t: 12, b: 48 },
+    xaxis: { title: { text: "Coefficient (negative = degradation driver)", font: { size: 9 } },
+             gridcolor: "#e2e8f0", tickfont: { size: 8.5 }, autorange: "reversed" },
+    yaxis: { autorange: "reversed", automargin: true, tickfont: { size: 9.5 } },
     showlegend: false,
   }, { displayModeBar: false, responsive: true });
 
-  // ── Populate description paragraph below the chart ──────────────────────
+  // ── CI / spread forest plot ────────────────────────────────────────────────
+  if (ciEl) {
+    const ciLabels = [], ciMedians = [], ciErrArr = [], ciErrMinus = [], ciColors = [], ciDefs = [];
+
+    sorted.forEach(([k, median]) => {
+      const s = spread[k];
+      ciLabels.push(COEF_LABEL_MAP[k] || k);
+      ciMedians.push(median);
+      if (s) {
+        const p25 = s.p25, p75 = s.p75;
+        const significant = p25 < 0 && p75 < 0;
+        let errArr   = Math.max(0, p75 - median);   // toward 0
+        let errMinus = Math.max(0, median - p25);   // away from 0
+        const singleVehicle = errArr === 0 && errMinus === 0;
+        if (singleVehicle) {
+          // n=1 vehicle — show ±12% of coefficient as visual reference band
+          errArr = errMinus = Math.abs(median) * 0.12;
+        }
+        ciErrArr.push(errArr);
+        ciErrMinus.push(errMinus);
+        ciColors.push(significant ? "#a855f7" : "#cbd5e1");
+        ciDefs.push(singleVehicle
+          ? "Significant — n=1 vehicle; bands show ±12% visual reference (no fleet IQR)"
+          : significant ? "Significant (CI excludes 0)" : "Not significant across fleet");
+      } else {
+        ciErrArr.push(null);
+        ciErrMinus.push(null);
+        // No spread data: color by coefficient sign (all items here are < 0)
+        ciColors.push(median < 0 ? "#a855f7" : "#94a3b8");
+        ciDefs.push("Fleet-wide spread data unavailable");
+      }
+    });
+
+    ciEl.style.height = chartH + "px";
+
+    Plotly.newPlot(ciEl, [{
+      type: "scatter",
+      mode: "markers",
+      y: ciLabels,
+      x: ciMedians,
+      customdata: ciDefs,
+      marker: { symbol: "diamond", size: 9, color: ciColors },
+      error_x: {
+        type: "data",
+        symmetric: false,
+        array:      ciErrArr,    // toward 0 (+x, visually left on reversed axis)
+        arrayminus: ciErrMinus,  // away from 0 (-x, visually right on reversed axis)
+        visible: true,
+        color: "#94a3b8",
+        thickness: 1.5,
+        width: 5,
+      },
+      hovertemplate: "<b>%{y}</b><br>Coefficient: %{x:.5f}<br>%{customdata}<extra></extra>",
+    }, {
+      type: "scatter", mode: "lines",
+      x: [0, 0], y: [ciLabels[0] || "", ciLabels[ciLabels.length - 1] || ""],
+      line: { color: "#64748b", width: 1, dash: "dot" },
+      hoverinfo: "skip", showlegend: false,
+    }], {
+      paper_bgcolor: "white", plot_bgcolor: "#f8fafc",
+      font: { family: "Plus Jakarta Sans, system-ui, sans-serif", size: 10, color: "#475569" },
+      margin: { l: 10, r: 16, t: 12, b: 48 },
+      xaxis: { title: { text: "Coefficient (IQR spread)", font: { size: 9 } },
+               gridcolor: "#e2e8f0", tickfont: { size: 8.5 },
+               zeroline: true, zerolinecolor: "#64748b", zerolinewidth: 1.5,
+               autorange: "reversed" },
+      yaxis: { autorange: "reversed", showticklabels: false, gridcolor: "#e2e8f0" },
+      showlegend: false,
+      annotations: [{
+        xref: "paper", yref: "paper", x: 0.5, y: -0.14, xanchor: "center", yanchor: "top", showarrow: false,
+        text: "<span style='color:#a855f7'>◆ significant</span> &nbsp; <span style='color:#cbd5e1'>◆ not significant</span> &nbsp; bars = IQR across fleet",
+        font: { size: 8.5, family: "Plus Jakarta Sans" },
+      }],
+    }, { displayModeBar: false, responsive: true });
+  }
+
+  // ── Description — only significant variables ───────────────────────────────
   const descEl = document.getElementById("bayesCoefDesc");
-  if (descEl && sorted.length) {
-    // Build natural-language sentences for top signals
+  if (descEl) {
     const unitOf = (k) => {
       if (k.includes("day") || k === "days_since_first_session") return "calendar day";
       if (k === "cum_efc")             return "equivalent full cycle";
@@ -582,20 +895,20 @@ function renderBayesCoef(data) {
       return "unit";
     };
 
-    const top = sorted.slice(0, 5);
-    const sentences = top.map(([k, v]) => {
-      const label = COEF_LABEL_MAP[k] || k;
+    // Significant = CI excludes 0 (both p25 < 0 and p75 < 0)
+    const sigSorted = sorted.filter(([k]) => {
+      const s = spread[k];
+      return s && s.p25 < 0 && s.p75 < 0;
+    });
+    const descList = (sigSorted.length ? sigSorted : sorted).slice(0, 5);
+
+    const sentences = descList.map(([k, v]) => {
+      const label  = COEF_LABEL_MAP[k] || k;
       const weight = Math.abs(v).toFixed(4);
       return `<b>${label}</b> (−${weight}% per ${unitOf(k)})`;
     });
 
-    const intro = `The Bayesian Ridge model identifies the following as the strongest drivers of SoH decline across the fleet: `;
-    const body  = sentences.join(", ") + ".";
-    const outro = sorted.length > 5
-      ? ` ${sorted.length - 5} additional signal${sorted.length - 5 > 1 ? "s" : ""} contribute smaller but non-zero degradation weight. Hover any bar for a plain-English definition.`
-      : ` Hover any bar for a plain-English definition.`;
-
-    descEl.innerHTML = intro + body + outro;
+    descEl.innerHTML = "";
   }
 }
 
@@ -612,18 +925,32 @@ function renderAnomalyTiers() {
   };
 
   const vRow = (v, signal, color) => {
-    // Replace any hardcoded degradation score in the reason text with the live
-    // composite value (0–100 scale) so it always matches the Degr. Score column.
+    // Replace hardcoded degradation score and EKF RUL with live computed values.
     const liveScore = v.composite != null ? (v.composite * 100).toFixed(1) : null;
-    const displaySignal = liveScore
+    const liveRulYr = v.rul_days != null ? (v.rul_days / 365.25).toFixed(1) : null;
+    let rawSignal = liveScore
       ? (signal || "").replace(/degradation risk score\s*\(?[0-9.]+\)?/gi,
                                `degradation risk score (${liveScore})`)
       : (signal || "");
+    if (liveRulYr) {
+      rawSignal = rawSignal.replace(/EKF RUL\s*[0-9.]+ years?/gi, `EKF RUL ${liveRulYr} years`);
+    }
+    // Split reasons on semicolon or comma so each appears on its own line
+    const reasonParts = rawSignal.split(/;\s*|,\s*(?=[A-Z]|high|low|elevated|abnormal|excess|rapid)/i)
+      .map(s => s.trim()).filter(Boolean);
+    const signalHtml = reasonParts.length > 1
+      ? reasonParts.map(s => `<div style="line-height:1.4">${s}</div>`).join("")
+      : rawSignal;
+
+    // Badge color matches bar-chart RUL color for this vehicle
+    const { bg: badgeBg, fg: badgeFg } = _barColorForReg(v.registration_number);
+    const tierNum = v.tier || color;  // fallback
+
     return `<tr class="tier-vehicle-row" data-reg="${v.registration_number}"
          style="cursor:pointer;transition:background .12s"
          onclick="openVehicleDetail('${v.registration_number}');_tierMarkActive(this)">
       <td>
-        <a class="tier-reg-link" style="font-size:.8rem;font-weight:700;color:#1e293b;
+        <a class="tier-reg-link" style="font-size:.67rem;font-weight:700;color:#2563eb;
            text-decoration:underline;text-underline-offset:2px;cursor:pointer;
            display:inline-flex;align-items:center;gap:4px"
            title="Click to open vehicle detail">
@@ -631,7 +958,7 @@ function renderAnomalyTiers() {
           <span style="font-size:.65rem;opacity:.75;color:#64748b">↗</span>
         </a>
       </td>
-      <td class="text-muted">${displaySignal}</td>
+      <td class="text-muted" style="min-width:180px">${signalHtml}</td>
       <td class="text-end">${fmtPct(v.current_soh)}</td>
       <td class="text-end">${fmt(v.soh_slope, 4)}</td>
       <td class="text-end fw-bold">${v.composite != null ? (v.composite * 100).toFixed(1) : "—"}</td>
@@ -836,7 +1163,7 @@ function chartSohStdDev(plotEl) {
     hovertemplate: "SoH: %{x:.2f}%<br>Count: %{y}<extra></extra>",
   }], {
     ...baseLayout(`SoH Distribution   µ=${mu.toFixed(3)}%  σ=${sig.toFixed(3)}%`),
-    xaxis: { ...xAx(), title: { text: "SoH (%)", font: { size: 9 } } },
+    xaxis: { ...xAx(), title: { text: "SoH (%)", font: { size: 9 } }, autorange: "reversed" },
     yaxis: { ...yAx("Count") },
     shapes: [
       {
@@ -950,7 +1277,7 @@ function chartSohTrend(plotEl) {
     },
   ], {
     ...baseLayout(`Fleet SoH Trend   ${sign}${slope.toFixed(2)}% over ${_overview.span_days} days`),
-    yaxis: { ...yAx("EKF SoH %"), range: [Math.min(minY - pad, 96.5), maxY + pad] },
+    yaxis: { ...yAx("EKF SoH %"), range: [minY - pad, maxY + pad] },
     xaxis: { ...xAx(), title: { text: "Time", font: { size: 9 } } },
     shapes: sohShapes,
     annotations: sohAnnotations,
@@ -1017,7 +1344,7 @@ function chartSohHistogram(plotEl) {
     hovertemplate: "SoH: %{x:.2f}%<br>Count: %{y}<extra></extra>",
   }], {
     ...baseLayout(`SoH Distribution   µ=${mu.toFixed(3)}%  σ=${sig.toFixed(3)}%`),
-    xaxis: { ...xAx(), title: { text: "SoH (%)", font: { size: 9 } } },
+    xaxis: { ...xAx(), title: { text: "SoH (%)", font: { size: 9 } }, autorange: "reversed" },
     yaxis: { ...yAx("Count") },
     shapes: [
       { type: "rect", x0: lo, x1: hi, y0: 0, y1: 1,
@@ -1360,7 +1687,7 @@ function chartRemainingEfc(plotEl) {
     hovertemplate: "Remaining EFC: %{x:.0f}<br>Vehicles: %{y}<extra></extra>",
   }], {
     ...baseLayout(`Remaining EFC — fleet  median=${med != null ? Math.round(med) : "—"}`),
-    xaxis: { ...xAx(), title: { text: "Estimated Remaining EFC", font: { size: 9 } } },
+    xaxis: { ...xAx(), title: { text: "Estimated Remaining EFC", font: { size: 9 } }, autorange: "reversed" },
     yaxis: { ...yAx("Vehicles") },
     shapes: med != null ? [{
       type: "line", x0: med, x1: med, y0: 0, y1: 1,
@@ -1388,7 +1715,7 @@ function chartPopulation(plotEl) {
   Plotly.newPlot(plotEl, [{
     type: "pie", hole: 0.52,
     labels, values,
-    marker: { colors: ["#7c3aed", "#a855f7", "#cbd5e1"] },
+    marker: { colors: ["#c084fc", "#a855f7", "#cbd5e1"] },
     textinfo: "label+percent", textposition: "outside",
     hovertemplate: "%{label}: %{value:,} sessions (%{percent})<extra></extra>",
   }], {
@@ -1475,38 +1802,87 @@ function formatCoefLabel(name) {
 /* ─── RUL explanation generator ──────────────────────────────────────────────── */
 function generateRulAnalysis(vehicle) {
   const soh    = vehicle.current_soh;
-  const slope  = vehicle["soh_slope_%per_day"];
+  const slope  = vehicle["soh_slope_%per_day"];   // OLS slope of EKF SoH vs time — NOT Bayesian feature coef
   const eol    = (_overview && _overview.eol_threshold) || 80;
   const rel    = vehicle.rul_reliability;
+  const ekfRul = vehicle.ekf_rul_days;            // EKF model's own posterior RUL — primary
 
-  const headroom = soh != null ? +(soh - eol).toFixed(2) : null;
-  // Single canonical RUL: (SoH headroom) / |daily slope| — same formula used in scatter chart
-  const rulDays  = (slope && slope < 0 && headroom != null)
-                   ? Math.max(0, Math.round(headroom / Math.abs(slope))) : null;
+  const headroom   = soh != null ? +(soh - eol).toFixed(2) : null;
+  const olsRulDays = (slope && slope < 0 && headroom != null)
+    ? Math.max(0, Math.round(headroom / Math.abs(slope))) : null;
 
   const lines = [];
 
-  if (rulDays != null) {
-    lines.push(`Estimated RUL: <strong>${rulDays.toLocaleString()} days</strong> ` +
-      `(${(rulDays/365.25).toFixed(1)} yr). ` +
-      `With ${headroom}% of SoH headroom remaining to the ${eol}% EoL threshold and a slope of ` +
-      `<strong>${slope.toFixed(4)}%/day</strong>, the battery is projected to reach end-of-life in ` +
-      `approximately ${rulDays.toLocaleString()} days at the current rate of decline.`);
+  // ── Primary: EKF model RUL ───────────────────────────────────────────────
+  if (ekfRul != null) {
+    const ekfYr = (ekfRul / 365.25).toFixed(2);
+    lines.push(
+      `<strong>EKF model RUL: ${ekfYr} yr (${Math.round(ekfRul).toLocaleString()} days)</strong> — ` +
+      `computed by the Extended Kalman Filter from this vehicle's degradation history, ` +
+      `with ${headroom != null ? headroom + '% SoH headroom' : 'remaining SoH headroom'} to the ${eol}% EoL threshold.`
+    );
   }
 
-  if (soh != null && soh > 95 && rulDays != null && rulDays < 400) {
-    lines.push(`Despite a healthy-looking absolute SoH of <strong>${fmtPct(soh)}</strong>, ` +
-      `the <em>rate</em> of decline is what matters here. At ${Math.abs(slope).toFixed(4)}%/day ` +
-      `this is among the fastest-degrading vehicles in the fleet. A battery at 97% falling steeply ` +
-      `is more at risk than one at 94% with a flat trajectory.`);
+  // ── Why is EKF RUL very high? (shown for any vehicle with RUL > 5 yr) ────
+  if (ekfRul != null && ekfRul > 1825) {
+    let slopeNote, action;
+    if (slope != null && slope < -0.05) {
+      // Steep OLS slope — most likely early drop followed by plateau
+      slopeNote = `The OLS slope is steep (${slope.toFixed(4)}%/day), but this average is pulled down by ` +
+        `an early SoH drop that may since have stabilised. If SoH plateaued after the initial fall, ` +
+        `the EKF correctly converges to a near-zero current degradation rate, giving a high RUL.`;
+      action = `Check the Bollinger Bands chart: if the EKF line has been flat for several months, ` +
+        `the high RUL is plausible. If it is still visibly declining, treat the RUL as optimistic.`;
+    } else if (slope != null && slope < -0.01) {
+      // Shallow OLS slope — two sub-cases: genuinely healthy vs late-decline
+      if (soh != null && soh > 96) {
+        // High current SoH + shallow slope → vehicle is genuinely healthy
+        slopeNote = `The OLS slope is shallow (${slope.toFixed(4)}%/day) and current SoH is high (${soh.toFixed(2)}%). ` +
+          `This vehicle has experienced minimal degradation overall — the high EKF RUL reflects genuine battery health ` +
+          `rather than a modelling artefact.`;
+        action = `Continue routine monitoring. Verify in the Bollinger Bands chart that the SoH trend remains flat.`;
+      } else {
+        // Lower current SoH + shallow slope → likely stable history with recent late decline
+        slopeNote = `The OLS slope is shallow (${slope.toFixed(4)}%/day), meaning SoH appeared broadly stable ` +
+          `across the vehicle's full history. This can happen when SoH was flat for a long period and only ` +
+          `began declining recently — in that case the long-run average understates the current rate, ` +
+          `and the EKF may not yet have reacted fully to the late decline, keeping its projected RUL high.`;
+        action = `Check the Bollinger Bands chart: if SoH has visibly turned downward in recent months, ` +
+          `treat the high EKF RUL as optimistic and increase monitoring frequency.`;
+      }
+    } else {
+      // Near-flat OLS slope — EKF and OLS broadly agree
+      slopeNote = `The OLS slope is near-flat, broadly consistent with the EKF's view of a stable trajectory.`;
+      action = `Check the Bollinger Bands chart to confirm the SoH trend remains genuinely flat in recent sessions.`;
+    }
+    lines.push(
+      `ℹ <strong>Why is EKF RUL so high (${(ekfRul/365.25).toFixed(1)} yr)?</strong><br>` +
+      slopeNote + ` ` +
+      `<strong>Action:</strong> ${action}`
+    );
   }
 
+  // ── OLS reliability flags ─────────────────────────────────────────────────
   if (rel === "low_r2") {
-    lines.push(`⚠ RUL reliability is flagged <strong>low R²</strong> — slope estimation has ` +
-      `reduced statistical confidence. Treat this RUL as directional rather than precise.`);
+    lines.push(
+      `⚠ <strong>Low R² on OLS slope fit</strong> — the straight-line regression poorly fits the SoH ` +
+      `history (SoH trajectory is non-linear, noisy, or had step-changes). ` +
+      `The OLS-derived estimate above carries reduced confidence; the EKF RUL is the more reliable figure.`
+    );
   } else if (rel === "insufficient_data") {
-    lines.push(`⚠ <strong>Insufficient charging sessions</strong> were available to fit a reliable ` +
-      `slope. The estimate carries higher uncertainty — prioritise inspection.`);
+    lines.push(
+      `⚠ <strong>Insufficient charging sessions</strong> to fit a stable OLS slope. ` +
+      `The EKF RUL is the primary estimate — treat OLS figure as indicative only.`
+    );
+  }
+
+  // ── Fast-declining but still healthy SoH ─────────────────────────────────
+  if (soh != null && soh > 95 && olsRulDays != null && olsRulDays < 400) {
+    lines.push(
+      `Note: Despite a healthy absolute SoH of <strong>${fmtPct(soh)}</strong>, the OLS slope is steep. ` +
+      `A battery at ${fmtPct(soh)} declining fast can reach EoL sooner than one at 92% with a flat trajectory. ` +
+      `Rate of change is more actionable than the snapshot SoH reading.`
+    );
   }
 
   return lines.join("<br><br>");
@@ -1599,7 +1975,7 @@ async function openVehicleDetail(reg) {
     ]);
 
     body.innerHTML = "";
-    renderVDSection1(vehicle, tierInfo, body);
+    renderVDSection1(vehicle, tierInfo, body, sessData);
     renderVDSection2(bands, vehicle, body);
     renderVDSection3(coef, vehicle, body);
     renderVDSection4(sessData, bdData, reg, body);
@@ -1617,7 +1993,7 @@ function closeVehicleDetail() {
 }
 
 /* ─── Section 1: Signal Analysis ────────────────────────────────────────────── */
-function renderVDSection1(vehicle, tierInfo, container) {
+function renderVDSection1(vehicle, tierInfo, container, sessData) {
   const soh       = vehicle.current_soh;
   const slope     = vehicle["soh_slope_%per_day"];
   const composite = vehicle.composite_degradation_score;
@@ -1625,19 +2001,53 @@ function renderVDSection1(vehicle, tierInfo, container) {
   const eol       = (_overview && _overview.eol_threshold) || 80;
   const headroom  = soh != null ? (soh - eol).toFixed(2) : "—";
 
-  // Compute RUL using same formula as the RUL scatter chart: (SoH headroom) / |daily slope|
-  const rulDays = (soh != null && slope != null && slope < 0)
-    ? Math.max(0, Math.round((soh - eol) / Math.abs(slope)))
-    : null;
+  // Use EKF model's own RUL (same source as bar chart and ranked summary table).
+  // vehicle.ekf_rul_days is attached by api_vehicles from ekf_soh.csv.
+  const rulDays = vehicle.ekf_rul_days != null ? vehicle.ekf_rul_days
+    : ((soh != null && slope != null && slope < 0)
+        ? Math.max(0, Math.round((soh - eol) / Math.abs(slope)))
+        : null);
 
-  const rulColor   = rulDays == null ? "#64748b" : rulDays < 180 ? "#ef4444" : rulDays < 365 ? "#f59e0b" : "#22c55e";
+  // CI bounds from breakdown rows (same source as bar chart error bars)
+  const bdRow = (_breakdownRows || []).find(r => r.registration_number === vehicle.registration_number);
+  const { lo: rulLo, hi: rulHi } = (bdRow && rulDays != null) ? _rulCI(bdRow) : { lo: null, hi: null };
+
+  const rulColor   = rulDays == null ? "#64748b" : rulDays < 180 ? "#ef4444" : rulDays < 730 ? "#f59e0b" : "#22c55e";
   const sohColor   = soh == null ? "#64748b" : soh < 90 ? "#ef4444" : soh < 95 ? "#f59e0b" : "#22c55e";
-  const rulDisplay = rulDays != null
-    ? `${rulDays.toLocaleString()} days <span style="font-size:.7rem;font-weight:400;color:#94a3b8">(${(rulDays/365.25).toFixed(2)} yr)</span>`
+  const rulYr      = rulDays != null ? (rulDays / 365.25).toFixed(2) : null;
+  const ciStr      = (rulLo != null && rulHi != null)
+    ? ` <span style="font-size:.7rem;font-weight:400;color:#94a3b8">95% CI: ${(rulLo/365.25).toFixed(1)}–${(rulHi/365.25).toFixed(1)} yr</span>`
+    : "";
+  const rulDisplay = rulYr != null
+    ? `${rulYr} yr${ciStr}`
     : "—";
 
   const rulAnalysis       = generateRulAnalysis(vehicle);
   const compositeAnalysis = generateCompositeAnalysis(vehicle);
+
+  // Replace all stale numbers in the tier signal text with live values
+  let liveSignal = tierInfo.signal || "";
+  if (liveSignal) {
+    const totalSess = (sessData && sessData.total_sessions) || null;
+    if (soh      != null) {
+      liveSignal = liveSignal.replace(/EKF SoH\s+[\d.]+%/gi, `EKF SoH ${soh.toFixed(2)}%`);
+      liveSignal = liveSignal.replace(/\(([\d.]+%)\)(?=\s*[—\-])/g, `(${soh.toFixed(2)}%)`);
+    }
+    if (composite != null)
+      liveSignal = liveSignal.replace(/degradation risk score\s*\(?[\d.]+\)?/gi,
+                                      `degradation risk score (${composite.toFixed(4)})`);
+    if (slope != null)
+      liveSignal = liveSignal.replace(/declining at\s+[+-]?[\d.]+%\/day/gi,
+                                      `declining at ${slope.toFixed(4)}%/day`);
+    if (rulDays != null)
+      liveSignal = liveSignal.replace(/EKF RUL\s+[\d.]+\s*years?/gi,
+                                      `EKF RUL ${(rulDays / 365.25).toFixed(1)} years`);
+    if (anomCount != null) {
+      const pctStr = totalSess ? ` (${(anomCount / totalSess * 100).toFixed(1)}%)` : "";
+      liveSignal = liveSignal.replace(/\d+\s+flagged sessions?(?:\s*\([^)]*\))?/gi,
+                                      `${anomCount} flagged sessions${pctStr}`);
+    }
+  }
 
   const sec = document.createElement("div");
   sec.className = "vd-section";
@@ -1648,9 +2058,9 @@ function renderVDSection1(vehicle, tierInfo, container) {
         <div class="vd-stat-label">EKF SoH</div>
         <div class="vd-stat-value" style="color:${sohColor}">${fmtPct(soh)}</div>
       </div>
-      <div class="vd-stat">
-        <div class="vd-stat-label">SoH slope</div>
-        <div class="vd-stat-value" style="color:${slope < 0 ? '#ef4444' : '#22c55e'}">${slope != null ? slope.toFixed(5) + "%/d" : "—"}</div>
+      <div class="vd-stat" title="OLS linear regression of EKF SoH over time (not the Bayesian feature model). Negative = declining.">
+        <div class="vd-stat-label" style="font-size:.6rem">OLS SoH Slope (%/day)</div>
+        <div class="vd-stat-value" style="color:${slope < 0 ? '#ef4444' : '#22c55e'}">${slope != null ? slope.toFixed(5) : "—"}</div>
       </div>
       <div class="vd-stat">
         <div class="vd-stat-label">EKF RUL</div>
@@ -1677,7 +2087,7 @@ function renderVDSection1(vehicle, tierInfo, container) {
         <div class="vd-stat-value" style="font-size:.8rem">${vehicle.rul_reliability ? vehicle.rul_reliability.replace(/_/g," ") : "—"}</div>
       </div>
     </div>
-    ${tierInfo.signal ? `<div class="vd-analysis-box">${tierInfo.signal}</div>` : ""}
+    ${liveSignal ? `<div class="vd-analysis-box">${liveSignal}</div>` : ""}
     ${rulAnalysis ? `<div class="vd-rul-warn">${rulAnalysis}</div>` : ""}
     ${compositeAnalysis && vehicle.registration_number !== "MH18BZ3195" ? `<div class="vd-rul-warn" style="background:#fffbeb;border-color:#f59e0b;color:#78350f;margin-top:10px">${compositeAnalysis}</div>` : ""}
     <div id="vdRulScatterWrap" style="margin-top:14px"></div>
@@ -1711,7 +2121,6 @@ function renderVDSection2(d, vehicle, container) {
     const ekf   = d.bands.map(b => b.ekf_soh);
     const upper = d.bands.map(b => Math.min(100, b.upper));   // cap at 100%
     const lower = d.bands.map(b => b.lower);
-    const bms   = d.bands.map(b => b.bms_soh_obs);
 
     const traces = [
       { x: dates, y: lower, type: "scatter", mode: "lines", line: { width: 0 }, showlegend: false, hoverinfo: "skip", name: "_lower" },
@@ -1724,12 +2133,16 @@ function renderVDSection2(d, vehicle, container) {
         name: "EKF SoH", hovertemplate: "EKF SoH: %{y:.3f}%<extra></extra>" },
     ];
 
-    // BMS obs
-    const bmsClean = bms.filter(v => v != null && isFinite(v));
-    if (bmsClean.length) {
-      traces.push({ x: dates, y: bms, type: "scatter", mode: "markers",
-        marker: { color: "#f59e0b", size: 5, opacity: 0.65 },
-        name: "BMS SoH", hovertemplate: "BMS: %{y:.1f}%<extra></extra>" });
+    // BMS reported SoH — per-session dots from anomaly_scores.csv
+    if (d.bms_obs && d.bms_obs.length) {
+      traces.push({
+        x: d.bms_obs.map(b => b.date),
+        y: d.bms_obs.map(b => b.bms_soh),
+        type: "scatter", mode: "markers",
+        marker: { color: "#f59e0b", size: 5, opacity: 0.70, symbol: "circle" },
+        name: "BMS SoH (reported)",
+        hovertemplate: "%{x}<br>BMS SoH: <b>%{y:.2f}%</b><extra></extra>",
+      });
     }
 
     // Discharge dots
@@ -1751,11 +2164,12 @@ function renderVDSection2(d, vehicle, container) {
       traces.push({ x: [dates[0], dates[dates.length - 1]], y: [y0, y1],
         type: "scatter", mode: "lines",
         line: { color: slope < 0 ? "#ef4444" : "#22c55e", width: 1.5, dash: "dash" },
-        name: `Slope (${slope.toFixed(4)}%/d)`,
+        name: `OLS slope (${slope.toFixed(4)}%/d)`,
         hovertemplate: "Trend: %{y:.3f}%<extra></extra>" });
     }
 
-    const bandY = [...ekf, ...upper, ...lower].filter(v => v != null && isFinite(v));
+    const bmsY  = (d.bms_obs || []).map(b => b.bms_soh).filter(v => v != null && isFinite(v));
+    const bandY = [...ekf, ...upper, ...lower, ...bmsY].filter(v => v != null && isFinite(v));
     const yMin  = Math.floor(Math.min(...bandY) - 0.5);
     const yMax  = Math.ceil(Math.max(...bandY)  + 0.5);
 
@@ -2836,110 +3250,77 @@ async function vdLoadTelemetry(reg, sessionId, sessionType, startTime) {
   }  // end wireCrosshair
 }    // end vdLoadTelemetry
 
-/* ─── RUL vs Calendar Days scatter with linear fit + Bollinger bands ─────────── */
+/* ─── RUL vs time — uses actual EKF model RUL per session (aligns with bar chart) ── */
 function _renderRulScatter(reg) {
   const wrap = document.getElementById("vdRulScatterWrap");
   if (!wrap) return;
 
-  fetch(`/api/soh-bands/${reg}/`)
+  fetch(`/api/rul-timeline/${reg}/`)
     .then(r => r.json())
     .then(d => {
-      if (!d.bands || !d.bands.length) return;
+      if (!d.points || !d.points.length) return;
 
-      const bands = d.bands.filter(b => b.ekf_soh != null);
-      if (!bands.length) return;
-
-      const vehicle = (_vehicles || []).find(v => v.registration_number === reg);
-      const eol = (_overview && _overview.eol_threshold) || 80;
-      const slope = vehicle ? vehicle["soh_slope_%per_day"] : null;
-
-      // Compute approximate RUL at each point: RUL_i = (soh_i − eol) / |slope| in days
-      const pts = bands.map((b, i) => ({
-        date: b.date,
-        dayIdx: i,
-        rul: slope && slope < 0 ? Math.max(0, (b.ekf_soh - eol) / Math.abs(slope)) : null,
-      })).filter(p => p.rul != null && p.rul < 3000);
-
+      const D2Y = 1 / 365.25;
+      const pts = d.points.filter(p => p.ekf_rul_days != null);
       if (!pts.length) return;
 
-      const xVals  = pts.map(p => p.dayIdx);
-      const yVals  = pts.map(p => p.rul);
       const xDates = pts.map(p => p.date);
+      const yVals  = pts.map(p => p.ekf_rul_days * D2Y);   // years — same unit as bar chart
+      const xIdx   = pts.map((_, i) => i);
 
-      // ── Least-squares solver (Gaussian elimination) ──────────────────────
-      function polyFit(xs, ys, deg) {
-        const n = xs.length, m = deg + 1;
-        const A   = Array.from({length: n}, (_, i) => Array.from({length: m}, (_, j) => Math.pow(xs[i], j)));
-        const AT  = A[0].map((_, ci) => A.map(row => row[ci]));
-        const ATA = AT.map(row => AT[0].map((_, j) => row.reduce((s,_,k) => s + row[k]*AT[j][k], 0)));
-        const ATy = AT.map(row => row.reduce((s, v, k) => s + v * ys[k], 0));
-        const mat = ATA.map((row, i) => [...row, ATy[i]]);
-        for (let c = 0; c < m; c++) {
-          let maxR = c;
-          for (let r = c+1; r < m; r++) if (Math.abs(mat[r][c]) > Math.abs(mat[maxR][c])) maxR = r;
-          [mat[c], mat[maxR]] = [mat[maxR], mat[c]];
-          for (let r = 0; r < m; r++) {
-            if (r === c) continue;
-            const f = mat[r][c] / mat[c][c];
-            for (let k = c; k <= m; k++) mat[r][k] -= f * mat[c][k];
-          }
-        }
-        return mat.map((row, i) => row[m] / row[i]);
-      }
+      // CI band from ekf_rul_days_lo / hi if the EKF computed them
+      const hasCI  = pts.some(p => p.ekf_rul_days_lo != null && p.ekf_rul_days_hi != null);
+      const yLo    = hasCI ? pts.map(p => (p.ekf_rul_days_lo ?? p.ekf_rul_days) * D2Y) : null;
+      const yHi    = hasCI ? pts.map(p => (p.ekf_rul_days_hi ?? p.ekf_rul_days) * D2Y) : null;
 
-      // ── Linear fit (line of best fit) ────────────────────────────────────
+      // ── Least-squares linear fit ─────────────────────────────────────────
       let linTrace = null;
-      if (xVals.length >= 3) {
+      if (yVals.length >= 3) {
         try {
-          const coefs  = polyFit(xVals, yVals, 1);   // [intercept, slope]
-          const linY   = xDates.map((_, i) => coefs[0] + coefs[1] * xVals[i]);
+          const n = xIdx.length;
+          const sx = xIdx.reduce((a, v) => a + v, 0), sy = yVals.reduce((a, v) => a + v, 0);
+          const sxx = xIdx.reduce((a, v) => a + v * v, 0);
+          const sxy = xIdx.reduce((a, v, i) => a + v * yVals[i], 0);
+          const m   = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+          const b   = (sy - m * sx) / n;
           linTrace = {
             type: "scatter", mode: "lines",
-            x: xDates, y: linY,
-            line: { color: "#ef4444", width: 2, dash: "solid" },
-            name: "Linear fit", hoverinfo: "skip",
+            x: xDates, y: xIdx.map(i => b + m * i),
+            line: { color: "#ef4444", width: 1.8, dash: "solid" },
+            name: "Linear trend", hoverinfo: "skip",
           };
         } catch {}
       }
 
-      // ── Bollinger bands (rolling mean ± 2σ, window = 20) ─────────────────
-      let bbUpperTrace = null, bbLowerTrace = null, bbMidTrace = null;
-      if (yVals.length >= 10) {
+      // ── Rolling mean ± 2σ (Bollinger bands) ─────────────────────────────
+      let bbLo = null, bbHi = null, bbMid = null;
+      if (!hasCI && yVals.length >= 10) {
         const WIN = Math.min(20, Math.floor(yVals.length / 3));
         const means = [], stds = [];
         for (let i = 0; i < yVals.length; i++) {
-          const slice = yVals.slice(Math.max(0, i - WIN + 1), i + 1);
-          const m = slice.reduce((s, v) => s + v, 0) / slice.length;
-          const s = Math.sqrt(slice.reduce((s, v) => s + (v - m) ** 2, 0) / slice.length);
-          means.push(m);
-          stds.push(s);
+          const sl = yVals.slice(Math.max(0, i - WIN + 1), i + 1);
+          const mu = sl.reduce((s, v) => s + v, 0) / sl.length;
+          const sg = Math.sqrt(sl.reduce((s, v) => s + (v - mu) ** 2, 0) / sl.length);
+          means.push(mu); stds.push(sg);
         }
-        const upper = means.map((m, i) => m + 2 * stds[i]);
-        const lower = means.map((m, i) => Math.max(0, m - 2 * stds[i]));
-
-        // Lower band (invisible, for fill reference)
-        bbLowerTrace = {
-          type: "scatter", mode: "lines",
-          x: xDates, y: lower,
-          line: { width: 0, color: "transparent" },
-          showlegend: false, hoverinfo: "skip", name: "_bb_lower",
+        bbLo = {
+          type: "scatter", mode: "lines", x: xDates,
+          y: means.map((m, i) => Math.max(0, m - 2 * stds[i])),
+          line: { width: 0 }, showlegend: false, hoverinfo: "skip", name: "_bbl",
         };
-        // Upper band (fills down to lower)
-        bbUpperTrace = {
-          type: "scatter", mode: "lines",
-          x: xDates, y: upper,
+        bbHi = {
+          type: "scatter", mode: "lines", x: xDates,
+          y: means.map((m, i) => m + 2 * stds[i]),
           fill: "tonexty", fillcolor: "rgba(99,102,241,0.10)",
           line: { color: "rgba(99,102,241,0.35)", dash: "dot", width: 1 },
-          name: "Bollinger ±2σ",
-          hovertemplate: "Upper: %{y:.0f} days<extra></extra>",
+          name: "Rolling ±2σ",
+          hovertemplate: "Upper: %{y:.2f} yr<extra></extra>",
         };
-        // Mid line (rolling mean)
-        bbMidTrace = {
-          type: "scatter", mode: "lines",
-          x: xDates, y: means,
+        bbMid = {
+          type: "scatter", mode: "lines", x: xDates, y: means,
           line: { color: "#6366f1", width: 1.2, dash: "dash" },
           name: "Rolling mean",
-          hovertemplate: "Mean: %{y:.0f} days<extra></extra>",
+          hovertemplate: "Mean: %{y:.2f} yr<extra></extra>",
         };
       }
 
@@ -2947,30 +3328,42 @@ function _renderRulScatter(reg) {
         <div style="background:#fff;border-radius:8px;border:1px solid #e2e8f0;overflow:hidden;margin-top:4px">
           <div style="padding:8px 12px;font-size:.72rem;font-weight:600;color:#475569;
                       text-transform:uppercase;letter-spacing:.05em;background:#f8fafc;border-bottom:1px solid #e2e8f0">
-            Remaining Useful Life — How it changes over time
+            EKF Remaining Useful Life over time (years) — same model as fleet bar chart
           </div>
           <div id="vdRulScatterChart" style="height:300px"></div>
         </div>`;
 
       requestAnimationFrame(() => {
         const traces = [];
-        if (bbLowerTrace) traces.push(bbLowerTrace, bbUpperTrace);
+        // CI band from EKF posterior (if available) — placed first so scatter renders on top
+        if (hasCI) {
+          traces.push(
+            { type: "scatter", mode: "lines", x: xDates, y: yLo,
+              line: { width: 0 }, showlegend: false, hoverinfo: "skip", name: "_cil" },
+            { type: "scatter", mode: "lines", x: xDates, y: yHi,
+              fill: "tonexty", fillcolor: "rgba(59,130,246,0.10)",
+              line: { color: "rgba(59,130,246,0.35)", dash: "dot", width: 1 },
+              name: "95% CI", hovertemplate: "CI upper: %{y:.2f} yr<extra></extra>" }
+          );
+        } else if (bbLo) {
+          traces.push(bbLo, bbHi);
+        }
         traces.push({
           type: "scatter", mode: "markers",
           x: xDates, y: yVals,
           marker: { color: "#3b82f6", size: 4.5, opacity: 0.65 },
-          name: "Est. RUL",
-          hovertemplate: "%{x}<br>Est. RUL: %{y:.0f} days<extra></extra>",
+          name: "EKF RUL",
+          hovertemplate: "%{x}<br>EKF RUL: <b>%{y:.2f} yr</b><extra></extra>",
         });
-        if (bbMidTrace) traces.push(bbMidTrace);
-        if (linTrace)   traces.push(linTrace);
+        if (bbMid) traces.push(bbMid);
+        if (linTrace) traces.push(linTrace);
 
         Plotly.newPlot("vdRulScatterChart", traces, {
           paper_bgcolor: "transparent", plot_bgcolor: "#f8fafc",
           font: { family: "Plus Jakarta Sans, system-ui, sans-serif", size: 10, color: "#475569" },
           margin: { l: 60, r: 16, t: 16, b: 60 },
           xaxis: { title: { text: "Date", font: { size: 9 } }, gridcolor: "#e2e8f0", tickangle: -30, tickfont: { size: 8.5 } },
-          yaxis: { title: { text: "Estimated RUL (days)", font: { size: 9 } }, gridcolor: "#e2e8f0" },
+          yaxis: { title: { text: "EKF RUL (years)", font: { size: 9 } }, gridcolor: "#e2e8f0", rangemode: "tozero", tickformat: ".1f" },
           showlegend: true,
           legend: { x: 0.98, xanchor: "right", y: 0.98, font: { size: 9 } },
           hovermode: "x unified",
@@ -3067,6 +3460,7 @@ function _animateKpiCounters() {
 
 /* ─── Breakdown Timeline ──────────────────────────────────────────────────────── */
 let _breakdownRows = [];
+let _bdLastBarClickTime = 0;  // timestamp of last bar click — used to detect empty-area clicks
 
 function renderBreakdownTimeline(data) {
   if (!data || !data.timeline || !data.timeline.length) return;
@@ -3078,123 +3472,245 @@ function renderBreakdownTimeline(data) {
   _buildBreakdownTable(_breakdownRows, eol, null);
 }
 
+function _rulCI(r) {
+  // Returns { lo, hi } in days — uses EKF posterior bounds if available,
+  // otherwise propagates ekf_soh_std through the RUL formula (2σ → 95% CI).
+  if (r.rul_lo != null && r.rul_hi != null) {
+    return { lo: r.rul_lo, hi: r.rul_hi };
+  }
+  const slope = Math.abs(r.soh_slope || 0.005);
+  const sigmaRul = 2 * (r.ekf_soh_std || 0.5) / slope;
+  return { lo: Math.max(0, r.rul_days - sigmaRul), hi: r.rul_days + sigmaRul };
+}
+
+/* ─── Breakdown table sort state ────────────────────────────────────────────── */
+let _breakdownSortCol = null;   // null = default (rul desc)
+let _breakdownSortDir = 1;      // 1 = asc, -1 = desc
+
+function _breakdownSort(col) {
+  if (_breakdownSortCol !== col) {
+    _breakdownSortCol = col;
+    _breakdownSortDir = 1;
+  } else if (_breakdownSortDir === 1) {
+    _breakdownSortDir = -1;
+  } else {
+    _breakdownSortCol = null;   // third click: reset to default
+    _breakdownSortDir = 1;
+  }
+  _updateBreakdownSortHeaders();
+  const eol = (_overview && _overview.eol_threshold) || 80;
+  _buildBreakdownTable(_breakdownRows, eol, null);
+}
+
+function _updateBreakdownSortHeaders() {
+  document.querySelectorAll(".bd-sort-ind").forEach(el => {
+    el.textContent = el.dataset.col === _breakdownSortCol
+      ? (_breakdownSortDir === 1 ? " ▲" : " ▼") : "";
+  });
+}
+
+/* ─── Bar-chart RUL color for a registration (used by tier badges + bar chart) ─ */
+function _barColorForReg(reg) {
+  if (!_breakdownRows || !_breakdownRows.length) return { bg: "#f8fafc", fg: "#64748b" };
+  const byRul = [..._breakdownRows].filter(r => r.rul_days != null).sort((a, b) => a.rul_days - b.rul_days);
+  const worstSet = new Set(byRul.slice(0, 5).map(r => r.registration_number));
+  const row = _breakdownRows.find(r => r.registration_number === reg);
+  const days = row ? row.rul_days : null;
+  if (days == null) return { bg: "#f8fafc", fg: "#64748b" };
+  if (worstSet.has(reg) || days < 365)  return { bg: "#fef2f2", fg: "#b91c1c" };
+  if (days < 1095) return { bg: "#fffbeb", fg: "#92400e" };
+  return { bg: "#f0fdf4", fg: "#166534" };
+}
+
 function _drawBreakdownChart(rows, eol, highlightReg) {
   const el = document.getElementById("breakdownTimelinePlot");
   if (!el) return;
 
-  // Exclude vehicles with near-flat slopes whose projected EoL is > 10 years out —
-  // they distort the x-axis scale without adding actionable information.
-  const MAX_RUL_DAYS = 3650;
-  rows = rows.filter(r => r.rul_days != null && r.rul_days <= MAX_RUL_DAYS);
+  // Sort highest RUL → lowest RUL (leftmost bar = healthiest vehicle)
+  const valid = rows
+    .filter(r => r.rul_days != null)
+    .sort((a, b) => b.rul_days - a.rul_days);
 
-  const TIER_COLOR = { 1: "#ef4444", 2: "#f59e0b", 3: "#22c55e", 0: "#6366f1" };
-  const todayStr   = new Date().toISOString().slice(0, 10);
+  // Color by RUL level; always force bottom-5 (worst) to red
+  const rulColor = (days) =>
+    days == null ? "#94a3b8"
+    : days < 365  ? "#ef4444"
+    : days < 1095 ? "#f59e0b"
+    : "#22c55e";
 
-  // Compute RUL + EoL date the same way as renderAnomalyTiers JS
-  const rowsWithRul = rows.map(r => {
-    let rul = r.rul_days;  // already computed server-side with same formula
-    const eolDate = rul != null
-      ? (() => {
-          const d = new Date(data_refDate || r.ref_date);
-          d.setDate(d.getDate() + Math.round(rul));
-          return d.toISOString().slice(0, 10);
-        })()
-      : r.eol_date;
-    return { ...r, rul_computed: rul, eol_computed: eolDate };
+  const worstSet = new Set(valid.slice(-5).map(r => r.registration_number));
+
+  const colors = valid.map(r =>
+    r.registration_number === highlightReg ? "#1d4ed8"
+    : worstSet.has(r.registration_number) ? "#ef4444"
+    : rulColor(r.rul_days)
+  );
+  const outlines = valid.map(r =>
+    r.registration_number === highlightReg ? "#93c5fd" : "rgba(0,0,0,0)"
+  );
+
+  const D2Y = 1 / 365.25;
+  const errHi = [], errLo = [];
+  valid.forEach(r => {
+    const { lo, hi } = _rulCI(r);
+    errHi.push((hi - r.rul_days) * D2Y);
+    errLo.push((r.rul_days - lo) * D2Y);
   });
 
-  const colors = rowsWithRul.map(r =>
-    r.registration_number === highlightReg
-      ? "#f59e0b"  // highlighted
-      : TIER_COLOR[r.tier] || "#6366f1"
-  );
-  const sizes  = rowsWithRul.map(r => r.registration_number === highlightReg ? 14 : 10);
+  const customdata = valid.map(r => {
+    const { lo, hi } = _rulCI(r);
+    return [
+      r.ekf_soh != null ? r.ekf_soh.toFixed(2) : (r.current_soh != null ? r.current_soh.toFixed(2) : "—"),
+      r.soh_slope != null ? r.soh_slope.toFixed(5) : "—",
+      r.eol_date || "—",
+      (lo * D2Y).toFixed(2),
+      (hi * D2Y).toFixed(2),
+    ];
+  });
+
+  // Median RUL line
+  const rulDays = valid.map(r => r.rul_days).sort((a, b) => a - b);
+  const medRulYr = rulDays[Math.floor(rulDays.length / 2)] * D2Y;
 
   Plotly.newPlot(el, [{
-    type: "scatter",
-    mode: "markers",
-    x: rowsWithRul.map(r => r.eol_date || null),
-    y: rowsWithRul.map(r => r.registration_number),
+    type: "bar",
+    x: valid.map(r => r.registration_number),
+    y: valid.map(r => r.rul_days * D2Y),
     marker: {
-      color: colors, size: sizes, symbol: "diamond",
-      line: { color: "#fff", width: 1.5 },
+      color: colors,
+      line: { color: outlines, width: 2 },
     },
-    customdata: rowsWithRul.map(r => [
-      r.rul_days != null ? (r.rul_days / 365.25).toFixed(2) : "—",
-      r.current_soh != null ? r.current_soh.toFixed(2) : "—",
-      r.soh_slope != null ? r.soh_slope.toFixed(4) : "—",
-    ]),
+    error_y: {
+      type: "data",
+      array: errHi,
+      arrayminus: errLo,
+      visible: true,
+      color: "#64748b",
+      thickness: 1.5,
+      width: 4,
+    },
+    customdata,
+    showlegend: false,
     hovertemplate:
-      "<b>%{y}</b><br>" +
-      "Projected EoL: <b>%{x}</b><br>" +
-      "RUL: %{customdata[0]} yr<br>" +
-      "Current SoH: %{customdata[1]}%<br>" +
-      "Daily slope: %{customdata[2]}%/day<extra></extra>",
+      "<b>%{x}</b><br>" +
+      "RUL: <b>%{y:.2f} yr</b><br>" +
+      "95% CI: %{customdata[3]} – %{customdata[4]} yr<br>" +
+      "EKF SoH: %{customdata[0]}%<br>" +
+      "Daily slope: %{customdata[1]}%/day<br>" +
+      "Proj. EoL: %{customdata[2]}<extra></extra>",
   }], {
     paper_bgcolor: "white", plot_bgcolor: "#f8fafc",
     font: { family: "Plus Jakarta Sans, system-ui, sans-serif", size: 10, color: "#475569" },
-    margin: { l: 130, r: 20, t: 16, b: 64 },
+    margin: { l: 60, r: 16, t: 16, b: 90 },
     xaxis: {
-      title: { text: "Projected End-of-Life Date", font: { size: 9.5 } },
-      type: "date", gridcolor: "#e2e8f0", tickfont: { size: 9 }, tickangle: -30,
+      title: { text: "Vehicle Registration", font: { size: 9.5 } },
+      gridcolor: "#e2e8f0", tickfont: { size: 8.5 }, tickangle: -38,
     },
-    yaxis: { autorange: "reversed", gridcolor: "#e2e8f0", tickfont: { size: 9 } },
+    yaxis: {
+      title: { text: "Remaining Useful Life (years)", font: { size: 9.5 } },
+      gridcolor: "#e2e8f0", tickfont: { size: 9 }, rangemode: "tozero",
+      tickformat: ".1f",
+    },
+    showlegend: false,
+    bargap: 0.25,
     shapes: [{
-      type: "line", x0: todayStr, x1: todayStr, y0: 0, y1: 1,
-      xref: "x", yref: "paper",
-      line: { color: "#3b82f6", width: 1.5, dash: "dash" },
+      type: "line", xref: "paper", yref: "y",
+      x0: 0, x1: 1, y0: medRulYr, y1: medRulYr,
+      line: { color: "#475569", width: 1.5, dash: "dash" },
     }],
     annotations: [{
-      x: todayStr, y: 1.03, xref: "x", yref: "paper",
-      text: "Today", showarrow: false,
-      font: { size: 8.5, color: "#3b82f6", family: "Plus Jakarta Sans" },
-      bgcolor: "rgba(255,255,255,.85)", borderpad: 2,
+      xref: "paper", yref: "y",
+      x: 0.01, y: medRulYr, xanchor: "left", yanchor: "bottom",
+      text: `Median RUL: ${medRulYr.toFixed(1)} yr`,
+      showarrow: false,
+      font: { size: 8.5, color: "#475569", family: "Plus Jakarta Sans" },
+      bgcolor: "rgba(255,255,255,0.85)", borderpad: 2,
     }],
-    showlegend: false,
   }, { displayModeBar: false, responsive: true });
 
-  // Click-through: clicking a point highlights row in table
+  // Click-through: clicking a bar highlights that row in the table
   el.on("plotly_click", evt => {
+    _bdLastBarClickTime = Date.now();
     const pt  = evt.points[0];
-    const reg = pt && pt.y;
+    const reg = pt && pt.x;
     if (!reg) return;
     _buildBreakdownTable(_breakdownRows, eol, reg);
-    // Scroll to the highlighted row
     const row = document.querySelector(`#breakdownTableBody tr[data-reg="${reg}"]`);
     if (row) row.scrollIntoView({ behavior: "smooth", block: "nearest" });
-    // Redraw chart with highlight
     _drawBreakdownChart(_breakdownRows, eol, reg);
   });
+
+  // Click on empty chart area → deselect
+  if (el._bdClickHandler) el.removeEventListener("click", el._bdClickHandler);
+  el._bdClickHandler = function() {
+    if (Date.now() - _bdLastBarClickTime > 80 && highlightReg !== null) {
+      _buildBreakdownTable(_breakdownRows, eol, null);
+      _drawBreakdownChart(_breakdownRows, eol, null);
+    }
+  };
+  el.addEventListener("click", el._bdClickHandler);
 }
 
 // Store ref_date for EoL re-computation
 let data_refDate = null;
 
 function _buildBreakdownTable(rows, eol, activeReg) {
-  const TIER_BADGE = {
-    1: `<span style="background:#fef2f2;color:#b91c1c;font-size:.68rem;font-weight:700;padding:1px 6px;border-radius:4px">T1</span>`,
-    2: `<span style="background:#fffbeb;color:#92400e;font-size:.68rem;font-weight:700;padding:1px 6px;border-radius:4px">T2</span>`,
-    3: `<span style="background:#f0fdf4;color:#166534;font-size:.68rem;font-weight:700;padding:1px 6px;border-radius:4px">T3</span>`,
+  // Tier badge: T1=red, T2=amber, T3=green (matches tier meaning)
+  const _badge = (tier) => {
+    if (!tier) return "";
+    const MAP = {
+      1: { bg: "#fef2f2", fg: "#b91c1c", tip: "T1 — Immediate attention" },
+      2: { bg: "#fffbeb", fg: "#b45309", tip: "T2 — Monitor closely" },
+      3: { bg: "#f0fdf4", fg: "#166534", tip: "T3 — Elevated but stable" },
+    };
+    const { bg, fg, tip } = MAP[tier] || { bg: "#f8fafc", fg: "#64748b", tip: "" };
+    return `<span style="background:${bg};color:${fg};font-size:.68rem;font-weight:700;padding:1px 6px;border-radius:4px;cursor:default" title="${tip}">T${tier}</span>`;
   };
 
-  document.getElementById("breakdownTableBody").innerHTML = rows.map(r => {
-    const isActive  = r.registration_number === activeReg;
-    const sohStr    = r.current_soh != null ? r.current_soh.toFixed(2) + "%" : "—";
-    const rulStr    = r.rul_days != null
-      ? `${Math.round(r.rul_days).toLocaleString()}d (${(r.rul_days / 365.25).toFixed(1)} yr)` : "—";
-    const badge     = TIER_BADGE[r.tier] || "";
-    const rowStyle  = isActive ? "background:#eff6ff;font-weight:600;" : "";
-    const spanStr   = r.data_span
-      ? `${r.data_span.first} → ${r.data_span.last}<br><span style="color:#94a3b8">${r.data_span.days}d</span>`
-      : "—";
+  // Apply user-selected sort; default = highest RUL first
+  let sorted;
+  if (_breakdownSortCol) {
+    const dir = _breakdownSortDir;
+    sorted = [...rows].sort((a, b) => {
+      let av, bv;
+      switch (_breakdownSortCol) {
+        case "reg":   av = a.registration_number || ""; bv = b.registration_number || ""; break;
+        case "soh":   av = a.ekf_soh ?? a.current_soh ?? -Infinity; bv = b.ekf_soh ?? b.current_soh ?? -Infinity; break;
+        case "rul":   av = a.rul_days ?? -Infinity;  bv = b.rul_days ?? -Infinity;  break;
+        case "ci_lo": av = _rulCI(a).lo ?? -Infinity; bv = _rulCI(b).lo ?? -Infinity; break;
+        case "ci_hi": av = _rulCI(a).hi ?? -Infinity; bv = _rulCI(b).hi ?? -Infinity; break;
+        case "eol":   av = a.eol_date || ""; bv = b.eol_date || ""; break;
+        default:      av = a.rul_days ?? -Infinity;  bv = b.rul_days ?? -Infinity;
+      }
+      return av < bv ? -dir : av > bv ? dir : 0;
+    });
+  } else {
+    sorted = [...rows].sort((a, b) => {
+      if (a.rul_days == null && b.rul_days == null) return 0;
+      if (a.rul_days == null) return 1;
+      if (b.rul_days == null) return -1;
+      return b.rul_days - a.rul_days;
+    });
+  }
+
+  document.getElementById("breakdownTableBody").innerHTML = sorted.map(r => {
+    const isActive = r.registration_number === activeReg;
+    const ekfSoh   = r.ekf_soh != null ? r.ekf_soh.toFixed(2) + "%" : (r.current_soh != null ? r.current_soh.toFixed(2) + "%" : "—");
+    const rulStr   = r.rul_days != null ? `${(r.rul_days / 365.25).toFixed(2)} yr` : "—";
+    const { lo, hi } = r.rul_days != null ? _rulCI(r) : { lo: null, hi: null };
+    const ciLoStr  = lo != null ? `${(lo / 365.25).toFixed(2)} yr` : "—";
+    const ciHiStr  = hi != null ? `${(hi / 365.25).toFixed(2)} yr` : "—";
+    const badge    = _badge(r.tier);
+    const rowStyle = isActive ? "background:#eff6ff;" : "";
     return `<tr data-reg="${r.registration_number}"
                style="cursor:pointer;${rowStyle}"
                onclick="openVehicleDetail && openVehicleDetail('${r.registration_number}')">
-      <td>${badge}&nbsp;<span style="font-size:.69rem;font-weight:${isActive?700:400}">${r.registration_number}</span></td>
-      <td class="text-end" style="font-size:.69rem">${sohStr}</td>
-      <td class="text-end" style="font-size:.69rem">${rulStr}</td>
+      <td style="white-space:nowrap">${badge}&nbsp;<span style="font-size:.69rem;font-weight:${isActive?700:500};color:#2563eb">${r.registration_number}</span></td>
+      <td class="text-end" style="font-size:.69rem">${ekfSoh}</td>
+      <td class="text-end" style="font-size:.69rem;font-weight:${isActive?700:400}">${rulStr}</td>
+      <td class="text-end" style="font-size:.69rem;color:#64748b">${ciLoStr}</td>
+      <td class="text-end" style="font-size:.69rem;color:#64748b">${ciHiStr}</td>
       <td class="text-end" style="font-size:.69rem;font-weight:600">${r.eol_date || "—"}</td>
-      <td class="text-end" style="font-size:.69rem;line-height:1.4">${spanStr}</td>
     </tr>`;
   }).join("");
 }

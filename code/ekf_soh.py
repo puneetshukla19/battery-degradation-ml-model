@@ -40,6 +40,7 @@ ekf_soh.csv  — one row per charging session with:
 
 import numpy as np
 import pandas as pd
+from scipy import stats as sp_stats
 from config import (
     CYCLES_CSV, EKF_CSV, BASE,
     EKF_Q_DIAG, EKF_R_DIAG,
@@ -168,12 +169,22 @@ def ekf_step(x: np.ndarray, P: np.ndarray,
 # ── RUL from EKF state ─────────────────────────────────────────────────────────
 
 def _rul_from_ekf(soh: float, soh_std: float, avg_efc_per_day: float,
+                  observed_rate_per_day: float = 0.0,
                   eol: float = EOL_SOH) -> dict:
-    """Compute point + uncertainty RUL from EKF SoH and its posterior std."""
+    """Compute point + uncertainty RUL from EKF SoH and its posterior std.
+
+    observed_rate_per_day: OLS-derived |slope| (%SoH/day) from cycle_soh.
+    Used as a floor on the physics rate so that vehicles with fast observed
+    degradation don't get inflated RUL from a low avg_efc_per_day.
+    The observed rate is capped at 3× the physics rate to limit noise from
+    short data spans (young fleet).
+    """
     if soh <= eol or not np.isfinite(avg_efc_per_day) or avg_efc_per_day <= 0:
         return {"ekf_rul_days": 0.0, "ekf_rul_days_lo": 0.0, "ekf_rul_days_hi": 0.0}
 
-    daily_soh_rate = (ALPHA * avg_efc_per_day + BETA * CAL_AGING_RATE / 365.0)
+    physics_rate   = ALPHA * avg_efc_per_day + BETA * CAL_AGING_RATE / 365.0
+    obs_rate_floor = min(float(observed_rate_per_day), 3.0 * physics_rate)
+    daily_soh_rate = max(physics_rate, obs_rate_floor)
     if daily_soh_rate <= 0:
         return {"ekf_rul_days": np.inf, "ekf_rul_days_lo": np.inf, "ekf_rul_days_hi": np.inf}
 
@@ -233,6 +244,18 @@ def run_ekf_fleet(cycles: pd.DataFrame) -> pd.DataFrame:
         days_span = float(veh["days_since_first"].iloc[-1])
         efc_total = float(veh["cum_efc"].iloc[-1])
         avg_efc_per_day = (efc_total / days_span) if days_span > 1.0 else np.nan
+
+        # Observed SoH degradation rate from OLS on cycle_soh vs days.
+        # Only use when slope is negative (degrading) and enough data exists.
+        observed_soh_rate = 0.0
+        csoh_obs = veh["cycle_soh"].dropna()
+        if len(csoh_obs) >= 5:
+            t_obs = veh.loc[csoh_obs.index, "days_since_first"].values
+            y_obs = csoh_obs.values
+            if len(np.unique(t_obs)) >= 3:
+                res = sp_stats.linregress(t_obs, y_obs)
+                if res.slope < 0:
+                    observed_soh_rate = float(-res.slope)  # positive rate (%SoH/day)
 
         # ── Pre-compute EWM-smoothed cycle_soh per vehicle ───────────────────
         # Only smooth on quality observations (not capped, sufficient block DoD).
@@ -305,7 +328,8 @@ def run_ekf_fleet(cycles: pd.DataFrame) -> pd.DataFrame:
 
             ekf_soh     = float(x[0])
             ekf_soh_std = float(np.sqrt(max(0.0, P[0, 0])))
-            rul_dict    = _rul_from_ekf(ekf_soh, ekf_soh_std, avg_efc_per_day)
+            rul_dict    = _rul_from_ekf(ekf_soh, ekf_soh_std, avg_efc_per_day,
+                                         observed_rate_per_day=observed_soh_rate)
 
             results.append({
                 "registration_number":      reg,

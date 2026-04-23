@@ -13,6 +13,7 @@ urlpatterns = [
     path("api/bayes-coef/<str:reg>/",  views.api_bayes_coef,    name="api-bayes-coef-veh"),
     path("api/soh-scatter/",              views.api_soh_scatter,       name="api-soh-scatter"),
     path("api/soh-delta-trend/",          views.api_soh_delta_trend,   name="api-soh-delta-trend"),
+    path("api/efc-trend/",               views.api_efc_trend,         name="api-efc-trend"),
     path("api/anomaly-tiers/",         views.api_anomaly_tiers,      name="api-anomaly-tiers"),
     path("api/anomaly-breakdown/",              views.api_anomaly_breakdown, name="api-anomaly-breakdown"),
     path("api/anomaly-breakdown/<str:reg>/",    views.api_anomaly_breakdown, name="api-anomaly-breakdown-veh"),

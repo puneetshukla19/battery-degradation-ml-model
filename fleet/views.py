@@ -314,6 +314,17 @@ def api_bayes_coef(request, reg=None):
                  if c != "registration_number" and c not in COEF_HIDE]
     global_coef = coef[feat_cols].median().dropna()
 
+    # Cross-vehicle spread (IQR) for CI forest plot
+    coef_spread = {}
+    for feat in feat_cols:
+        vals = coef[feat].dropna()
+        if len(vals) >= 1:
+            coef_spread[feat] = {
+                "p25": round(float(vals.quantile(0.25)), 6),
+                "p75": round(float(vals.quantile(0.75)), 6),
+                "std": round(float(vals.std()), 6) if len(vals) >= 2 else 0.0,
+            }
+
     veh_coef = {}
     if reg:
         row = coef[coef["registration_number"] == reg]
@@ -323,6 +334,7 @@ def api_bayes_coef(request, reg=None):
     return JsonResponse({
         "global": {k: round(float(v), 6) for k, v in global_coef.items()},
         "vehicle": {k: round(float(v), 6) for k, v in veh_coef.items()},
+        "coef_spread": coef_spread,
         "registration_number": reg,
     })
 
@@ -331,7 +343,7 @@ def api_bayes_coef(request, reg=None):
 def api_soh_scatter(request):
     """Per-session BMS-reported SoH vs EKF SoH for the scatter plot."""
     anom = _load_anom()
-    cols = ["registration_number", "soh", "ekf_soh", "start_time_ist"]
+    cols = ["registration_number", "soh", "ekf_soh", "start_time_ist", "cum_efc"]
     avail = [c for c in cols if c in anom.columns]
     df = anom[avail].dropna(subset=["soh", "ekf_soh"]).copy()
     if "start_time_ist" in df.columns:
@@ -343,28 +355,122 @@ def api_soh_scatter(request):
 
 @require_GET
 def api_soh_delta_trend(request):
-    """Daily (EKF SoH − BMS SoH) delta per vehicle for the delta time-series chart."""
+    """Daily (EKF SoH − BMS SoH) delta — uses ekf_soh.csv for full date coverage."""
     anom = _load_anom()
-    cols = ["registration_number", "soh", "ekf_soh", "start_time_ist"]
-    avail = [c for c in cols if c in anom.columns]
-    df = anom[avail].dropna(subset=["soh", "ekf_soh"]).copy()
-    df["date"] = pd.to_datetime(df["start_time_ist"], errors="coerce").dt.strftime("%Y-%m-%d")
-    df["delta"] = (df["ekf_soh"] - df["soh"]).round(3)
-    # Fleet daily median delta
-    fleet = (
-        df.groupby("date")["delta"]
-        .median()
-        .reset_index()
-        .rename(columns={"delta": "fleet_median_delta"})
-        .sort_values("date")
+    ekf  = _load_ekf()  # has "date" col from start_time ms
+
+    # EKF SoH daily median per vehicle (full historical range from ekf_soh.csv)
+    ekf_day = (
+        ekf[["registration_number", "date", "ekf_soh"]].dropna(subset=["ekf_soh"])
+        .groupby(["registration_number", "date"])["ekf_soh"].median().reset_index()
     )
-    # Per-vehicle records (date + reg + delta) for slider mode
+
+    # BMS SoH daily median per vehicle from anomaly_scores.csv
+    bms_ok = "soh" in anom.columns and "start_time_ist" in anom.columns
+    if bms_ok:
+        bms = anom[["registration_number", "soh", "start_time_ist"]].dropna(subset=["soh"]).copy()
+        bms["date"] = pd.to_datetime(bms["start_time_ist"], errors="coerce").dt.strftime("%Y-%m-%d")
+        bms_day = bms.groupby(["registration_number", "date"])["soh"].median().reset_index()
+    else:
+        bms_day = pd.DataFrame(columns=["registration_number", "date", "soh"])
+
+    # Left-join so all EKF dates are retained; delta is NaN where BMS unavailable
+    merged = ekf_day.merge(bms_day, on=["registration_number", "date"], how="left")
+    merged["delta"] = (merged["ekf_soh"] - merged["soh"]).round(3)
+
+    # Fleet daily median delta — only for days where at least one vehicle has both values
+    delta_by_date = (
+        merged.dropna(subset=["delta"])
+        .groupby("date")["delta"].median()
+    )
+    all_dates = sorted(ekf_day["date"].unique())
+    fleet_records = [
+        {"date": d, "fleet_median_delta": (round(float(delta_by_date[d]), 3) if d in delta_by_date else None)}
+        for d in all_dates
+    ]
+
+    # Per-vehicle records for slider mode (only where delta is non-null)
     veh_records = _df_to_records(
-        df[["registration_number", "date", "delta"]].sort_values(["registration_number", "date"])
+        merged.dropna(subset=["delta"])[["registration_number", "date", "delta"]]
+        .sort_values(["registration_number", "date"])
     )
     return _safe_json({
-        "fleet_trend": fleet.to_dict(orient="records"),
+        "fleet_trend": fleet_records,
         "vehicle_points": veh_records,
+    })
+
+
+@require_GET
+@require_GET
+def api_efc_trend(request):
+    """EFC over time per vehicle + per-vehicle EOL projection."""
+    from datetime import timedelta
+    anom = _load_anom()
+    ekf  = _load_ekf()
+
+    cols  = ["registration_number", "start_time_ist", "cum_efc", "days_since_first"]
+    avail = [c for c in cols if c in anom.columns]
+    df = anom[avail].dropna(subset=["cum_efc"]).copy()
+    df["date"] = pd.to_datetime(df["start_time_ist"], errors="coerce").dt.strftime("%Y-%m-%d")
+    df = df.dropna(subset=["date"])
+
+    # Fleet daily median EFC
+    fleet = (df.groupby("date")["cum_efc"]
+               .median().reset_index()
+               .rename(columns={"cum_efc": "fleet_median_cum_efc"})
+               .sort_values("date"))
+
+    # Per-vehicle daily last EFC (one row per vehicle per day to reduce payload)
+    veh_pts = (df.sort_values("start_time_ist")
+                 .groupby(["registration_number", "date"])["cum_efc"]
+                 .last().reset_index()
+                 .sort_values(["registration_number", "date"]))
+
+    # Latest EKF RUL and SoH per vehicle
+    ekf_rul_map = {}
+    ekf_soh_map = {}
+    if "ekf_rul_days" in ekf.columns:
+        ekf_rul_map = ekf.groupby("registration_number")["ekf_rul_days"].last().dropna().to_dict()
+    if "ekf_soh" in ekf.columns:
+        ekf_soh_map = ekf.groupby("registration_number")["ekf_soh"].last().dropna().to_dict()
+
+    last_date_map = df.groupby("registration_number")["date"].last().to_dict()
+    last_sess = (df.sort_values("start_time_ist")
+                   .groupby("registration_number")[["cum_efc", "days_since_first"]]
+                   .last())
+
+    projections = []
+    for reg, row in last_sess.iterrows():
+        rul       = ekf_rul_map.get(reg)
+        cur_efc   = float(row["cum_efc"])
+        days      = float(row["days_since_first"]) if pd.notna(row["days_since_first"]) and float(row["days_since_first"]) > 0 else None
+        ld        = last_date_map.get(reg)
+        ekf_soh   = ekf_soh_map.get(reg)
+        efc_rate  = (cur_efc / days) if days else None
+
+        proj_efc = proj_date = None
+        if rul is not None and not math.isnan(float(rul)) and efc_rate:
+            proj_efc = cur_efc + efc_rate * float(rul)
+            try:
+                proj_date = (pd.to_datetime(ld).date() + timedelta(days=int(float(rul)))).strftime("%Y-%m-%d")
+            except Exception:
+                pass
+
+        projections.append({
+            "registration_number":   reg,
+            "current_cum_efc":       round(cur_efc, 1),
+            "efc_daily_rate":        round(efc_rate, 5) if efc_rate else None,
+            "ekf_rul_days":          round(float(rul), 0) if rul is not None and not math.isnan(float(rul)) else None,
+            "current_ekf_soh":       round(float(ekf_soh), 2) if ekf_soh is not None else None,
+            "projected_efc_at_eol":  round(proj_efc, 1) if proj_efc else None,
+            "last_date":             ld,
+            "proj_date":             proj_date,
+        })
+
+    return _safe_json({
+        "fleet_trend":     fleet.to_dict(orient="records"),
+        "vehicle_points":  _df_to_records(veh_pts),
+        "projections":     projections,
     })
 
 
@@ -663,7 +769,18 @@ def api_soh_bands(request, reg):
         )
         disc_ekf = _df_to_records(disc)
 
-    return _safe_json({"reg": reg, "bands": _df_to_records(df[cols]), "discharge_ekf": disc_ekf})
+    # Per-session BMS-reported SoH from anomaly_scores.csv (all session types)
+    bms_obs = []
+    if "soh" in anom.columns and "start_time_ist" in anom.columns:
+        bms_df = (
+            anom[anom["registration_number"] == reg][["start_time_ist", "soh"]]
+            .dropna(subset=["soh"])
+            .rename(columns={"start_time_ist": "date", "soh": "bms_soh"})
+            .sort_values("date")
+        )
+        bms_obs = _df_to_records(bms_df)
+
+    return _safe_json({"reg": reg, "bands": _df_to_records(df[cols]), "discharge_ekf": disc_ekf, "bms_obs": bms_obs})
 
 
 @require_GET
@@ -728,9 +845,13 @@ def api_breakdown_timeline(request):
     ref_date_str = ref_ts.strftime("%Y-%m-%d")
 
     # Latest EKF SoH + RUL per vehicle (for display)
+    ekf_rul_cols = ["ekf_soh", "ekf_soh_std", "ekf_rul_days"]
+    for _c in ("ekf_rul_days_lo", "ekf_rul_days_hi"):
+        if _c in ekf.columns:
+            ekf_rul_cols.append(_c)
     last_ekf = (
         ekf.sort_values("start_time")
-           .groupby("registration_number")[["ekf_soh", "ekf_soh_std", "ekf_rul_days"]]
+           .groupby("registration_number")[ekf_rul_cols]
            .last()
     )
 
@@ -760,6 +881,8 @@ def api_breakdown_timeline(request):
         ekf_std   = float(ekf_row["ekf_soh_std"]) if ekf_row is not None and pd.notna(ekf_row["ekf_soh_std"]) else None
         # Use EKF RUL (consistent with KPI card and anomaly tiers)
         rul_days  = float(ekf_row["ekf_rul_days"]) if ekf_row is not None and pd.notna(ekf_row["ekf_rul_days"]) else None
+        rul_lo    = float(ekf_row["ekf_rul_days_lo"]) if ekf_row is not None and "ekf_rul_days_lo" in ekf_row.index and pd.notna(ekf_row["ekf_rul_days_lo"]) else None
+        rul_hi    = float(ekf_row["ekf_rul_days_hi"]) if ekf_row is not None and "ekf_rul_days_hi" in ekf_row.index and pd.notna(ekf_row["ekf_rul_days_hi"]) else None
 
         tier = 1 if reg in TIER1 else (2 if reg in TIER2 else (3 if reg in TIER3 else 0))
 
@@ -778,6 +901,8 @@ def api_breakdown_timeline(request):
             "ekf_soh_std": round(ekf_std, 4)   if ekf_std  is not None else None,
             "composite":   round(float(composite), 4) if composite is not None and pd.notna(composite) else None,
             "rul_days":    round(rul_days, 0)   if rul_days is not None else None,
+            "rul_lo":      round(rul_lo, 0)     if rul_lo   is not None else None,
+            "rul_hi":      round(rul_hi, 0)     if rul_hi   is not None else None,
             "eol_date":    _add_days(ref_ts, rul_days),
             "tier":        tier,
             "ref_date":    ref_date_str,
